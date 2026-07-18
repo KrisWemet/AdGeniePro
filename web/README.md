@@ -78,9 +78,15 @@ npm install
 npm run dev
 ```
 
-Deploy to Vercel with the same env vars; `vercel.json` schedules the three cron
-jobs (discovery daily, metrics sync hourly, optimizer every 4h). Set
-`CRON_SECRET` in Vercel so the cron endpoints are authenticated.
+Deploy to Vercel with the same env vars; `vercel.json` schedules the four cron
+jobs. Set `CRON_SECRET` in Vercel so the cron endpoints are authenticated.
+
+Note: the schedules are **daily** because Vercel's Hobby plan only allows daily
+crons. On Vercel Pro, tighten them for faster feedback: sync hourly
+(`0 * * * *`), optimizer every 4h (`30 */4 * * *`), email every 15 min
+(`*/15 * * * *`). Alternatively, keep Hobby and use an external pinger (e.g.
+cron-job.org) hitting the endpoints with the `Authorization: Bearer $CRON_SECRET`
+header at the desired frequency.
 
 ## Launching a campaign
 
