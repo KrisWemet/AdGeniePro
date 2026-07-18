@@ -1,4 +1,4 @@
-import { db, type Campaign } from "@/lib/db";
+import { sql, type Campaign } from "@/lib/db";
 
 export const dynamic = "force-dynamic";
 
@@ -7,15 +7,19 @@ function usd(cents: number): string {
 }
 
 interface CampaignRow extends Campaign {
-  metrics_daily: Array<{ spend_cents: number; revenue_cents: number }>;
+  spend_total: number;
+  revenue_total: number;
 }
 
 export default async function Campaigns() {
-  const { data } = await db()
-    .from("campaigns")
-    .select("*, metrics_daily(spend_cents, revenue_cents)")
-    .order("created_at", { ascending: false });
-  const campaigns = (data ?? []) as CampaignRow[];
+  const campaigns = await sql()<CampaignRow[]>`
+    select c.*,
+           coalesce(sum(m.spend_cents), 0)::int as spend_total,
+           coalesce(sum(m.revenue_cents), 0)::int as revenue_total
+    from campaigns c
+    left join metrics_daily m on m.campaign_id = c.id
+    group by c.id
+    order by c.created_at desc`;
 
   return (
     <div className="space-y-4">
@@ -40,54 +44,52 @@ export default async function Campaigns() {
               </tr>
             </thead>
             <tbody>
-              {campaigns.map((c) => {
-                const spend = c.metrics_daily.reduce((a, m) => a + m.spend_cents, 0);
-                const revenue = c.metrics_daily.reduce((a, m) => a + m.revenue_cents, 0);
-                return (
-                  <tr key={c.id} className="border-t border-zinc-800">
-                    <td className="p-3 font-medium">{c.name}</td>
-                    <td className="p-3">
-                      <span
-                        className={
-                          c.status === "active"
-                            ? "text-emerald-400"
-                            : c.status === "pending_approval"
-                              ? "text-amber-400"
-                              : c.status === "killed"
-                                ? "text-red-400"
-                                : "text-zinc-400"
-                        }
-                      >
-                        {c.status}
-                      </span>
-                    </td>
-                    <td className="p-3">{usd(c.daily_budget_cents)}</td>
-                    <td className="p-3">{usd(spend)}</td>
-                    <td className="p-3">{usd(revenue)}</td>
-                    <td className="p-3">{spend > 0 ? (revenue / spend).toFixed(2) : "—"}</td>
-                    <td className="p-3">
-                      <div className="flex gap-2">
-                        {c.status === "pending_approval" && (
-                          <form action={`/api/campaigns/${c.id}`} method="post">
-                            <input type="hidden" name="op" value="approve" />
-                            <button className="rounded bg-emerald-600 px-2 py-1 text-xs font-medium hover:bg-emerald-500">
-                              Approve &amp; launch
-                            </button>
-                          </form>
-                        )}
-                        {c.status === "active" && (
-                          <form action={`/api/campaigns/${c.id}`} method="post">
-                            <input type="hidden" name="op" value="pause" />
-                            <button className="rounded bg-zinc-700 px-2 py-1 text-xs font-medium hover:bg-zinc-600">
-                              Pause
-                            </button>
-                          </form>
-                        )}
-                      </div>
-                    </td>
-                  </tr>
-                );
-              })}
+              {campaigns.map((c) => (
+                <tr key={c.id} className="border-t border-zinc-800">
+                  <td className="p-3 font-medium">{c.name}</td>
+                  <td className="p-3">
+                    <span
+                      className={
+                        c.status === "active"
+                          ? "text-emerald-400"
+                          : c.status === "pending_approval"
+                            ? "text-amber-400"
+                            : c.status === "killed"
+                              ? "text-red-400"
+                              : "text-zinc-400"
+                      }
+                    >
+                      {c.status}
+                    </span>
+                  </td>
+                  <td className="p-3">{usd(c.daily_budget_cents)}</td>
+                  <td className="p-3">{usd(c.spend_total)}</td>
+                  <td className="p-3">{usd(c.revenue_total)}</td>
+                  <td className="p-3">
+                    {c.spend_total > 0 ? (c.revenue_total / c.spend_total).toFixed(2) : "—"}
+                  </td>
+                  <td className="p-3">
+                    <div className="flex gap-2">
+                      {c.status === "pending_approval" && (
+                        <form action={`/api/campaigns/${c.id}`} method="post">
+                          <input type="hidden" name="op" value="approve" />
+                          <button className="rounded bg-emerald-600 px-2 py-1 text-xs font-medium hover:bg-emerald-500">
+                            Approve &amp; launch
+                          </button>
+                        </form>
+                      )}
+                      {c.status === "active" && (
+                        <form action={`/api/campaigns/${c.id}`} method="post">
+                          <input type="hidden" name="op" value="pause" />
+                          <button className="rounded bg-zinc-700 px-2 py-1 text-xs font-medium hover:bg-zinc-600">
+                            Pause
+                          </button>
+                        </form>
+                      )}
+                    </div>
+                  </td>
+                </tr>
+              ))}
             </tbody>
           </table>
         </div>

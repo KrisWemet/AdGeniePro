@@ -1,6 +1,6 @@
 # AdGeniePro — AI-run affiliate ad campaigns
 
-A Next.js + Supabase app where AI runs the affiliate-ad loop end to end, inside
+A Next.js + Postgres app where AI runs the affiliate-ad loop end to end, inside
 hard budget guardrails you control:
 
 1. **Discover** — a daily job pulls the ClickBank marketplace, pre-filters for
@@ -58,8 +58,11 @@ posts sale notifications to `POST /api/webhooks/clickbank`.
 
 ## Setup
 
-1. **Supabase**: create a project, run `supabase/migrations/0001_init.sql` in
-   the SQL editor, and copy the URL + service-role key.
+1. **Postgres**: create a database (Neon is the easy path — from your Vercel
+   project's *Storage* tab click *Create Database → Neon*, which also sets
+   `DATABASE_URL` automatically; or sign up at neon.tech). Run
+   `db/migrations/0001_init.sql` then `0002_funnel.sql` against it (Neon SQL
+   editor or `psql $DATABASE_URL -f ...`).
 2. **Meta**: create a Meta app with Marketing API access, generate a
    long-lived system-user token with `ads_management`, and note your ad
    account id and Page id. Your ad account must have a payment method and the

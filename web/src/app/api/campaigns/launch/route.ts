@@ -1,8 +1,16 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db, getSettings, logAction, type Product } from "@/lib/db";
+import {
+  sql,
+  isUuid,
+  getSettings,
+  logAction,
+  currentSpendState,
+  type Product,
+  type Campaign,
+} from "@/lib/db";
 import { generateAdCopy } from "@/lib/anthropic";
 import { createCampaign, createAdSet, createAdWithCreative, setStatus } from "@/lib/meta";
-import { canAllocateBudget, type SpendState } from "@/lib/guardrails";
+import { canAllocateBudget } from "@/lib/guardrails";
 
 export const maxDuration = 300;
 
@@ -16,21 +24,19 @@ export async function POST(req: NextRequest) {
       daily_budget_cents?: number;
       landing_url?: string;
     };
+    if (!isUuid(product_id)) {
+      return NextResponse.json({ error: "invalid product_id" }, { status: 400 });
+    }
 
     const settings = await getSettings();
     if (settings.kill_switch) {
       return NextResponse.json({ error: "kill switch engaged" }, { status: 409 });
     }
 
-    const { data: product, error: pErr } = await db()
-      .from("products")
-      .select("*")
-      .eq("id", product_id)
-      .single();
-    if (pErr || !product) {
+    const [p] = await sql()<Product[]>`select * from products where id = ${product_id}`;
+    if (!p) {
       return NextResponse.json({ error: "product not found" }, { status: 404 });
     }
-    const p = product as Product;
 
     const url = landing_url || p.affiliate_link;
     if (!url) {
@@ -64,20 +70,13 @@ export async function POST(req: NextRequest) {
       dailyBudgetCents: budget,
     });
 
-    const { data: campaign, error: cErr } = await db()
-      .from("campaigns")
-      .insert({
-        product_id: p.id,
-        meta_campaign_id: metaCampaignId,
-        meta_adset_id: metaAdsetId,
-        name,
-        status: "pending_approval",
-        daily_budget_cents: budget,
-        landing_url: url,
-      })
-      .select()
-      .single();
-    if (cErr) throw new Error(cErr.message);
+    const [campaign] = await sql()<Campaign[]>`
+      insert into campaigns
+        (product_id, meta_campaign_id, meta_adset_id, name, status,
+         daily_budget_cents, landing_url)
+      values (${p.id}, ${metaCampaignId}, ${metaAdsetId}, ${name},
+              'pending_approval', ${budget}, ${url})
+      returning *`;
 
     for (const v of variants) {
       const { adId, creativeId } = await createAdWithCreative({
@@ -88,23 +87,19 @@ export async function POST(req: NextRequest) {
         primaryText: v.primary_text,
         description: v.description,
       });
-      await db().from("ads").insert({
-        campaign_id: campaign.id,
-        meta_ad_id: adId,
-        meta_creative_id: creativeId,
-        headline: v.headline,
-        primary_text: v.primary_text,
-        description: v.description,
-        angle: v.angle,
-        status: "paused",
-      });
+      await sql()`
+        insert into ads
+          (campaign_id, meta_ad_id, meta_creative_id, headline, primary_text,
+           description, angle, status)
+        values (${campaign.id}, ${adId}, ${creativeId}, ${v.headline},
+                ${v.primary_text}, ${v.description}, ${v.angle}, 'paused')`;
     }
 
     let activated = false;
     if (settings.autonomy_mode === "auto") {
       await setStatus(metaCampaignId, "ACTIVE");
       await setStatus(metaAdsetId, "ACTIVE");
-      await db().from("campaigns").update({ status: "active" }).eq("id", campaign.id);
+      await sql()`update campaigns set status = 'active', updated_at = now() where id = ${campaign.id}`;
       activated = true;
     }
 
@@ -113,7 +108,11 @@ export async function POST(req: NextRequest) {
       action: activated ? "launch_campaign" : "build_campaign",
       target_type: "campaign",
       target_id: campaign.id,
-      detail: { meta_campaign_id: metaCampaignId, daily_budget_cents: budget, variants: variants.length },
+      detail: {
+        meta_campaign_id: metaCampaignId,
+        daily_budget_cents: budget,
+        variants: variants.length,
+      },
       rationale: activated
         ? `Built and activated (autonomy=auto) at $${(budget / 100).toFixed(2)}/day — ${gate.reason}`
         : `Built PAUSED with ${variants.length} ad variants; awaiting approval (autonomy=approve)`,
@@ -125,19 +124,4 @@ export async function POST(req: NextRequest) {
     await logAction({ actor: "builder", action: "launch_failed", rationale: message });
     return NextResponse.json({ error: message }, { status: 500 });
   }
-}
-
-async function currentSpendState(): Promise<SpendState> {
-  const { data: active } = await db()
-    .from("campaigns")
-    .select("daily_budget_cents")
-    .eq("status", "active");
-  const { data: totals } = await db().from("metrics_daily").select("spend_cents");
-  return {
-    activeDailyBudgetCents: (active ?? []).reduce(
-      (a, c) => a + (c.daily_budget_cents ?? 0),
-      0
-    ),
-    totalSpendCents: (totals ?? []).reduce((a, m) => a + (m.spend_cents ?? 0), 0),
-  };
 }

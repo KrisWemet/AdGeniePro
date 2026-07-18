@@ -1,4 +1,4 @@
-import { db } from "@/lib/db";
+import { sql } from "@/lib/db";
 
 export const dynamic = "force-dynamic";
 
@@ -13,12 +13,8 @@ interface ActionRow {
 }
 
 export default async function Activity() {
-  const { data } = await db()
-    .from("ai_actions")
-    .select("*")
-    .order("created_at", { ascending: false })
-    .limit(200);
-  const actions = (data ?? []) as ActionRow[];
+  const actions = await sql()<ActionRow[]>`
+    select * from ai_actions order by created_at desc limit 200`;
 
   return (
     <div className="space-y-4">

@@ -1,19 +1,36 @@
-import { createClient, SupabaseClient } from "@supabase/supabase-js";
+import postgres from "postgres";
 
-// Server-only Supabase client using the service-role key. Never import this
-// from a client component.
-let client: SupabaseClient | null = null;
+// Plain-Postgres data layer. Works with any provider that hands out a
+// connection string (Neon, Railway, RDS, Supabase, ...). Serverless-friendly:
+// one connection, no prepared statements (safe behind pgbouncer/Neon pooler).
+let client: postgres.Sql | null = null;
 
-export function db(): SupabaseClient {
+export function sql(): postgres.Sql {
   if (!client) {
-    const url = process.env.SUPABASE_URL;
-    const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-    if (!url || !key) {
-      throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set");
+    const url = process.env.DATABASE_URL;
+    if (!url) {
+      throw new Error("DATABASE_URL must be set (e.g. a Neon Postgres connection string)");
     }
-    client = createClient(url, key, { auth: { persistSession: false } });
+    client = postgres(url, {
+      ssl: "require",
+      max: 1,
+      prepare: false,
+      types: {
+        // Return numeric columns as JS numbers instead of strings.
+        numeric: {
+          to: 1700,
+          from: [1700],
+          serialize: (x: number) => String(x),
+          parse: (x: string) => Number(x),
+        },
+      },
+    });
   }
   return client;
+}
+
+export function isUuid(v: string | null | undefined): v is string {
+  return !!v && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
 }
 
 export interface AppSettings {
@@ -65,13 +82,9 @@ export interface MetricsDaily {
 }
 
 export async function getSettings(): Promise<AppSettings> {
-  const { data, error } = await db()
-    .from("app_settings")
-    .select("*")
-    .eq("id", 1)
-    .single();
-  if (error) throw new Error(`failed to load settings: ${error.message}`);
-  return data as AppSettings;
+  const rows = await sql()<AppSettings[]>`select * from app_settings where id = 1`;
+  if (rows.length === 0) throw new Error("app_settings row missing — run the migrations");
+  return rows[0];
 }
 
 export async function logAction(entry: {
@@ -82,6 +95,28 @@ export async function logAction(entry: {
   detail?: unknown;
   rationale?: string;
 }): Promise<void> {
-  const { error } = await db().from("ai_actions").insert(entry);
-  if (error) console.error("failed to log ai_action:", error.message);
+  try {
+    await sql()`
+      insert into ai_actions (actor, action, target_type, target_id, detail, rationale)
+      values (${entry.actor}, ${entry.action}, ${entry.target_type ?? null},
+              ${entry.target_id ?? null},
+              ${entry.detail ? sql().json(entry.detail as never) : null},
+              ${entry.rationale ?? null})`;
+  } catch (err) {
+    console.error("failed to log ai_action:", err);
+  }
+}
+
+// Shared by every spend-affecting code path.
+export async function currentSpendState(): Promise<{
+  activeDailyBudgetCents: number;
+  totalSpendCents: number;
+}> {
+  const [row] = await sql()<
+    Array<{ active_daily: number; total_spend: number }>
+  >`
+    select
+      coalesce((select sum(daily_budget_cents) from campaigns where status = 'active'), 0)::int as active_daily,
+      coalesce((select sum(spend_cents) from metrics_daily), 0)::int as total_spend`;
+  return { activeDailyBudgetCents: row.active_daily, totalSpendCents: row.total_spend };
 }

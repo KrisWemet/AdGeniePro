@@ -1,5 +1,5 @@
 import { createHmac } from "crypto";
-import { db, logAction } from "./db";
+import { sql, logAction } from "./db";
 
 // Buyers get the upsell sequence; non-buyers get the stepping-stone
 // (tripwire) sequence that warms them back toward the ClickBank offer.
@@ -13,29 +13,23 @@ export async function enrollLead(
   clickbankProductId: string,
   audience: "buyers" | "non_buyers"
 ): Promise<number> {
-  const { data: product } = await db()
-    .from("own_products")
-    .select("id")
-    .eq("clickbank_product_id", clickbankProductId)
-    .eq("kind", AUDIENCE_KIND[audience])
-    .eq("status", "live")
-    .maybeSingle();
+  const [product] = await sql()<Array<{ id: string }>>`
+    select id from own_products
+    where clickbank_product_id = ${clickbankProductId}
+      and kind = ${AUDIENCE_KIND[audience]} and status = 'live'
+    limit 1`;
   if (!product) return 0;
 
-  const { data: sequence } = await db()
-    .from("email_sequences")
-    .select("id")
-    .eq("own_product_id", product.id)
-    .eq("audience", audience)
-    .maybeSingle();
+  const [sequence] = await sql()<Array<{ id: string }>>`
+    select id from email_sequences
+    where own_product_id = ${product.id} and audience = ${audience}
+    limit 1`;
   if (!sequence) return 0;
 
-  const { data: steps } = await db()
-    .from("email_steps")
-    .select("id, delay_hours")
-    .eq("sequence_id", sequence.id)
-    .order("step_number");
-  if (!steps || steps.length === 0) return 0;
+  const steps = await sql()<Array<{ id: string; delay_hours: number }>>`
+    select id, delay_hours from email_steps
+    where sequence_id = ${sequence.id} order by step_number`;
+  if (steps.length === 0) return 0;
 
   let cumulativeHours = 0;
   const rows = steps.map((s) => {
@@ -46,10 +40,9 @@ export async function enrollLead(
       scheduled_at: new Date(Date.now() + cumulativeHours * 3600_000).toISOString(),
     };
   });
-  const { error } = await db()
-    .from("email_sends")
-    .upsert(rows, { onConflict: "lead_id,step_id", ignoreDuplicates: true });
-  if (error) throw new Error(error.message);
+  await sql()`
+    insert into email_sends ${sql()(rows)}
+    on conflict (lead_id, step_id) do nothing`;
   return rows.length;
 }
 
@@ -59,11 +52,9 @@ export async function promoteLeadToBuyer(
   email: string,
   status: "buyer" | "tripwire_buyer" = "buyer"
 ): Promise<void> {
-  const { data: lead } = await db()
-    .from("leads")
-    .select("id, clickbank_product_id")
-    .eq("email", email.toLowerCase())
-    .maybeSingle();
+  const [lead] = await sql()<
+    Array<{ id: string; clickbank_product_id: string | null }>
+  >`select id, clickbank_product_id from leads where email = ${email.toLowerCase()}`;
   if (!lead) {
     await logAction({
       actor: "funnel",
@@ -73,17 +64,13 @@ export async function promoteLeadToBuyer(
     return;
   }
 
-  await db()
-    .from("leads")
-    .update({ status, purchased_at: new Date().toISOString() })
-    .eq("id", lead.id);
+  await sql()`
+    update leads set status = ${status}, purchased_at = now() where id = ${lead.id}`;
 
   // Cancel any not-yet-sent non-buyer emails.
-  await db()
-    .from("email_sends")
-    .update({ status: "skipped", error: "lead purchased" })
-    .eq("lead_id", lead.id)
-    .eq("status", "scheduled");
+  await sql()`
+    update email_sends set status = 'skipped', error = 'lead purchased'
+    where lead_id = ${lead.id} and status = 'scheduled'`;
 
   if (status === "buyer" && lead.clickbank_product_id) {
     const enrolled = await enrollLead(lead.id, lead.clickbank_product_id, "buyers");

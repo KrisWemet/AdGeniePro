@@ -1,6 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db, logAction } from "@/lib/db";
+import { sql, isUuid, logAction } from "@/lib/db";
 import { enrollLead } from "@/lib/funnel";
+
+interface Lead {
+  id: string;
+  status: string;
+}
 
 // Public opt-in endpoint for bridge/landing pages. Accepts JSON or form posts:
 // { email, name?, campaign_id? }. New leads are enrolled in the non-buyer
@@ -28,31 +33,20 @@ export async function POST(req: NextRequest) {
     if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
       return NextResponse.json({ error: "invalid email" }, { status: 400 });
     }
+    if (!isUuid(campaignId)) campaignId = null;
 
     let clickbankProductId: string | null = null;
     if (campaignId) {
-      const { data: campaign } = await db()
-        .from("campaigns")
-        .select("product_id")
-        .eq("id", campaignId)
-        .maybeSingle();
+      const [campaign] = await sql()<Array<{ product_id: string }>>`
+        select product_id from campaigns where id = ${campaignId}`;
       clickbankProductId = campaign?.product_id ?? null;
     }
 
-    const { data: lead, error } = await db()
-      .from("leads")
-      .upsert(
-        {
-          email,
-          name,
-          source_campaign_id: campaignId,
-          clickbank_product_id: clickbankProductId,
-        },
-        { onConflict: "email", ignoreDuplicates: false }
-      )
-      .select()
-      .single();
-    if (error) throw new Error(error.message);
+    const [lead] = await sql()<Lead[]>`
+      insert into leads (email, name, source_campaign_id, clickbank_product_id)
+      values (${email}, ${name}, ${campaignId}, ${clickbankProductId})
+      on conflict (email) do update set name = coalesce(excluded.name, leads.name)
+      returning id, status`;
 
     let enrolled = 0;
     if (clickbankProductId && lead.status === "subscriber") {

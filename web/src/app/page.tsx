@@ -1,4 +1,4 @@
-import { db, getSettings } from "@/lib/db";
+import { sql, getSettings } from "@/lib/db";
 
 export const dynamic = "force-dynamic";
 
@@ -8,14 +8,18 @@ function usd(cents: number): string {
 
 export default async function Overview() {
   const settings = await getSettings();
-  const { data: metrics } = await db().from("metrics_daily").select("*");
-  const { data: campaigns } = await db().from("campaigns").select("id,status");
+  const [totals] = await sql()<Array<{ spend: number; revenue: number }>>`
+    select coalesce(sum(spend_cents), 0)::int as spend,
+           coalesce(sum(revenue_cents), 0)::int as revenue
+    from metrics_daily`;
+  const [counts] = await sql()<Array<{ active: number; pending: number }>>`
+    select count(*) filter (where status = 'active')::int as active,
+           count(*) filter (where status = 'pending_approval')::int as pending
+    from campaigns`;
 
-  const spend = (metrics ?? []).reduce((a, m) => a + (m.spend_cents ?? 0), 0);
-  const revenue = (metrics ?? []).reduce((a, m) => a + (m.revenue_cents ?? 0), 0);
+  const spend = totals.spend;
+  const revenue = totals.revenue;
   const profit = revenue - spend;
-  const active = (campaigns ?? []).filter((c) => c.status === "active").length;
-  const pending = (campaigns ?? []).filter((c) => c.status === "pending_approval").length;
 
   const cards = [
     { label: "Total spend", value: usd(spend) },
@@ -26,8 +30,8 @@ export default async function Overview() {
       tone: profit >= 0 ? "text-emerald-400" : "text-red-400",
     },
     { label: "ROAS", value: spend > 0 ? (revenue / spend).toFixed(2) : "—" },
-    { label: "Active campaigns", value: String(active) },
-    { label: "Awaiting approval", value: String(pending) },
+    { label: "Active campaigns", value: String(counts.active) },
+    { label: "Awaiting approval", value: String(counts.pending) },
   ];
 
   return (

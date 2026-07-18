@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db, getSettings, logAction } from "@/lib/db";
+import { sql, getSettings, logAction } from "@/lib/db";
 import { sendEmail } from "@/lib/email";
 import { requireCronAuth } from "@/lib/cron-auth";
 
@@ -7,18 +7,14 @@ export const maxDuration = 300;
 
 interface DueSend {
   id: string;
-  lead: { id: string; email: string; name: string | null; status: string };
-  step: {
-    subject: string;
-    body_md: string;
-    sequence: {
-      own_product: {
-        slug: string;
-        checkout_url: string | null;
-        clickbank_product: { affiliate_link: string | null } | null;
-      };
-    };
-  };
+  email: string;
+  name: string | null;
+  lead_status: string;
+  subject: string;
+  body_md: string;
+  slug: string;
+  checkout_url: string | null;
+  affiliate_link: string | null;
 }
 
 // Sends due sequence emails. Skips unsubscribed leads. Respects the kill
@@ -33,57 +29,49 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ skipped: "kill switch engaged" });
     }
 
-    const { data, error } = await db()
-      .from("email_sends")
-      .select(
-        `id,
-         lead:leads (id, email, name, status),
-         step:email_steps (subject, body_md,
-           sequence:email_sequences (
-             own_product:own_products (slug, checkout_url,
-               clickbank_product:products (affiliate_link))))`
-      )
-      .eq("status", "scheduled")
-      .lte("scheduled_at", new Date().toISOString())
-      .limit(50);
-    if (error) throw new Error(error.message);
+    const due = await sql()<DueSend[]>`
+      select es.id, l.email, l.name, l.status as lead_status,
+             st.subject, st.body_md,
+             op.slug, op.checkout_url, p.affiliate_link
+      from email_sends es
+      join leads l on l.id = es.lead_id
+      join email_steps st on st.id = es.step_id
+      join email_sequences seq on seq.id = st.sequence_id
+      join own_products op on op.id = seq.own_product_id
+      left join products p on p.id = op.clickbank_product_id
+      where es.status = 'scheduled' and es.scheduled_at <= now()
+      limit 50`;
 
     const base = process.env.APP_BASE_URL ?? "";
     let sent = 0;
     let failed = 0;
 
-    for (const row of (data ?? []) as unknown as DueSend[]) {
-      if (!row.lead || !row.step) continue;
-      if (row.lead.status === "unsubscribed") {
-        await db()
-          .from("email_sends")
-          .update({ status: "skipped", error: "unsubscribed" })
-          .eq("id", row.id);
+    for (const row of due) {
+      if (row.lead_status === "unsubscribed") {
+        await sql()`
+          update email_sends set status = 'skipped', error = 'unsubscribed'
+          where id = ${row.id}`;
         continue;
       }
-      const own = row.step.sequence.own_product;
-      const productLink = own.checkout_url ?? `${base}/p/${own.slug}`;
-      const clickbankLink = own.clickbank_product?.affiliate_link ?? productLink;
+      const productLink = row.checkout_url ?? `${base}/p/${row.slug}`;
+      const clickbankLink = row.affiliate_link ?? productLink;
       try {
         await sendEmail({
-          to: row.lead.email,
-          toName: row.lead.name,
-          subject: row.step.subject,
-          bodyMd: row.step.body_md,
+          to: row.email,
+          toName: row.name,
+          subject: row.subject,
+          bodyMd: row.body_md,
           productLink,
           clickbankLink,
         });
-        await db()
-          .from("email_sends")
-          .update({ status: "sent", sent_at: new Date().toISOString() })
-          .eq("id", row.id);
+        await sql()`
+          update email_sends set status = 'sent', sent_at = now() where id = ${row.id}`;
         sent++;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        await db()
-          .from("email_sends")
-          .update({ status: "failed", error: message.slice(0, 500) })
-          .eq("id", row.id);
+        await sql()`
+          update email_sends set status = 'failed', error = ${message.slice(0, 500)}
+          where id = ${row.id}`;
         failed++;
       }
     }

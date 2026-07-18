@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db, getSettings, logAction } from "@/lib/db";
+import { sql, getSettings, logAction } from "@/lib/db";
 import { fetchMarketplaceCandidates, hoplink } from "@/lib/clickbank";
 import { scoreProducts } from "@/lib/anthropic";
 import { requireCronAuth } from "@/lib/cron-auth";
@@ -49,10 +49,20 @@ export async function GET(req: NextRequest) {
       };
     });
 
-    const { error } = await db()
-      .from("products")
-      .upsert(rows, { onConflict: "source,vendor_id" });
-    if (error) throw new Error(error.message);
+    await sql()`
+      insert into products ${sql()(rows)}
+      on conflict (source, vendor_id) do update set
+        title = excluded.title,
+        description = excluded.description,
+        category = excluded.category,
+        gravity = excluded.gravity,
+        commission_pct = excluded.commission_pct,
+        avg_dollars_per_sale = excluded.avg_dollars_per_sale,
+        affiliate_link = excluded.affiliate_link,
+        ai_score = excluded.ai_score,
+        ai_rationale = excluded.ai_rationale,
+        status = excluded.status,
+        updated_at = now()`;
 
     const shortlisted = rows.filter((r) => r.status === "shortlisted").length;
     await logAction({

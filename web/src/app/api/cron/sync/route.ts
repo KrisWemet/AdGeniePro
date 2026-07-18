@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db, logAction, type Campaign } from "@/lib/db";
+import { sql, logAction, type Campaign } from "@/lib/db";
 import { getCampaignInsights } from "@/lib/meta";
 import { fetchRevenueCentsForDay } from "@/lib/clickbank";
 import { requireCronAuth } from "@/lib/cron-auth";
@@ -19,47 +19,39 @@ export async function GET(req: NextRequest) {
   if (denied) return denied;
 
   try {
-    const { data: campaigns, error } = await db()
-      .from("campaigns")
-      .select("*")
-      .not("meta_campaign_id", "is", null)
-      .in("status", ["active", "paused"]);
-    if (error) throw new Error(error.message);
+    const campaigns = await sql()<Campaign[]>`
+      select * from campaigns
+      where meta_campaign_id is not null and status in ('active', 'paused')`;
 
     const days = [isoDate(new Date(Date.now() - 86400000)), isoDate(new Date())];
     let updates = 0;
 
-    for (const c of (campaigns ?? []) as Campaign[]) {
+    for (const c of campaigns) {
       for (const date of days) {
         const insights = await getCampaignInsights(c.meta_campaign_id as string, date);
-        const { error: upErr } = await db().from("metrics_daily").upsert(
-          {
-            campaign_id: c.id,
-            date,
-            spend_cents: insights.spendCents,
-            impressions: insights.impressions,
-            clicks: insights.clicks,
-            meta_conversions: insights.conversions,
-          },
-          { onConflict: "campaign_id,date" }
-        );
-        if (upErr) throw new Error(upErr.message);
+        await sql()`
+          insert into metrics_daily
+            (campaign_id, date, spend_cents, impressions, clicks, meta_conversions)
+          values (${c.id}, ${date}, ${insights.spendCents}, ${insights.impressions},
+                  ${insights.clicks}, ${insights.conversions})
+          on conflict (campaign_id, date) do update set
+            spend_cents = excluded.spend_cents,
+            impressions = excluded.impressions,
+            clicks = excluded.clicks,
+            meta_conversions = excluded.meta_conversions`;
         updates++;
       }
     }
 
     // Revenue: only auto-attribute when exactly one campaign is running.
-    const active = ((campaigns ?? []) as Campaign[]).filter((c) => c.status === "active");
+    const active = campaigns.filter((c) => c.status === "active");
     for (const date of days) {
       const revenue = await fetchRevenueCentsForDay(date);
       if (revenue === null) continue; // ClickBank API not configured
       if (active.length === 1) {
-        const { error: revErr } = await db()
-          .from("metrics_daily")
-          .update({ revenue_cents: revenue })
-          .eq("campaign_id", active[0].id)
-          .eq("date", date);
-        if (revErr) throw new Error(revErr.message);
+        await sql()`
+          update metrics_daily set revenue_cents = ${revenue}
+          where campaign_id = ${active[0].id} and date = ${date}`;
       } else if (active.length > 1 && revenue > 0) {
         await logAction({
           actor: "sync",

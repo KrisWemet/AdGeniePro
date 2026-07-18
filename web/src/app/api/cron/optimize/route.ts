@@ -1,7 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db, getSettings, logAction, type Campaign, type MetricsDaily } from "@/lib/db";
+import {
+  sql,
+  getSettings,
+  logAction,
+  currentSpendState,
+  type Campaign,
+  type MetricsDaily,
+} from "@/lib/db";
 import { decideForCampaign } from "@/lib/optimizer";
-import { canAllocateBudget, type SpendState } from "@/lib/guardrails";
+import { canAllocateBudget } from "@/lib/guardrails";
 import { setStatus, setAdSetDailyBudget } from "@/lib/meta";
 import { requireCronAuth } from "@/lib/cron-auth";
 
@@ -18,13 +25,11 @@ export async function GET(req: NextRequest) {
     const settings = await getSettings();
     if (settings.kill_switch) {
       // Kill switch pauses everything that's running, then stops.
-      const { data: running } = await db()
-        .from("campaigns")
-        .select("*")
-        .eq("status", "active");
-      for (const c of (running ?? []) as Campaign[]) {
+      const running = await sql()<Campaign[]>`
+        select * from campaigns where status = 'active'`;
+      for (const c of running) {
         if (c.meta_campaign_id) await setStatus(c.meta_campaign_id, "PAUSED");
-        await db().from("campaigns").update({ status: "killed" }).eq("id", c.id);
+        await sql()`update campaigns set status = 'killed', updated_at = now() where id = ${c.id}`;
         await logAction({
           actor: "optimizer",
           action: "kill_campaign",
@@ -33,31 +38,25 @@ export async function GET(req: NextRequest) {
           rationale: "kill switch engaged — pausing all delivery",
         });
       }
-      return NextResponse.json({ killed: running?.length ?? 0 });
+      return NextResponse.json({ killed: running.length });
     }
 
-    const { data: campaigns, error } = await db()
-      .from("campaigns")
-      .select("*")
-      .eq("status", "active");
-    if (error) throw new Error(error.message);
+    const campaigns = await sql()<Campaign[]>`
+      select * from campaigns where status = 'active'`;
 
     const spendState = await currentSpendState();
     const results: Array<{ campaign: string; action: string }> = [];
 
-    for (const c of (campaigns ?? []) as Campaign[]) {
-      const { data: metrics } = await db()
-        .from("metrics_daily")
-        .select("*")
-        .eq("campaign_id", c.id)
-        .order("date", { ascending: false })
-        .limit(7);
+    for (const c of campaigns) {
+      const metrics = await sql()<MetricsDaily[]>`
+        select * from metrics_daily
+        where campaign_id = ${c.id} order by date desc limit 7`;
 
-      const decision = decideForCampaign(c, (metrics ?? []) as MetricsDaily[], settings);
+      const decision = decideForCampaign(c, metrics, settings);
 
       if (decision.action === "pause") {
         if (c.meta_campaign_id) await setStatus(c.meta_campaign_id, "PAUSED");
-        await db().from("campaigns").update({ status: "paused" }).eq("id", c.id);
+        await sql()`update campaigns set status = 'paused', updated_at = now() where id = ${c.id}`;
       } else if (decision.action === "scale_up" || decision.action === "scale_down") {
         const gate = canAllocateBudget(
           settings,
@@ -79,10 +78,10 @@ export async function GET(req: NextRequest) {
         if (c.meta_adset_id) {
           await setAdSetDailyBudget(c.meta_adset_id, decision.newDailyBudgetCents);
         }
-        await db()
-          .from("campaigns")
-          .update({ daily_budget_cents: decision.newDailyBudgetCents })
-          .eq("id", c.id);
+        await sql()`
+          update campaigns set daily_budget_cents = ${decision.newDailyBudgetCents},
+            updated_at = now()
+          where id = ${c.id}`;
         spendState.activeDailyBudgetCents +=
           decision.newDailyBudgetCents - c.daily_budget_cents;
       }
@@ -107,19 +106,4 @@ export async function GET(req: NextRequest) {
     await logAction({ actor: "optimizer", action: "optimize_failed", rationale: message });
     return NextResponse.json({ error: message }, { status: 500 });
   }
-}
-
-async function currentSpendState(): Promise<SpendState> {
-  const { data: active } = await db()
-    .from("campaigns")
-    .select("daily_budget_cents")
-    .eq("status", "active");
-  const { data: totals } = await db().from("metrics_daily").select("spend_cents");
-  return {
-    activeDailyBudgetCents: (active ?? []).reduce(
-      (a, c) => a + (c.daily_budget_cents ?? 0),
-      0
-    ),
-    totalSpendCents: (totals ?? []).reduce((a, m) => a + (m.spend_cents ?? 0), 0),
-  };
 }

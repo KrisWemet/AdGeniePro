@@ -1,14 +1,12 @@
-import { db, type Product } from "@/lib/db";
+import { sql, type Product } from "@/lib/db";
 
 export const dynamic = "force-dynamic";
 
 export default async function Products() {
-  const { data } = await db()
-    .from("products")
-    .select("*")
-    .order("ai_score", { ascending: false, nullsFirst: false })
-    .limit(100);
-  const products = (data ?? []) as Product[];
+  const products = await sql()<Product[]>`
+    select * from products
+    order by ai_score desc nulls last
+    limit 100`;
 
   return (
     <div className="space-y-4">

@@ -2,7 +2,7 @@
 
 AI-run affiliate ad campaigns with hard budget guardrails.
 
-- **`web/`** — the application: a Next.js + Supabase dashboard and agent
+- **`web/`** — the application: a Next.js + Postgres dashboard and agent
   pipeline that discovers high-commission ClickBank products, has Claude score
   them and write Meta ad creatives, launches campaigns (paused-first, gated by
   budget caps and a kill switch), and optimizes them on a schedule with a full

@@ -1,4 +1,4 @@
-import { db } from "@/lib/db";
+import { sql } from "@/lib/db";
 
 export const dynamic = "force-dynamic";
 
@@ -11,27 +11,36 @@ interface OwnProductRow {
   status: string;
   checkout_url: string | null;
   gap_rationale: string | null;
-  clickbank_product: { title: string } | null;
+  clickbank_title: string | null;
+}
+
+interface StatusCount {
+  status: string;
+  n: number;
 }
 
 export default async function Funnel() {
-  const { data: products } = await db()
-    .from("own_products")
-    .select("id, kind, title, slug, price_cents, status, checkout_url, gap_rationale, clickbank_product:products(title)")
-    .order("created_at", { ascending: false });
-  const { data: leads } = await db().from("leads").select("status");
-  const { data: sends } = await db().from("email_sends").select("status");
+  const products = await sql()<OwnProductRow[]>`
+    select op.id, op.kind, op.title, op.slug, op.price_cents, op.status,
+           op.checkout_url, op.gap_rationale, p.title as clickbank_title
+    from own_products op
+    left join products p on p.id = op.clickbank_product_id
+    order by op.created_at desc`;
+  const leadCounts = await sql()<StatusCount[]>`
+    select status, count(*)::int as n from leads group by status`;
+  const sendCounts = await sql()<StatusCount[]>`
+    select status, count(*)::int as n from email_sends group by status`;
 
-  const count = (rows: Array<{ status: string }> | null, s: string) =>
-    (rows ?? []).filter((r) => r.status === s).length;
+  const count = (rows: StatusCount[], s: string) =>
+    rows.find((r) => r.status === s)?.n ?? 0;
 
   const stats = [
-    { label: "Subscribers", value: count(leads, "subscriber") },
-    { label: "Buyers", value: count(leads, "buyer") },
-    { label: "Tripwire buyers", value: count(leads, "tripwire_buyer") },
-    { label: "Emails sent", value: count(sends, "sent") },
-    { label: "Emails scheduled", value: count(sends, "scheduled") },
-    { label: "Unsubscribed", value: count(leads, "unsubscribed") },
+    { label: "Subscribers", value: count(leadCounts, "subscriber") },
+    { label: "Buyers", value: count(leadCounts, "buyer") },
+    { label: "Tripwire buyers", value: count(leadCounts, "tripwire_buyer") },
+    { label: "Emails sent", value: count(sendCounts, "sent") },
+    { label: "Emails scheduled", value: count(sendCounts, "scheduled") },
+    { label: "Unsubscribed", value: count(leadCounts, "unsubscribed") },
   ];
 
   return (
@@ -55,12 +64,12 @@ export default async function Funnel() {
       </p>
 
       <div className="space-y-3">
-        {(products ?? []).length === 0 && (
+        {products.length === 0 && (
           <div className="rounded border border-zinc-800 bg-zinc-900 p-6 text-zinc-400 text-sm">
             No own products yet.
           </div>
         )}
-        {((products ?? []) as unknown as OwnProductRow[]).map((p) => (
+        {products.map((p) => (
           <div key={p.id} className="rounded-lg border border-zinc-800 bg-zinc-900 p-4 space-y-2">
             <div className="flex items-center gap-3">
               <span
@@ -78,10 +87,8 @@ export default async function Funnel() {
                 view content →
               </a>
             </div>
-            {p.clickbank_product && (
-              <div className="text-xs text-zinc-500">
-                Companion to: {p.clickbank_product.title}
-              </div>
+            {p.clickbank_title && (
+              <div className="text-xs text-zinc-500">Companion to: {p.clickbank_title}</div>
             )}
             {p.gap_rationale && (
               <div className="text-sm text-zinc-400">{p.gap_rationale}</div>

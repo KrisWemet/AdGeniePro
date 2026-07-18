@@ -1,12 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db, logAction } from "@/lib/db";
+import { sql, logAction } from "@/lib/db";
 
 // Updates budget caps, autonomy mode, and the kill switch from the settings
 // page form.
 export async function POST(req: NextRequest) {
   const form = await req.formData();
 
-  const update: Record<string, unknown> = { updated_at: new Date().toISOString() };
+  const update: Record<string, unknown> = {};
 
   const dollars = (name: string) => {
     const v = form.get(name);
@@ -27,10 +27,13 @@ export async function POST(req: NextRequest) {
   if (autonomy === "approve" || autonomy === "auto") update.autonomy_mode = autonomy;
 
   update.kill_switch = form.get("kill_switch") === "on";
+  update.updated_at = new Date().toISOString();
 
-  const { error } = await db().from("app_settings").update(update).eq("id", 1);
-  if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 });
+  try {
+    await sql()`update app_settings set ${sql()(update)} where id = 1`;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return NextResponse.json({ error: message }, { status: 500 });
   }
 
   await logAction({

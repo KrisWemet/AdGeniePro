@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db, logAction, type Product } from "@/lib/db";
+import { sql, isUuid, logAction, type Product } from "@/lib/db";
 import { generateOwnProduct, generateEmailSequence } from "@/lib/anthropic";
 
 export const maxDuration = 300;
@@ -17,35 +17,26 @@ export async function POST(req: NextRequest) {
     if (kind !== "upsell" && kind !== "tripwire") {
       return NextResponse.json({ error: "kind must be upsell|tripwire" }, { status: 400 });
     }
+    if (!isUuid(product_id)) {
+      return NextResponse.json({ error: "invalid product_id" }, { status: 400 });
+    }
 
-    const { data: product, error: pErr } = await db()
-      .from("products")
-      .select("*")
-      .eq("id", product_id)
-      .single();
-    if (pErr || !product) {
+    const [p] = await sql()<Product[]>`select * from products where id = ${product_id}`;
+    if (!p) {
       return NextResponse.json({ error: "product not found" }, { status: 404 });
     }
-    const p = product as Product;
 
     const draft = await generateOwnProduct(p, kind);
 
-    const { data: own, error: oErr } = await db()
-      .from("own_products")
-      .insert({
-        clickbank_product_id: p.id,
-        kind,
-        title: draft.title,
-        slug: `${draft.slug}-${Date.now().toString(36)}`,
-        price_cents: Math.round(draft.price_dollars * 100),
-        summary: draft.summary,
-        gap_rationale: draft.gap_rationale,
-        content_md: draft.content_md,
-        status: "ready",
-      })
-      .select()
-      .single();
-    if (oErr) throw new Error(oErr.message);
+    const [own] = await sql()<Array<{ id: string; price_cents: number; slug: string }>>`
+      insert into own_products
+        (clickbank_product_id, kind, title, slug, price_cents, summary,
+         gap_rationale, content_md, status)
+      values (${p.id}, ${kind}, ${draft.title},
+              ${`${draft.slug}-${Date.now().toString(36)}`},
+              ${Math.round(draft.price_dollars * 100)}, ${draft.summary},
+              ${draft.gap_rationale}, ${draft.content_md}, 'ready')
+      returning id, price_cents, slug`;
 
     const audience = kind === "upsell" ? "buyers" : "non_buyers";
     const sequence = await generateEmailSequence(
@@ -54,23 +45,19 @@ export async function POST(req: NextRequest) {
       audience
     );
 
-    const { data: seq, error: sErr } = await db()
-      .from("email_sequences")
-      .insert({ own_product_id: own.id, audience, name: sequence.name })
-      .select()
-      .single();
-    if (sErr) throw new Error(sErr.message);
+    const [seq] = await sql()<Array<{ id: string }>>`
+      insert into email_sequences (own_product_id, audience, name)
+      values (${own.id}, ${audience}, ${sequence.name})
+      returning id`;
 
-    const { error: stErr } = await db().from("email_steps").insert(
-      sequence.steps.map((s) => ({
-        sequence_id: seq.id,
-        step_number: s.step_number,
-        delay_hours: s.delay_hours,
-        subject: s.subject,
-        body_md: s.body_md,
-      }))
-    );
-    if (stErr) throw new Error(stErr.message);
+    const stepRows = sequence.steps.map((s) => ({
+      sequence_id: seq.id,
+      step_number: s.step_number,
+      delay_hours: s.delay_hours,
+      subject: s.subject,
+      body_md: s.body_md,
+    }));
+    await sql()`insert into email_steps ${sql()(stepRows)}`;
 
     await logAction({
       actor: "product_creator",

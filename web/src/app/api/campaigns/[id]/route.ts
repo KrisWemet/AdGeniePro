@@ -1,7 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db, getSettings, logAction, type Campaign } from "@/lib/db";
+import {
+  sql,
+  isUuid,
+  getSettings,
+  logAction,
+  currentSpendState,
+  type Campaign,
+} from "@/lib/db";
 import { setStatus } from "@/lib/meta";
-import { canAllocateBudget, type SpendState } from "@/lib/guardrails";
+import { canAllocateBudget } from "@/lib/guardrails";
 
 // Human controls: approve a pending campaign, or pause an active one.
 export async function POST(
@@ -9,20 +16,18 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
+  if (!isUuid(id)) {
+    return NextResponse.json({ error: "invalid campaign id" }, { status: 400 });
+  }
   const form = await req.formData();
   const op = String(form.get("op") ?? "");
 
-  const { data: campaign, error } = await db()
-    .from("campaigns")
-    .select("*")
-    .eq("id", id)
-    .single();
-  if (error || !campaign) {
-    return NextResponse.json({ error: "campaign not found" }, { status: 404 });
-  }
-  const c = campaign as Campaign;
-
   try {
+    const [c] = await sql()<Campaign[]>`select * from campaigns where id = ${id}`;
+    if (!c) {
+      return NextResponse.json({ error: "campaign not found" }, { status: 404 });
+    }
+
     if (op === "approve") {
       const settings = await getSettings();
       const spendState = await currentSpendState();
@@ -32,7 +37,7 @@ export async function POST(
       }
       if (c.meta_campaign_id) await setStatus(c.meta_campaign_id, "ACTIVE");
       if (c.meta_adset_id) await setStatus(c.meta_adset_id, "ACTIVE");
-      await db().from("campaigns").update({ status: "active" }).eq("id", id);
+      await sql()`update campaigns set status = 'active', updated_at = now() where id = ${id}`;
       await logAction({
         actor: "human",
         action: "approve_campaign",
@@ -42,7 +47,7 @@ export async function POST(
       });
     } else if (op === "pause") {
       if (c.meta_campaign_id) await setStatus(c.meta_campaign_id, "PAUSED");
-      await db().from("campaigns").update({ status: "paused" }).eq("id", id);
+      await sql()`update campaigns set status = 'paused', updated_at = now() where id = ${id}`;
       await logAction({
         actor: "human",
         action: "pause_campaign",
@@ -59,19 +64,4 @@ export async function POST(
   }
 
   return NextResponse.redirect(new URL("/campaigns", req.url), 303);
-}
-
-async function currentSpendState(): Promise<SpendState> {
-  const { data: active } = await db()
-    .from("campaigns")
-    .select("daily_budget_cents")
-    .eq("status", "active");
-  const { data: totals } = await db().from("metrics_daily").select("spend_cents");
-  return {
-    activeDailyBudgetCents: (active ?? []).reduce(
-      (a, c) => a + (c.daily_budget_cents ?? 0),
-      0
-    ),
-    totalSpendCents: (totals ?? []).reduce((a, m) => a + (m.spend_cents ?? 0), 0),
-  };
 }
