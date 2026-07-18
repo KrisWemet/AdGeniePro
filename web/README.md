@@ -26,6 +26,36 @@ hard budget guardrails you control:
 - Every AI decision — including refusals ("wanted to scale but guardrail said
   no") — is written to `ai_actions` with a plain-English rationale.
 
+### The funnel layer (own products + email)
+
+Beyond running ads for ClickBank offers, AdGeniePro monetizes the traffic twice
+more with AI-created digital products of your own:
+
+- **Upsell (buyers)** — after a ClickBank sale (detected via the ClickBank INS
+  webhook), the buyer enters a 4-email sequence selling a companion product
+  Claude designed to fill the biggest gap the main product leaves open
+  ($27–$67).
+- **Stepping stone (non-buyers)** — leads who opt in on your bridge page but
+  don't buy enter a 5-email sequence: value first, then a low-priced ($5–$17)
+  quick-win product Claude wrote, then a bridge back to the ClickBank offer.
+
+Generate both for any discovered product:
+
+```bash
+curl -X POST $APP/api/products/own/generate -u admin:$PASS \
+  -H 'content-type: application/json' \
+  -d '{"product_id": "<uuid>", "kind": "tripwire"}'   # and again with "upsell"
+```
+
+Review the generated product and emails on the **Funnel** page, optionally add
+a Stripe Payment Link as the checkout URL (empty = delivered free at
+`/p/<slug>`), and flip it to **live** to start enrollment. Emails send via
+Resend every 15 minutes; every send honors unsubscribes and the kill switch.
+
+Wire-up on the traffic side: your bridge page posts opt-ins to
+`POST /api/leads` (fields `email`, `name`, `campaign_id`), and ClickBank INS
+posts sale notifications to `POST /api/webhooks/clickbank`.
+
 ## Setup
 
 1. **Supabase**: create a project, run `supabase/migrations/0001_init.sql` in

@@ -11,6 +11,7 @@ const nav = [
   { href: "/", label: "Overview" },
   { href: "/products", label: "Products" },
   { href: "/campaigns", label: "Campaigns" },
+  { href: "/funnel", label: "Funnel" },
   { href: "/activity", label: "AI Activity" },
   { href: "/settings", label: "Settings" },
 ];
