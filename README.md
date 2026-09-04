@@ -502,7 +502,7 @@ adgenie/
   static/            dashboard
   cli.py             command line
   demo.py            end-to-end simulation
-tests/               481 tests
+tests/               480 tests
 legacy/              the original prototype scripts, kept for reference
 ```
 
