@@ -118,35 +118,63 @@ def new_click_id() -> str:
 # --------------------------------------------------------------------------
 
 
+_B36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+_PLATFORM_FLAGS = {"m": Platform.META, "g": Platform.GOOGLE}
+
+
+def _to_b36(value: int) -> str:
+    if value <= 0:
+        return "0"
+    out = ""
+    while value:
+        value, digit = divmod(value, 36)
+        out = _B36[digit] + out
+    return out
+
+
+def _from_b36(text: str) -> int:
+    try:
+        return int(text, 36)
+    except ValueError:
+        return 0
+
+
 def encode_subid(ctx: TrackingContext) -> str:
     """Pack the entity ids into a compact token.
 
-    Networks truncate sub-ids aggressively (ClickBank's TID is 24 characters),
-    so this stays short and uses no characters that need escaping.
+    Networks truncate sub-ids hard: ClickBank's TID field is 24 characters, and
+    a token that gets cut in half attributes revenue to nothing. So ids are
+    base-36 encoded, and only the offer and the creative are carried. The
+    campaign and ad group are derivable from the creative, and are included
+    only when there is no creative to derive them from.
     """
-    parts = [
-        f"o{ctx.offer_id}",
-        f"c{ctx.campaign_id}" if ctx.campaign_id else "",
-        f"g{ctx.ad_group_id}" if ctx.ad_group_id else "",
-        f"a{ctx.creative_id}" if ctx.creative_id else "",
-        f"p{ctx.platform.value[0]}" if ctx.platform else "",
-    ]
-    return "".join(p for p in parts if p)
-
-
-_SUBID_RE = re.compile(r"([ocgap])(\\w*?)(?=[ocgap]|$)")
-_PLATFORM_FLAGS = {"m": Platform.META, "g": Platform.GOOGLE}
+    parts = [f"o{_to_b36(ctx.offer_id)}"]
+    if ctx.creative_id:
+        parts.append(f"a{_to_b36(ctx.creative_id)}")
+    else:
+        if ctx.campaign_id:
+            parts.append(f"c{_to_b36(ctx.campaign_id)}")
+        if ctx.ad_group_id:
+            parts.append(f"g{_to_b36(ctx.ad_group_id)}")
+    if ctx.platform:
+        parts.append(f"p{ctx.platform.value[0]}")
+    # Base-36 digits include the segment letters, so the segments need an
+    # explicit separator to stay unambiguous.
+    return "-".join(parts)
 
 
 def decode_subid(token: str) -> TrackingContext:
     """Inverse of `encode_subid`. Unparseable segments are skipped, not fatal."""
     fields: dict[str, int] = {}
     platform: Platform | None = None
-    for key, value in re.findall(r"([ocga])(\d+)", token or ""):
-        fields[key] = int(value)
-    match = re.search(r"p([mg])(?!\d)", token or "")
-    if match:
-        platform = _PLATFORM_FLAGS.get(match.group(1))
+    for segment in (token or "").split("-"):
+        if len(segment) < 2:
+            continue
+        key, value = segment[0], segment[1:]
+        if key == "p":
+            platform = _PLATFORM_FLAGS.get(value)
+        elif key in "ocga" and re.fullmatch(r"[0-9a-z]+", value):
+            fields[key] = _from_b36(value)
     return TrackingContext(
         offer_id=fields.get("o", 0),
         campaign_id=fields.get("c"),
@@ -296,7 +324,15 @@ def record_click(
         ).scalar_one_or_none()
         if match:
             creative_id = match.id
-            ad_group_id = ad_group_id or match.ad_group_id
+
+    # The sub-id carries only the creative, so walk up to fill in its parents.
+    if creative_id and not (campaign_id and ad_group_id):
+        creative = session.get(Creative, creative_id)
+        if creative is not None:
+            ad_group_id = ad_group_id or creative.ad_group_id
+            group = session.get(AdGroup, creative.ad_group_id)
+            if group is not None:
+                campaign_id = campaign_id or group.campaign_id
 
     click = Click(
         click_id=new_click_id(),

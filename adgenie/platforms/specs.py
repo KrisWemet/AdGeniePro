@@ -111,6 +111,16 @@ def get_spec(platform: Platform, ad_format: str | None = None) -> AdSpec:
         raise ValueError(f"no spec for {platform.value}/{fmt}") from exc
 
 
+# A truncated result shorter than this is not worth the sentence boundary.
+_MIN_SENTENCE_CHARS = 20
+
+
+def _is_abbreviation(text: str, period_index: int) -> bool:
+    """Tell "Dr." and "U.S." apart from the end of a sentence."""
+    token = text[:period_index].rsplit(" ", 1)[-1]
+    return len(token) <= 2 or "." in token
+
+
 def truncate_to_spec(text: str, max_chars: int) -> str:
     """Trim to the limit, preferring a sentence boundary, then a word boundary.
 
@@ -122,9 +132,11 @@ def truncate_to_spec(text: str, max_chars: int) -> str:
         return text
 
     window = text[:max_chars]
-    # Prefer ending on a complete sentence if that keeps at least 60% of the budget.
+    # A complete short sentence reads better than a longer fragment, so prefer
+    # the last sentence boundary in the window. The 20-character floor keeps an
+    # abbreviation ("Dr.", "U.S.") from truncating the text to nothing.
     boundary = max(window.rfind(". "), window.rfind("! "), window.rfind("? "))
-    if boundary >= int(max_chars * 0.6):
+    if boundary + 1 >= _MIN_SENTENCE_CHARS and not _is_abbreviation(window, boundary):
         return window[: boundary + 1].strip()
     if window.endswith((".", "!", "?")):
         return window.strip()
