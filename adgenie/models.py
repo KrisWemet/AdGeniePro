@@ -20,6 +20,7 @@ import enum
 from datetime import date, datetime, timezone
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     Date,
     DateTime,
@@ -114,7 +115,12 @@ class EntityLevel(str, enum.Enum):
 
 
 class Offer(Base):
-    """An affiliate offer: the product, its payout and its promotion rules."""
+    """An affiliate offer: the product, its payout and its promotion rules.
+
+    Money columns are `BigInteger`: at a million micros to the dollar, a 32-bit
+    column overflows just past $2,147, which a lifetime spend total reaches
+    quickly. SQLite would hide the problem; Postgres would not.
+    """
 
     __tablename__ = "offers"
 
@@ -128,9 +134,9 @@ class Offer(Base):
     payout_type: Mapped[PayoutType] = mapped_column(
         Enum(PayoutType), default=PayoutType.CPA
     )
-    payout_micros: Mapped[int] = mapped_column(Integer, default=0)
+    payout_micros: Mapped[int] = mapped_column(BigInteger, default=0)
     payout_percent: Mapped[float] = mapped_column(Float, default=0.0)
-    average_order_value_micros: Mapped[int] = mapped_column(Integer, default=0)
+    average_order_value_micros: Mapped[int] = mapped_column(BigInteger, default=0)
     # Fraction of gross conversions the network later reverses (refunds).
     expected_reversal_rate: Mapped[float] = mapped_column(Float, default=0.10)
 
@@ -200,11 +206,11 @@ class Campaign(Base):
     external_id: Mapped[str | None] = mapped_column(String(120), index=True)
     objective: Mapped[str] = mapped_column(String(80), default="OUTCOME_SALES")
     bid_strategy: Mapped[str] = mapped_column(String(80), default="LOWEST_COST")
-    daily_budget_micros: Mapped[int] = mapped_column(Integer, default=0)
-    lifetime_budget_micros: Mapped[int] = mapped_column(Integer, default=0)
+    daily_budget_micros: Mapped[int] = mapped_column(BigInteger, default=0)
+    lifetime_budget_micros: Mapped[int] = mapped_column(BigInteger, default=0)
     target_roas: Mapped[float] = mapped_column(Float, default=1.30)
     # Optimizer will not push the daily budget past this.
-    max_daily_budget_micros: Mapped[int] = mapped_column(Integer, default=0)
+    max_daily_budget_micros: Mapped[int] = mapped_column(BigInteger, default=0)
 
     status: Mapped[EntityStatus] = mapped_column(
         Enum(EntityStatus), default=EntityStatus.DRAFT
@@ -232,9 +238,9 @@ class AdGroup(Base):
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     external_id: Mapped[str | None] = mapped_column(String(120), index=True)
 
-    daily_budget_micros: Mapped[int] = mapped_column(Integer, default=0)
-    max_daily_budget_micros: Mapped[int] = mapped_column(Integer, default=0)
-    bid_micros: Mapped[int] = mapped_column(Integer, default=0)
+    daily_budget_micros: Mapped[int] = mapped_column(BigInteger, default=0)
+    max_daily_budget_micros: Mapped[int] = mapped_column(BigInteger, default=0)
+    bid_micros: Mapped[int] = mapped_column(BigInteger, default=0)
     # Meta: age/gender/geo/interests. Google: keywords/match types/audiences.
     targeting: Mapped[dict] = mapped_column(JSON, default=dict)
     keywords: Mapped[list] = mapped_column(JSON, default=list)
@@ -316,11 +322,11 @@ class MetricSnapshot(Base):
 
     impressions: Mapped[int] = mapped_column(Integer, default=0)
     clicks: Mapped[int] = mapped_column(Integer, default=0)
-    spend_micros: Mapped[int] = mapped_column(Integer, default=0)
+    spend_micros: Mapped[int] = mapped_column(BigInteger, default=0)
     # What the ad platform's own pixel saw. Kept for diagnostics; revenue and
     # ROAS are computed from network conversions instead.
     platform_conversions: Mapped[float] = mapped_column(Float, default=0.0)
-    platform_conversion_value_micros: Mapped[int] = mapped_column(Integer, default=0)
+    platform_conversion_value_micros: Mapped[int] = mapped_column(BigInteger, default=0)
     frequency: Mapped[float] = mapped_column(Float, default=0.0)
     reach: Mapped[int] = mapped_column(Integer, default=0)
     video_views: Mapped[int] = mapped_column(Integer, default=0)
@@ -374,8 +380,8 @@ class Conversion(Base):
 
     network: Mapped[str] = mapped_column(String(80), default="manual")
     network_txn_id: Mapped[str] = mapped_column(String(160), nullable=False)
-    revenue_micros: Mapped[int] = mapped_column(Integer, default=0)
-    sale_amount_micros: Mapped[int] = mapped_column(Integer, default=0)
+    revenue_micros: Mapped[int] = mapped_column(BigInteger, default=0)
+    sale_amount_micros: Mapped[int] = mapped_column(BigInteger, default=0)
     status: Mapped[ConversionStatus] = mapped_column(
         Enum(ConversionStatus), default=ConversionStatus.PENDING
     )

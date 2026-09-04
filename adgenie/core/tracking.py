@@ -396,8 +396,23 @@ def record_conversion(
         )
     ).scalar_one_or_none()
     if existing is not None:
-        # Networks re-send postbacks on refunds and status upgrades.
-        if existing.status is not status:
+        # Networks re-send postbacks on refunds and status upgrades. A pending
+        # sale is often posted with no commission and only carries its real
+        # value once approved, so the amounts have to be updated alongside the
+        # status. Leaving revenue at the pending figure would count an approved
+        # conversion as zero and get a profitable creative killed.
+        changed = existing.status is not status
+        if revenue_micros and revenue_micros != existing.revenue_micros:
+            existing.revenue_micros = revenue_micros
+            changed = True
+        if sale_amount_micros and sale_amount_micros != existing.sale_amount_micros:
+            existing.sale_amount_micros = sale_amount_micros
+            changed = True
+        if status is ConversionStatus.REVERSED:
+            # A reversal takes the money back rather than restating it.
+            existing.revenue_micros = 0
+            changed = True
+        if changed:
             existing.status = status
             existing.raw = {**(existing.raw or {}), "last_update": raw}
             session.flush()

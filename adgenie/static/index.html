@@ -104,11 +104,24 @@
 
 <script>
 const $ = s => document.querySelector(s);
+
+// Offer names, creative names and optimizer reasons all originate from user
+// input and end up in innerHTML. Escaping them here is what stops an offer
+// named "<img onerror=...>" from running script in the operator's dashboard.
+const esc = v => String(v ?? "").replace(/[&<>"']/g,
+  c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const money = n => (n < 0 ? "-$" : "$") + Math.abs(n).toLocaleString(undefined,
   {minimumFractionDigits:2, maximumFractionDigits:2});
 const pct = n => (n*100).toFixed(2) + "%";
 
+// Set by an operator when the deployment requires a key:
+//   localStorage.setItem("adgenie_api_key", "…")
+const API_KEY = (() => { try { return localStorage.getItem("adgenie_api_key"); }
+                         catch { return null; } })();
+
 async function api(path, opts){
+  opts = {...(opts || {})};
+  if(API_KEY) opts.headers = {...(opts.headers || {}), "X-API-Key": API_KEY};
   const r = await fetch("/api" + path, opts);
   if(!r.ok) throw new Error(await r.text());
   return r.json();
@@ -141,7 +154,7 @@ async function loadPerformance(){
     spend+=r.spend_usd; revenue+=r.revenue_usd; clicks+=r.clicks; conv+=r.conversions;
     const tr = document.createElement("tr");
     tr.innerHTML = `
-      <td>${r.name || ("#"+r.entity_id)}</td>
+      <td>${esc(r.name || ("#"+r.entity_id))}</td>
       <td>${r.clicks.toLocaleString()}</td>
       <td>${money(r.spend_usd)}</td>
       <td>${r.conversions}</td>
@@ -166,7 +179,8 @@ async function loadPerformance(){
     ["EPC", clicks ? money(revenue/clicks) : "—"],
   ];
   $("#kpis").innerHTML = kpis.map(([label,value]) =>
-    `<div class="kpi"><div class="label">${label}</div><div class="value">${value}</div></div>`
+    `<div class="kpi"><div class="label">${esc(label)}</div>` +
+    `<div class="value">${esc(value)}</div></div>`
   ).join("");
 }
 
@@ -179,18 +193,18 @@ async function loadActions(){
   }
   host.innerHTML = actions.map(a => `
     <div class="action ${a.action}">
-      <div class="head">${a.action.replace(/_/g," ")}
-        <span class="sub">· ${a.level} #${a.entity_id}</span>
+      <div class="head">${esc(a.action.replace(/_/g," "))}
+        <span class="sub">· ${esc(a.level)} #${Number(a.entity_id)}</span>
         ${a.requires_approval ? '<span class="tag t-warn">needs approval</span>' : ""}
-        <span class="tag ${a.status==="applied"?"t-good":"t-mute"}">${a.status}</span>
+        <span class="tag ${a.status==="applied"?"t-good":"t-mute"}">${esc(a.status)}</span>
       </div>
-      <div class="why">${a.reason}</div>
-      <div class="sub"><code>${a.rule}</code>
+      <div class="why">${esc(a.reason)}</div>
+      <div class="sub"><code>${esc(a.rule)}</code>
         ${a.confidence ? " · confidence " + (a.confidence*100).toFixed(0) + "%" : ""}</div>
       ${a.requires_approval && a.status==="proposed"
         ? `<div class="row" style="margin-top:6px">
-             <button onclick="approve(${a.id})">Approve</button>
-             <button onclick="reject(${a.id})">Reject</button>
+             <button onclick="approve(${Number(a.id)})">Approve</button>
+             <button onclick="reject(${Number(a.id)})">Reject</button>
            </div>` : ""}
     </div>`).join("");
 }
@@ -203,9 +217,9 @@ async function loadCampaigns(){
   for(const c of camps){
     const tr = document.createElement("tr");
     const cls = c.status==="active" ? "t-good" : c.status==="paused" ? "t-mute" : "t-warn";
-    tr.innerHTML = `<td>${c.name}</td><td>${c.platform}</td>
+    tr.innerHTML = `<td>${esc(c.name)}</td><td>${esc(c.platform)}</td>
       <td>${money(c.daily_budget_usd)}/day</td>
-      <td><span class="tag ${cls}">${c.status}</span></td>`;
+      <td><span class="tag ${cls}">${esc(c.status)}</span></td>`;
     tbody.appendChild(tr);
   }
 }

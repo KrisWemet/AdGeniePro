@@ -91,6 +91,7 @@ sandbox, and the logs say so explicitly rather than silently doing nothing.
 | `META_*` | Meta calls go to the simulator |
 | `GOOGLE_*` | Google calls go to the simulator |
 | `DRY_RUN` | Defaults to `true`: nothing is sent to a live ad account |
+| `API_KEY` | The `/api` routes are unauthenticated; bind to localhost |
 
 ### 2. Add an offer
 
@@ -213,7 +214,19 @@ Three independent limits stand between the optimizer and your money:
 2. Budget changes above `AUTO_APPLY_BUDGET_CEILING_USD` are held for approval
    (`POST /api/optimizer/actions/{id}/approve`).
 3. `GLOBAL_DAILY_BUDGET_CAP_USD` caps total committed daily spend, so no
-   sequence of individually-reasonable increases can run away.
+   sequence of individually-reasonable increases can run away. A campaign
+   counts the larger of its own budget and the sum of its ad sets, so neither
+   budgeting style escapes the cap.
+
+### Access control
+
+The `/api` routes launch campaigns and move budgets, so set `API_KEY` for any
+deployment reachable beyond localhost. Every `/api` route then requires it in
+an `X-API-Key` header, and the server logs a warning at startup when it is
+unset. The two public routes stay open by necessity: `/r` takes anonymous ad
+clicks, and `/postback` authenticates with its own shared secret because
+affiliate networks cannot send custom headers. Narrow `CORS_ORIGINS` from `*`
+whenever the dashboard is served from a known origin.
 
 ---
 
@@ -231,7 +244,8 @@ Three independent limits stand between the optimizer and your money:
 | `POST /api/optimizer/run` | Evaluate and decide |
 | `GET /api/optimizer/actions` | Review proposals |
 | `POST /api/optimizer/actions/{id}/approve` | Approve a held proposal |
-| `GET /api/optimizer/rebalance/{ad_group_id}` | Proposed budget split |
+| `GET /api/optimizer/rebalance/{ad_group_id}` | Advisory split across creatives |
+| `GET /api/optimizer/rebalance-campaign/{id}` | Applicable split across ad groups |
 | `POST /api/optimizer/push-conversions` | Send sales back to the platforms |
 | `GET /api/audit` | Every mutation ever sent to an ad account |
 | `GET /r` | Click redirect (public) |
@@ -266,7 +280,7 @@ adgenie/
   static/            dashboard
   cli.py             command line
   demo.py            end-to-end simulation
-tests/               251 tests
+tests/               277 tests
 legacy/              the original prototype scripts, kept for reference
 ```
 
@@ -281,12 +295,18 @@ copy generation for all ten angles on both platforms, sub-id round trips and
 attribution edge cases, both live adapters against mocked transports, and the
 whole loop end to end against the simulator.
 
+`tests/test_regressions.py` is kept separate: each test there documents a
+specific defect found in review, so a fix that silently reverts fails loudly.
+
 ## Limits worth knowing
 
 - Image and video generation is not included. Creatives carry an
   `image_prompt`; supplying the asset is still manual.
-- Google budgets live on the campaign, so an ad-group scale decision moves the
-  parent campaign's budget.
+- Google holds one budget per campaign. An ad-group scale decision therefore
+  moves the parent campaign's budget by the delta, and per-ad-group
+  reallocation is unavailable there.
+- Neither platform funds an individual ad, so creative-level allocation is
+  advisory. It tells you which creatives to keep running, not how to fund them.
 - The compliance engine is an automated pre-screen and a forcing function for
   better copy. It is not legal advice and does not replace each platform's own
   review.

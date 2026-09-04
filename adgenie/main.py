@@ -11,13 +11,14 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__
 from .api import routes_campaigns, routes_offers, routes_optimizer, routes_tracking
+from .api.security import require_api_key
 from .config import get_settings
 from .db import init_db
 from .models import Platform
@@ -42,6 +43,11 @@ async def lifespan(app: FastAPI):
         logger.info(
             "DRY RUN is on: no mutation will be sent to a live ad account. "
             "Set DRY_RUN=false to let the optimizer spend."
+        )
+    if not settings.requires_api_key:
+        logger.warning(
+            "API_KEY is not set: the /api routes, which launch campaigns and "
+            "move budgets, are unauthenticated. Bind to localhost or set a key."
         )
     for platform, configured in (
         (Platform.META, settings.has_meta),
@@ -70,9 +76,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+_settings = get_settings()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_settings.cors_origins,
+    allow_credentials=_settings.cors_origins != ["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -92,13 +100,16 @@ async def platform_error_handler(request, exc: PlatformError) -> JSONResponse:
     )
 
 
-app.include_router(routes_offers.router, prefix="/api")
-app.include_router(routes_campaigns.router, prefix="/api")
-app.include_router(routes_optimizer.router, prefix="/api")
+# Everything under /api is guarded. The tracking router is not: `/r` takes
+# anonymous ad clicks and `/postback` carries its own shared secret.
+_guard = [Depends(require_api_key)]
+app.include_router(routes_offers.router, prefix="/api", dependencies=_guard)
+app.include_router(routes_campaigns.router, prefix="/api", dependencies=_guard)
+app.include_router(routes_optimizer.router, prefix="/api", dependencies=_guard)
 app.include_router(routes_tracking.router)
 
 
-@app.get("/api/health", tags=["system"])
+@app.get("/api/health", tags=["system"], dependencies=[Depends(require_api_key)])
 def health() -> dict:
     settings = get_settings()
     platforms = {}
@@ -117,6 +128,7 @@ def health() -> dict:
         "environment": settings.environment,
         "dry_run": settings.dry_run,
         "copywriter": "claude" if settings.has_copywriter_llm else "template",
+        "authenticated": settings.requires_api_key,
         "global_daily_budget_cap_usd": settings.global_daily_budget_cap_usd,
         "platforms": platforms,
     }

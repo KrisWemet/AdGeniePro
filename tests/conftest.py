@@ -83,6 +83,7 @@ def api_client(engine, settings, monkeypatch):
         "adgenie.api.routes_optimizer",
         "adgenie.api.routes_tracking",
         "adgenie.core.tracking",
+        "adgenie.api.security",
     ):
         import importlib
 

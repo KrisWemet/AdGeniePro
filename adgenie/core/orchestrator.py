@@ -42,7 +42,7 @@ from ..models import (
     Platform,
 )
 from ..money import micros_to_usd
-from ..platforms.base import AdPlatform, InsightRow, PlatformError
+from ..platforms.base import AdPlatform, CreativeSpec, InsightRow, PlatformError
 from ..platforms.factory import get_platform
 from .copywriter import CopyStudio, build_brief
 from .metrics import (
@@ -558,13 +558,30 @@ class Orchestrator:
             target = cap
 
         if action.level is EntityLevel.AD_GROUP and platform is Platform.GOOGLE:
-            # Google budgets live on the campaign, so scale the parent instead.
+            # Google holds the budget on the campaign, shared by every ad group
+            # under it. Writing this ad group's new amount onto the campaign
+            # would silently defund its siblings, so the campaign moves by the
+            # delta instead.
             campaign = self.session.get(Campaign, entity.campaign_id)
-            if campaign and campaign.external_id:
-                self.client(platform).set_budget(
-                    "campaign", campaign.external_id, target
+            if campaign is None:
+                raise PlatformError(
+                    f"ad group {entity.id} has no campaign",
+                    platform=platform,
+                    code="NOT_FOUND",
                 )
-                campaign.daily_budget_micros = target
+            delta = target - entity.daily_budget_micros
+            campaign_target = max(1, campaign.daily_budget_micros + delta)
+            if campaign.max_daily_budget_micros:
+                campaign_target = min(campaign_target, campaign.max_daily_budget_micros)
+            if campaign.external_id:
+                self.client(platform).set_budget(
+                    "campaign", campaign.external_id, campaign_target
+                )
+            campaign.daily_budget_micros = campaign_target
+            action.payload = {
+                **action.payload,
+                "campaign_budget_micros": campaign_target,
+            }
         elif entity.external_id:
             self.client(platform).set_budget(
                 action.level.value, entity.external_id, target
@@ -572,17 +589,43 @@ class Orchestrator:
         entity.daily_budget_micros = target
         action.payload = {**action.payload, "applied_micros": target}
 
+    def _committed_daily_micros(
+        self, exclude_level: EntityLevel | None = None, exclude_id: int | None = None
+    ) -> int:
+        """Total daily spend currently committed across active campaigns.
+
+        A campaign either carries its own budget (campaign budget optimisation)
+        or delegates to its ad sets. Summing both double-counts; summing only
+        campaigns misses every ad-set budget. So each campaign contributes the
+        larger of the two, which is the most it can actually spend in a day.
+        """
+        committed = 0
+        campaigns = list(
+            self.session.execute(
+                select(Campaign).where(Campaign.status == EntityStatus.ACTIVE)
+            ).scalars()
+        )
+        for campaign in campaigns:
+            if exclude_level is EntityLevel.CAMPAIGN and campaign.id == exclude_id:
+                continue
+            group_total = 0
+            for group in self.session.execute(
+                select(AdGroup).where(
+                    AdGroup.campaign_id == campaign.id,
+                    AdGroup.status == EntityStatus.ACTIVE,
+                )
+            ).scalars():
+                if exclude_level is EntityLevel.AD_GROUP and group.id == exclude_id:
+                    continue
+                group_total += group.daily_budget_micros
+            committed += max(campaign.daily_budget_micros, group_total)
+        return committed
+
     def _budget_headroom_micros(self, exclude_entity, level: EntityLevel) -> int:
         cap = int(self.settings.global_daily_budget_cap_usd * 1_000_000)
-        committed = 0
-        for campaign in self.session.execute(
-            select(Campaign).where(Campaign.status == EntityStatus.ACTIVE)
-        ).scalars():
-            if level is EntityLevel.CAMPAIGN and campaign.id == getattr(
-                exclude_entity, "id", None
-            ):
-                continue
-            committed += campaign.daily_budget_micros
+        committed = self._committed_daily_micros(
+            exclude_level=level, exclude_id=getattr(exclude_entity, "id", None)
+        )
         return max(0, cap - committed)
 
     def _generate_variants(self, action: OptimizationAction, entity: Creative) -> None:
@@ -640,23 +683,83 @@ class Orchestrator:
                 ),
                 settings=self.settings,
             )
-            created.append(child.id)
+
+            # A variant that only exists in the database does not replace a worn
+            # out ad, so the fatigue rule would fire again on every cycle and
+            # accumulate orphan rows. Push it to the platform, paused, and let
+            # the operator or the next cycle turn it on.
+            spec = CreativeSpec(
+                ad_group_external_id=group.external_id or "",
+                name=child.name,
+                final_url=child.final_url,
+                headlines=child.headlines,
+                descriptions=child.descriptions,
+                primary_texts=child.primary_texts,
+                call_to_action=child.call_to_action,
+                status="PAUSED",
+            )
+            try:
+                child.external_id = self.client(campaign.platform).create_creative(spec)
+                child.status = EntityStatus.PAUSED
+                created.append(child.id)
+            except PlatformError as exc:
+                child.status = EntityStatus.FAILED
+                child.last_error = str(exc)
+                logger.error("Variant %s could not be created: %s", child.name, exc)
+
+        if not created:
+            raise PlatformError(
+                "no usable variants were produced",
+                platform=campaign.platform,
+                code="NO_VARIANTS",
+            )
         action.payload = {**action.payload, "created_creative_ids": created}
 
-    def _reallocate(self, action: OptimizationAction, entity: AdGroup) -> None:
-        """Redistribute an ad group's budget across its creatives."""
-        allocation = action.payload.get("allocation", {})
-        platform = self._platform_of(EntityLevel.AD_GROUP, entity)
-        for creative_id, budget_micros in allocation.items():
-            creative = self.session.get(Creative, int(creative_id))
-            if creative and creative.external_id:
+    def _reallocate(self, action: OptimizationAction, entity: Campaign) -> None:
+        """Redistribute a campaign's budget across its ad groups.
+
+        Reallocation happens at the ad-group level because that is the lowest
+        level either platform actually exposes a budget on. Individual ads share
+        their parent's budget and are steered by pausing, not by funding.
+        """
+        if action.level is not EntityLevel.CAMPAIGN:
+            raise PlatformError(
+                "budget reallocation applies to a campaign's ad groups",
+                platform=self._platform_of(action.level, entity),
+                code="INVALID_LEVEL",
+            )
+        platform = entity.platform
+        if platform is Platform.GOOGLE:
+            raise PlatformError(
+                "Google holds one budget per campaign, so its ad groups cannot "
+                "be funded separately",
+                platform=platform,
+                code="UNSUPPORTED",
+            )
+
+        allocation = action.payload.get("allocation_micros", {})
+        applied: dict[str, int] = {}
+        for group_id, budget_micros in allocation.items():
+            group = self.session.get(AdGroup, int(group_id))
+            if group is None or group.campaign_id != entity.id:
+                continue
+            budget_micros = int(budget_micros)
+            if group.external_id:
                 self.client(platform).set_budget(
-                    "creative", creative.external_id, int(budget_micros)
+                    "ad_group", group.external_id, budget_micros
                 )
+            group.daily_budget_micros = budget_micros
+            applied[str(group.id)] = budget_micros
+        action.payload = {**action.payload, "applied_micros": applied}
 
     # ------------------------------------------------------------------
     def rebalance_ad_group(self, ad_group_id: int, since: date, until: date) -> dict:
-        """Propose a Thompson-sampled budget split across an ad group's creatives."""
+        """Advisory: how an ad group's budget would split across its creatives.
+
+        Neither platform lets you fund an individual ad, so this is guidance for
+        deciding which creatives to keep running, not something that can be
+        applied directly. `rebalance_campaign` is the applicable version.
+        """
         group = self.session.get(AdGroup, ad_group_id)
         if group is None:
             raise ValueError(f"ad group {ad_group_id} not found")
@@ -669,7 +772,7 @@ class Orchestrator:
             ).scalars()
         )
         if not creatives:
-            return {"ad_group_id": ad_group_id, "allocation": {}}
+            return {"ad_group_id": ad_group_id, "allocation": {}, "allocation_micros": {}}
 
         windows = [
             load_performance(self.session, EntityLevel.CREATIVE, c.id, since, until)
@@ -678,10 +781,45 @@ class Orchestrator:
         allocation = allocate_budget(windows, group.daily_budget_micros)
         return {
             "ad_group_id": ad_group_id,
+            "applicable": False,
+            "note": (
+                "Advisory only: ad-level budgets do not exist on Meta or Google. "
+                "Use it to decide which creatives stay active."
+            ),
             "daily_budget_usd": micros_to_usd(group.daily_budget_micros),
-            "allocation": {
-                str(k): micros_to_usd(v) for k, v in allocation.items()
-            },
+            "allocation": {str(k): micros_to_usd(v) for k, v in allocation.items()},
+            "allocation_micros": allocation,
+        }
+
+    def rebalance_campaign(self, campaign_id: int, since: date, until: date) -> dict:
+        """Split a campaign's budget across its ad groups. Applicable on Meta."""
+        campaign = self.session.get(Campaign, campaign_id)
+        if campaign is None:
+            raise ValueError(f"campaign {campaign_id} not found")
+        groups = list(
+            self.session.execute(
+                select(AdGroup).where(
+                    AdGroup.campaign_id == campaign_id,
+                    AdGroup.status == EntityStatus.ACTIVE,
+                )
+            ).scalars()
+        )
+        if not groups:
+            return {"campaign_id": campaign_id, "allocation": {}, "allocation_micros": {}}
+
+        windows = [
+            load_performance(self.session, EntityLevel.AD_GROUP, g.id, since, until)
+            for g in groups
+        ]
+        total = campaign.daily_budget_micros or sum(
+            g.daily_budget_micros for g in groups
+        )
+        allocation = allocate_budget(windows, total)
+        return {
+            "campaign_id": campaign_id,
+            "applicable": campaign.platform is Platform.META,
+            "daily_budget_usd": micros_to_usd(total),
+            "allocation": {str(k): micros_to_usd(v) for k, v in allocation.items()},
             "allocation_micros": allocation,
         }
 
@@ -708,7 +846,10 @@ class Orchestrator:
         if not pending:
             return {"uploaded": 0}
 
+        # Track which conversions belong to which platform so one platform's
+        # failure cannot force a re-upload of what another already accepted.
         by_platform: dict[Platform, list[dict]] = defaultdict(list)
+        conversions_by_platform: dict[Platform, list[Conversion]] = defaultdict(list)
         for conversion in pending:
             click = self.session.execute(
                 select(Click).where(Click.click_id == conversion.click_id)
@@ -716,8 +857,8 @@ class Orchestrator:
             if click is None or not click.platform:
                 continue
             entry = {
-                "event_time": int(conversion.occurred_at.timestamp()),
-                "click_time": int(click.created_at.timestamp()),
+                "event_time": _to_epoch(conversion.occurred_at),
+                "click_time": _to_epoch(click.created_at),
                 "value": micros_to_usd(conversion.revenue_micros),
                 "currency": "USD",
                 "event_id": f"adgenie-{conversion.id}",
@@ -733,18 +874,23 @@ class Orchestrator:
             if not (entry.get("fbclid") or entry.get("gclid")):
                 continue
             by_platform[click.platform].append(entry)
-            conversion.uploaded_to_platform = True
+            conversions_by_platform[click.platform].append(conversion)
 
         uploaded = 0
+        succeeded: list[str] = []
+        failed: dict[str, str] = {}
         for platform, entries in by_platform.items():
             try:
                 uploaded += self.client(platform).upload_conversions(entries)
             except PlatformError as exc:
                 logger.error("Conversion upload failed for %s: %s", platform.value, exc)
-                for conversion in pending:
-                    conversion.uploaded_to_platform = False
+                failed[platform.value] = str(exc)
+                continue
+            for conversion in conversions_by_platform[platform]:
+                conversion.uploaded_to_platform = True
+            succeeded.append(platform.value)
         self.session.commit()
-        return {"uploaded": uploaded, "platforms": [p.value for p in by_platform]}
+        return {"uploaded": uploaded, "platforms": succeeded, "errors": failed}
 
 
 # --------------------------------------------------------------------------
@@ -763,6 +909,19 @@ def run_cycle(session: Session, **kwargs) -> dict:
         if k in kwargs
     }
     return Orchestrator(session, **orchestrator_kwargs).run_cycle(**kwargs)
+
+
+def _to_epoch(value: datetime) -> int:
+    """Unix seconds from a stored timestamp.
+
+    Timestamps are persisted naive but mean UTC. Calling `.timestamp()` on a
+    naive datetime makes Python read it in the host's local zone, which shifts
+    every uploaded conversion by the server's offset and misattributes it to
+    the wrong click.
+    """
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return int(value.timestamp())
 
 
 def _count_by(items, key) -> dict:

@@ -16,6 +16,7 @@ from ..models import (
     ActionStatus,
     AdGroup,
     AuditLog,
+    Campaign,
     OptimizationAction,
     OptimizerRun,
 )
@@ -145,12 +146,31 @@ def rebalance(
     days: int = Query(default=7, ge=1, le=90),
     session: Session = Depends(get_session),
 ) -> dict:
-    """Propose a Thompson-sampled budget split across an ad group's creatives."""
+    """Advisory split across an ad group's creatives.
+
+    Neither platform funds an individual ad, so this guides which creatives to
+    keep running. Use the campaign endpoint for a split that can be applied.
+    """
     if session.get(AdGroup, ad_group_id) is None:
         raise HTTPException(404, f"ad group {ad_group_id} not found")
     since, until = default_window(days)
     return Orchestrator(session, settings=get_settings()).rebalance_ad_group(
         ad_group_id, since, until
+    )
+
+
+@router.get("/optimizer/rebalance-campaign/{campaign_id}")
+def rebalance_campaign(
+    campaign_id: int,
+    days: int = Query(default=7, ge=1, le=90),
+    session: Session = Depends(get_session),
+) -> dict:
+    """Thompson-sampled budget split across a campaign's ad groups."""
+    if session.get(Campaign, campaign_id) is None:
+        raise HTTPException(404, f"campaign {campaign_id} not found")
+    since, until = default_window(days)
+    return Orchestrator(session, settings=get_settings()).rebalance_campaign(
+        campaign_id, since, until
     )
 
 

@@ -18,6 +18,7 @@ import json
 import logging
 import time
 from datetime import date
+from urllib.parse import parse_qsl, urlparse
 
 import httpx
 
@@ -298,18 +299,25 @@ class MetaAdsClient(AdPlatform):
 
         rows: list[InsightRow] = []
         path = f"act_{self.account_id}/insights"
-        page_params: dict | None = params
-        while True:
+        page_params: dict = params
+        # Meta caps a report at a few hundred pages; the bound stops a malformed
+        # cursor from looping forever.
+        for _ in range(500):
             body = self._request("GET", path, params=page_params)
             for item in body.get("data", []):
                 rows.append(self._to_insight_row(item, id_field))
             nxt = (body.get("paging") or {}).get("next")
             if not nxt:
                 break
-            path, page_params = nxt, None
-            if path.startswith("http"):
-                # `next` is absolute; strip the base so `_url` does not double it.
-                path = path.split(f"/{self.api_version}/", 1)[-1]
+            # `next` is an absolute URL whose query carries the cursor *and* the
+            # original filters. Its query has to be parsed out and passed on:
+            # httpx replaces a URL's query string with `params` rather than
+            # merging, so sending the path alone would silently re-request the
+            # unfiltered first page forever.
+            parsed = urlparse(nxt)
+            path = parsed.path.split(f"/{self.api_version}/", 1)[-1].lstrip("/")
+            page_params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+            page_params.pop("access_token", None)
         return rows
 
     def _to_insight_row(self, item: dict, id_field: str) -> InsightRow:

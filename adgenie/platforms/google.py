@@ -370,6 +370,13 @@ class GoogleAdsClient(AdPlatform):
                 },
             )
         else:
+            if "~" not in external_id:
+                raise PlatformError(
+                    "a Google ad id must be '{adGroupId}~{adId}'; "
+                    f"got '{external_id}'",
+                    platform=self.platform,
+                    code="INVALID_AD_ID",
+                )
             self._post(
                 f"customers/{self.customer_id}/adGroupAds:mutate",
                 {
@@ -486,12 +493,20 @@ class GoogleAdsClient(AdPlatform):
             "metrics.conversions_value",
             "metrics.video_views",
         ]
+        # An ad group ad is identified by "{adGroupId}~{adId}", which is what
+        # `create_creative` stores. The ad id alone would never match it, so
+        # the ad group id has to come back too and be recombined below.
+        if level == "creative":
+            fields.insert(1, "ad_group.id")
+
         where = [
             f"segments.date BETWEEN '{since.isoformat()}' AND '{until.isoformat()}'"
         ]
-        if external_ids:
-            quoted = ", ".join(str(int(e.split("~")[-1])) for e in external_ids)
-            where.append(f"{id_field} IN ({quoted})")
+        numeric_ids = [
+            part for part in (e.split("~")[-1] for e in external_ids or []) if part.isdigit()
+        ]
+        if numeric_ids:
+            where.append(f"{id_field} IN ({', '.join(numeric_ids)})")
 
         query = (
             f"SELECT {', '.join(fields)} FROM {resource} "
@@ -502,9 +517,14 @@ class GoogleAdsClient(AdPlatform):
         out: list[InsightRow] = []
         for row in rows:
             metrics = row.get("metrics", {})
+            external_id = _nested_id(row, id_field)
+            if level == "creative":
+                ad_group_id = _nested_id(row, "ad_group.id")
+                if ad_group_id:
+                    external_id = f"{ad_group_id}~{external_id}"
             out.append(
                 InsightRow(
-                    external_id=_nested_id(row, id_field),
+                    external_id=external_id,
                     day=date.fromisoformat(row["segments"]["date"]),
                     impressions=int(metrics.get("impressions", 0) or 0),
                     clicks=int(metrics.get("clicks", 0) or 0),
@@ -601,12 +621,18 @@ def _nested_id(row: dict, field_path: str) -> str:
 
 
 def _fake_mutate_response(path: str, body: dict) -> dict:
-    """Shape-compatible response so dry-run exercises the same parsing code."""
+    """Shape-compatible response so dry-run exercises the same parsing code.
+
+    Ad group ads keep their "{adGroupId}~{adId}" shape, because code
+    downstream depends on it and a dry run that produces a differently-shaped
+    id would hide exactly the bugs a dry run exists to surface.
+    """
     count = len(body.get("operations", [])) or 1
     collection = path.split("/")[-1].split(":")[0]
+    suffix = "0~{i}" if collection == "adGroupAds" else "dryrun{i}"
     return {
         "results": [
-            {"resourceName": f"customers/0/{collection}/dryrun{i + 1}"}
+            {"resourceName": f"customers/0/{collection}/" + suffix.format(i=i + 1)}
             for i in range(count)
         ]
     }

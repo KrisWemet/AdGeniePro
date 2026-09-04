@@ -29,6 +29,15 @@ class Settings(BaseSettings):
     # Public base URL used to build affiliate tracking links and postbacks.
     public_base_url: str = "http://localhost:8000"
 
+    # --- access control ---
+    # When set, every /api route requires this key in an X-API-Key header.
+    # These routes launch campaigns and move budgets, so anything reachable
+    # from a network other than localhost must set it.
+    api_key: str | None = None
+    # Browser origins allowed to call the API. "*" is only safe while api_key
+    # is unset and the server is bound to localhost.
+    cors_origins: list[str] = Field(default_factory=lambda: ["*"])
+
     # --- safety rails ---
     # When true no live mutation is sent to Meta/Google; actions are recorded
     # as proposals only. This is the default: spending real money is opt-in.
@@ -80,6 +89,10 @@ class Settings(BaseSettings):
         description="Spend beyond N x offer payout with zero conversions triggers a kill review.",
     )
     action_cooldown_hours: int = 12
+
+    @property
+    def requires_api_key(self) -> bool:
+        return bool(self.api_key)
 
     @property
     def has_meta(self) -> bool:

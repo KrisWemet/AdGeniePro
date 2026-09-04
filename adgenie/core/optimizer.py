@@ -365,9 +365,23 @@ class Optimizer:
         proposed = int(current * (1 + step))
 
         cap = p.max_daily_budget_micros
-        if direction > 0 and cap:
-            proposed = min(proposed, cap)
-        proposed = max(proposed, p.min_daily_budget_micros)
+        if direction > 0:
+            if cap:
+                proposed = min(proposed, cap)
+            proposed = max(proposed, p.min_daily_budget_micros)
+        else:
+            # The floor must never turn a throttle into an increase. An entity
+            # already at or below the minimum has nothing left to cut, so the
+            # decision collapses to no action rather than a budget rise.
+            proposed = max(proposed, p.min_daily_budget_micros)
+            if proposed >= current:
+                return self._no_action(
+                    window,
+                    f"{rule}_at_floor",
+                    f"{reason} Budget is already at the minimum, so there is "
+                    "nothing to reduce.",
+                    evidence=evidence,
+                )
 
         if proposed == current:
             return self._no_action(
