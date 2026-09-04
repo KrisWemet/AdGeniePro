@@ -60,6 +60,7 @@ class Settings(BaseSettings):
     google_refresh_token: str | None = None
     google_customer_id: str | None = None
     google_login_customer_id: str | None = None
+    google_conversion_action_id: str | None = None
     google_api_version: str = "v18"
 
     # --- affiliate networks ---
