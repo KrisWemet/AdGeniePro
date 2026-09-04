@@ -53,6 +53,7 @@ from .metrics import (
     load_performance,
 )
 from .optimizer import Decision, Optimizer, OptimizerPolicy, allocate_budget
+from .segments import analyse_segments
 from .tracking import TrackingContext, build_tracking_url
 
 logger = logging.getLogger(__name__)
@@ -270,6 +271,7 @@ class Orchestrator:
         decisions: list[tuple[Decision, object]] = []
         decisions += self._evaluate_creatives(since, until, now)
         decisions += self._evaluate_ad_groups(since, until, now)
+        decisions += self._evaluate_segments(since, until)
 
         actions: list[OptimizationAction] = []
         for decision, _entity in decisions:
@@ -460,6 +462,83 @@ class Orchestrator:
             out.append((decision, group))
         return out
 
+    def _evaluate_segments(
+        self, since: date, until: date, dimension: str = "placement"
+    ) -> list[tuple[Decision, AdGroup]]:
+        """Look inside each ad group for a segment that is wasting budget.
+
+        A campaign total hides its own worst parts, and cutting one bad
+        placement is frequently a larger move than any creative test. Only ad
+        groups are examined: it is the level both platforms will actually accept
+        an exclusion on.
+        """
+        out: list[tuple[Decision, AdGroup]] = []
+        groups = list(
+            self.session.execute(
+                select(AdGroup).where(
+                    AdGroup.status == EntityStatus.ACTIVE,
+                    AdGroup.external_id.is_not(None),
+                )
+            ).scalars()
+        )
+
+        for group in groups:
+            campaign = self.session.get(Campaign, group.campaign_id)
+            if campaign is None:
+                continue
+            offer = self.session.get(Offer, campaign.offer_id)
+            payout = offer.expected_value_micros() if offer else 0
+            if not payout:
+                continue
+            already = set(group.targeting.get("excluded_segments", []))
+
+            try:
+                rows = self.client(campaign.platform).fetch_breakdowns(
+                    "ad_group", since, until, dimension, [group.external_id]
+                )
+            except PlatformError as exc:
+                # A platform that cannot slice this way simply offers one fewer
+                # lever; it is not a reason to fail the run.
+                logger.info(
+                    "No %s breakdown for ad group %s: %s",
+                    dimension,
+                    group.id,
+                    exc,
+                )
+                continue
+
+            rows = [r for r in rows if f"{dimension}:{r.segment}" not in already]
+            if not rows:
+                continue
+
+            report = analyse_segments(
+                rows, EntityLevel.AD_GROUP, group.id, dimension, payout
+            )
+            for stat in report.exclusions:
+                out.append(
+                    (
+                        Decision(
+                            level=EntityLevel.AD_GROUP,
+                            entity_id=group.id,
+                            action=ActionType.EXCLUDE_SEGMENT,
+                            rule=f"{dimension}_waste",
+                            reason=stat.reason,
+                            confidence=round(stat.prob_worse, 4),
+                            evidence=report.as_dict(),
+                            payload={
+                                "dimension": dimension,
+                                "segment": stat.segment,
+                                "recoverable_micros": stat.wasted_micros,
+                            },
+                            # Exclusions are hard to see the effect of and can
+                            # reset ad set learning, so a human signs them off.
+                            requires_approval=True,
+                        ),
+                        group,
+                    )
+                )
+        return out
+
     def _last_action_at(self, level: EntityLevel, entity_id: int) -> datetime | None:
         return self.session.execute(
             select(OptimizationAction.applied_at)
@@ -546,6 +625,8 @@ class Orchestrator:
                 self._generate_variants(action, entity)
             elif action.action is ActionType.REALLOCATE:
                 self._reallocate(action, entity)
+            elif action.action is ActionType.EXCLUDE_SEGMENT:
+                self._exclude_segment(platform, action, entity)
             else:
                 action.status = ActionStatus.REJECTED
                 action.error = f"no handler for {action.action.value}"
@@ -814,6 +895,23 @@ class Orchestrator:
             )
         action.payload = {**action.payload, "created_creative_ids": created}
 
+    def _exclude_segment(
+        self, platform: Platform, action: OptimizationAction, entity: AdGroup
+    ) -> None:
+        dimension = action.payload["dimension"]
+        segment = action.payload["segment"]
+        if entity.external_id:
+            self.client(platform).apply_exclusion(
+                "ad_group", entity.external_id, dimension, segment
+            )
+        # Recorded locally too, so the next analysis does not re-propose a
+        # segment that is already switched off.
+        excluded = list(entity.targeting.get("excluded_segments", []))
+        marker = f"{dimension}:{segment}"
+        if marker not in excluded:
+            excluded.append(marker)
+        entity.targeting = {**entity.targeting, "excluded_segments": excluded}
+
     def _reallocate(self, action: OptimizationAction, entity: Campaign) -> None:
         """Redistribute a campaign's budget across its ad groups.
 
@@ -852,6 +950,24 @@ class Orchestrator:
         action.payload = {**action.payload, "applied_micros": applied}
 
     # ------------------------------------------------------------------
+    def segment_report(
+        self, ad_group_id: int, since: date, until: date, dimension: str = "placement"
+    ) -> dict:
+        """Where an ad group's budget is going, sliced one way."""
+        group = self.session.get(AdGroup, ad_group_id)
+        if group is None:
+            raise ValueError(f"ad group {ad_group_id} not found")
+        campaign = self.session.get(Campaign, group.campaign_id)
+        offer = self.session.get(Offer, campaign.offer_id) if campaign else None
+        payout = offer.expected_value_micros() if offer else 0
+
+        rows = self.client(campaign.platform).fetch_breakdowns(
+            "ad_group", since, until, dimension, [group.external_id or ""]
+        )
+        return analyse_segments(
+            rows, EntityLevel.AD_GROUP, group.id, dimension, payout
+        ).as_dict()
+
     def rebalance_ad_group(self, ad_group_id: int, since: date, until: date) -> dict:
         """Advisory: how an ad group's budget would split across its creatives.
 

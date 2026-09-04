@@ -302,6 +302,7 @@ Evaluated in order; the first match wins.
 | `scale_winner` | ROAS above target **and** the lower bound clears breakeven | Raise budget |
 | `throttle_marginal` | Profitable but the upper bound cannot reach target | Cut budget |
 | `decayed_winner_throttle` | Bad window, but a profitable lifetime record | Cut budget |
+| `placement_waste` | One segment is measurably worse than its peers | Exclude it (needs approval) |
 | `frequency_fatigue` | Frequency above the ceiling | Generate new creative |
 | `ctr_decay` | CTR decayed against the ad's own opening week | Generate new creative |
 
@@ -310,6 +311,40 @@ individual ad, so at creative level a winner is held (its gain is realised by
 funding the parent ad set and by the budget split across its siblings) and the
 usable actions are pause, resume and creative refresh. Budget changes apply to
 ad sets and campaigns.
+
+### Segment analysis
+
+A campaign total hides its own worst parts. An affiliate ad set frequently has
+one placement quietly taking a fifth of the budget at a fraction of the
+conversion rate — Audience Network and Reels are the usual suspects — and
+because the average still looks acceptable, nobody goes looking. Cutting it is
+often a larger ROAS move than any creative test, and it is available
+immediately rather than after another week of data.
+
+```bash
+python -m adgenie.cli segments --dimension placement --days 14
+```
+
+Delivery can be sliced by placement, device, age and gender, region or hour.
+The hard part is not finding the worst segment — sorting does that — but
+knowing whether it is genuinely bad or merely unlucky. Each segment is compared
+against **the rest of the entity pooled**, not against the best performer, on
+the same Beta posterior the rest of the optimizer uses. Four guards must clear
+before anything is cut, and each stops a specific way of being wrong:
+
+| Guard | Stops |
+|---|---|
+| Minimum clicks | Cutting on noise |
+| Minimum share of spend | Cutting something too small to matter |
+| Confidence adjusted for how many segments were tested | Finding a "significant" loser by chance — with five segments at 95%, you will roughly half the time |
+| Keep a minimum number of segments | Starving the entity of anywhere to deliver |
+
+At most two are cut per cycle so the effect of each stays measurable, and every
+exclusion requires human approval: on Meta it means switching the ad set off
+automatic placements and enumerating what remains, which resets learning.
+
+Age, gender and region are reported but never auto-excluded — those are
+targeting changes with consequences a human should weigh.
 
 ### Conversion lag
 
@@ -399,6 +434,7 @@ whenever the dashboard is served from a known origin.
 | `POST /api/optimizer/run` | Evaluate and decide |
 | `GET /api/optimizer/actions` | Review proposals |
 | `POST /api/optimizer/actions/{id}/approve` | Approve a held proposal |
+| `GET /api/optimizer/segments/{ad_group_id}` | Where an ad group's budget actually goes |
 | `GET /api/optimizer/rebalance/{ad_group_id}` | Advisory split across creatives |
 | `GET /api/optimizer/rebalance-campaign/{id}` | Applicable split across ad groups |
 | `POST /api/optimizer/push-conversions` | Send sales back to the platforms |
@@ -427,6 +463,7 @@ adgenie/
   core/
     stats.py         Beta-Binomial helpers, no numpy or scipy
     lag.py           conversion delay curves and maturity weighting
+    segments.py      placement and audience waste detection
     compliance.py    Meta and Google policy engine
     angles.py        the angle library
     copywriter.py    Claude generation + template fallback + repair loop
@@ -456,7 +493,7 @@ adgenie/
   static/            dashboard
   cli.py             command line
   demo.py            end-to-end simulation
-tests/               444 tests
+tests/               471 tests
 legacy/              the original prototype scripts, kept for reference
 ```
 

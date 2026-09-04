@@ -28,6 +28,7 @@ from ..models import Platform
 from .base import (
     AdGroupSpec,
     AdPlatform,
+    BreakdownRow,
     CampaignSpec,
     CreativeSpec,
     InsightRow,
@@ -538,6 +539,117 @@ class GoogleAdsClient(AdPlatform):
                 )
             )
         return out
+
+    # -- breakdowns ------------------------------------------------------
+    # GAQL segments. Google has no placement concept on search, so the
+    # equivalent lever is network and device.
+    BREAKDOWN_SEGMENTS = {
+        "placement": ("segments.ad_network_type",),
+        "device": ("segments.device",),
+        "hour": ("segments.hour",),
+        "region": ("segments.geo_target_region",),
+    }
+
+    def fetch_breakdowns(
+        self,
+        level: str,
+        since: date,
+        until: date,
+        dimension: str,
+        external_ids: list[str] | None = None,
+    ) -> list[BreakdownRow]:
+        segments = self.BREAKDOWN_SEGMENTS.get(dimension)
+        if not segments:
+            raise PlatformError(
+                f"unsupported breakdown '{dimension}'; Google offers "
+                + ", ".join(sorted(self.BREAKDOWN_SEGMENTS)),
+                platform=self.platform,
+                code="UNSUPPORTED_BREAKDOWN",
+            )
+
+        resource, id_field = {
+            "campaign": ("campaign", "campaign.id"),
+            "ad_group": ("ad_group", "ad_group.id"),
+            "creative": ("ad_group_ad", "ad_group_ad.ad.id"),
+        }.get(level, ("ad_group", "ad_group.id"))
+
+        fields = [
+            id_field, "segments.date", *segments,
+            "metrics.impressions", "metrics.clicks",
+            "metrics.cost_micros", "metrics.conversions",
+        ]
+        if level == "creative":
+            fields.insert(1, "ad_group.id")
+
+        where = [f"segments.date BETWEEN '{since.isoformat()}' AND '{until.isoformat()}'"]
+        numeric = [
+            part for part in (e.split("~")[-1] for e in external_ids or [])
+            if part.isdigit()
+        ]
+        if numeric:
+            where.append(f"{id_field} IN ({', '.join(numeric)})")
+
+        rows = self.search(
+            f"SELECT {', '.join(fields)} FROM {resource} WHERE {' AND '.join(where)}"
+        )
+
+        out: list[BreakdownRow] = []
+        for row in rows:
+            metrics = row.get("metrics", {})
+            external_id = _nested_id(row, id_field)
+            if level == "creative":
+                group_id = _nested_id(row, "ad_group.id")
+                if group_id:
+                    external_id = f"{group_id}~{external_id}"
+            segment = ":".join(
+                str(_nested_id(row, s) or "") for s in segments
+            ).strip(":") or "unknown"
+            out.append(
+                BreakdownRow(
+                    external_id=external_id,
+                    day=date.fromisoformat(row["segments"]["date"]),
+                    dimension=dimension,
+                    segment=segment,
+                    impressions=int(metrics.get("impressions", 0) or 0),
+                    clicks=int(metrics.get("clicks", 0) or 0),
+                    spend_micros=int(metrics.get("costMicros", 0) or 0),
+                    conversions=float(metrics.get("conversions", 0) or 0),
+                    raw=row,
+                )
+            )
+        return out
+
+    def apply_exclusion(
+        self, level: str, external_id: str, dimension: str, segment: str
+    ) -> None:
+        """Apply a negative criterion.
+
+        Google's device lever is a bid modifier rather than an on/off switch, so
+        excluding a device means bidding it to zero.
+        """
+        if dimension != "device" or level != "ad_group":
+            raise PlatformError(
+                f"Google exclusions here cover devices on ad groups, not "
+                f"{dimension} at {level} level.",
+                platform=self.platform,
+                code="UNSUPPORTED",
+            )
+        device = segment.upper().split(":")[0]
+        self._post(
+            f"customers/{self.customer_id}/adGroupCriteria:mutate",
+            {
+                "operations": [
+                    {
+                        "create": {
+                            "adGroup": self._resource(f"adGroups/{external_id}"),
+                            "device": {"type": device},
+                            # -100% is Google's way of saying "never serve here".
+                            "bidModifier": 0.0,
+                        }
+                    }
+                ]
+            },
+        )
 
     # -- offline conversions ---------------------------------------------
     def upload_conversions(self, conversions: list[dict]) -> int:

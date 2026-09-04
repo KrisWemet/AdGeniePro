@@ -86,6 +86,7 @@ class ActionType(str, enum.Enum):
     ROTATE_CREATIVE = "rotate_creative"
     GENERATE_VARIANTS = "generate_variants"
     REALLOCATE = "reallocate"
+    EXCLUDE_SEGMENT = "exclude_segment"
     NO_ACTION = "no_action"
 
 

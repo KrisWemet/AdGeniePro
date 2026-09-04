@@ -25,6 +25,7 @@ from ..models import Platform
 from .base import (
     AdGroupSpec,
     AdPlatform,
+    BreakdownRow,
     CampaignSpec,
     CreativeSpec,
     InsightRow,
@@ -354,6 +355,107 @@ class SandboxPlatform(AdPlatform):
             reach=int(impressions / max(1.0, 1.0 + days_live * 0.09)),
             video_views=int(impressions * 0.22),
             raw={"cpm_micros": int(cpm), "true_ctr": ad.true_ctr, "true_cvr": ad.true_cvr},
+        )
+
+    # -- breakdowns ------------------------------------------------------
+    # Segment share of delivery, and how each segment's conversion rate
+    # compares to the entity's overall rate. Audience Network being cheap,
+    # high-volume and near-worthless for affiliate offers is the single most
+    # common real-world case, so the simulator reproduces it.
+    SEGMENT_PROFILES: dict[str, tuple[tuple[str, float, float], ...]] = {
+        "placement": (
+            ("facebook:feed", 0.42, 1.35),
+            ("instagram:stream", 0.20, 1.05),
+            ("instagram:reels", 0.15, 0.45),
+            ("audience_network:classic", 0.18, 0.08),
+            ("messenger:messenger_home", 0.05, 0.55),
+        ),
+        "device": (
+            ("iphone", 0.44, 1.25),
+            ("android_smartphone", 0.40, 0.85),
+            ("desktop", 0.16, 1.15),
+        ),
+        "age_gender": (
+            ("25-34:female", 0.28, 1.30),
+            ("35-44:female", 0.24, 1.20),
+            ("25-34:male", 0.26, 0.70),
+            ("45-54:female", 0.14, 0.95),
+            ("18-24:male", 0.08, 0.25),
+        ),
+    }
+
+    def fetch_breakdowns(
+        self,
+        level: str,
+        since: date,
+        until: date,
+        dimension: str,
+        external_ids: list[str] | None = None,
+    ) -> list[BreakdownRow]:
+        self._guard("fetch_breakdowns")
+        profile = self.SEGMENT_PROFILES.get(dimension)
+        if profile is None:
+            raise PlatformError(
+                f"unsupported breakdown '{dimension}'",
+                platform=self.platform,
+                code="UNSUPPORTED_BREAKDOWN",
+            )
+
+        # Delivery is recorded per creative, so a request for an ad group or a
+        # campaign has to be resolved down to the creatives underneath it.
+        wanted = self._descendant_creatives(external_ids) if external_ids else None
+        out: list[BreakdownRow] = []
+        for (eid, day), row in self.insights.items():
+            if not (since <= day <= until):
+                continue
+            if wanted is not None and eid not in wanted:
+                continue
+            rng = self._rng_for(f"bd:{dimension}:{eid}:{day.isoformat()}")
+            for segment, share, quality in profile:
+                jitter = rng.uniform(0.85, 1.15)
+                clicks = int(row.clicks * share * jitter)
+                out.append(
+                    BreakdownRow(
+                        external_id=eid,
+                        day=day,
+                        dimension=dimension,
+                        segment=segment,
+                        impressions=int(row.impressions * share * jitter),
+                        clicks=clicks,
+                        spend_micros=int(row.spend_micros * share * jitter),
+                        conversions=float(
+                            _binomial(rng, clicks, min(0.95, row.raw.get("true_cvr", 0.02) * quality))
+                        ),
+                        raw={"share": share, "quality": quality},
+                    )
+                )
+        return sorted(out, key=lambda r: (r.day, r.external_id, r.segment))
+
+    def _descendant_creatives(self, external_ids: list[str]) -> set[str]:
+        """Every creative at or beneath the given entities."""
+        requested = set(external_ids)
+        resolved: set[str] = set()
+        for entity in self.entities.values():
+            if entity.level != "creative":
+                continue
+            if entity.external_id in requested or entity.parent_id in requested:
+                resolved.add(entity.external_id)
+                continue
+            group = self.entities.get(entity.parent_id or "")
+            if group is not None and group.parent_id in requested:
+                resolved.add(entity.external_id)
+        return resolved
+
+    def apply_exclusion(
+        self, level: str, external_id: str, dimension: str, segment: str
+    ) -> None:
+        self._guard("apply_exclusion")
+        entity = self._require(external_id)
+        excluded = list(entity.spec.get("excluded_segments", []))
+        excluded.append(f"{dimension}:{segment}")
+        entity.spec["excluded_segments"] = excluded
+        self.calls.append(
+            ("apply_exclusion", {"id": external_id, "segment": segment})
         )
 
     # -- measurement -----------------------------------------------------

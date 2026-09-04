@@ -77,6 +77,45 @@ class CreativeSpec:
     extra: dict = field(default_factory=dict)
 
 
+# Dimensions delivery can be split along. Meta and Google name them
+# differently; these are the platform-neutral names the optimizer reasons in.
+BREAKDOWN_PLACEMENT = "placement"
+BREAKDOWN_DEVICE = "device"
+BREAKDOWN_AGE_GENDER = "age_gender"
+BREAKDOWN_REGION = "region"
+BREAKDOWN_HOUR = "hour"
+
+SUPPORTED_BREAKDOWNS = (
+    BREAKDOWN_PLACEMENT,
+    BREAKDOWN_DEVICE,
+    BREAKDOWN_AGE_GENDER,
+    BREAKDOWN_REGION,
+    BREAKDOWN_HOUR,
+)
+
+
+@dataclass
+class BreakdownRow:
+    """Delivery for one entity, one day, sliced along one dimension.
+
+    Exclusions are where most of the easy ROAS lives. An affiliate campaign
+    frequently has one placement or one age bracket quietly consuming a third
+    of the budget at a fraction of the conversion rate, and the campaign total
+    hides it completely.
+    """
+
+    external_id: str
+    day: date
+    dimension: str
+    segment: str
+    impressions: int = 0
+    clicks: int = 0
+    spend_micros: int = 0
+    conversions: float = 0.0
+    conversion_value_micros: int = 0
+    raw: dict = field(default_factory=dict)
+
+
 @dataclass
 class InsightRow:
     """One entity's delivery for one day, already normalised to micros."""
@@ -131,6 +170,35 @@ class AdPlatform(abc.ABC):
         self, level: str, since: date, until: date, external_ids: list[str] | None = None
     ) -> list[InsightRow]:
         """Daily delivery rows for the window, inclusive of both endpoints."""
+
+    def fetch_breakdowns(
+        self,
+        level: str,
+        since: date,
+        until: date,
+        dimension: str,
+        external_ids: list[str] | None = None,
+    ) -> list["BreakdownRow"]:
+        """Delivery split along one dimension.
+
+        Optional: an adapter that cannot slice this way returns nothing, and
+        the optimizer simply has one fewer lever.
+        """
+        return []
+
+    def apply_exclusion(
+        self, level: str, external_id: str, dimension: str, segment: str
+    ) -> None:
+        """Stop delivering to one segment.
+
+        Optional. Raising `PlatformError` is the honest answer where the
+        platform offers no such control.
+        """
+        raise PlatformError(
+            f"{self.platform.value} cannot exclude {dimension} segments here",
+            platform=self.platform,
+            code="UNSUPPORTED",
+        )
 
     # -- conversions back to the platform --
     def upload_conversions(self, conversions: list[dict]) -> int:

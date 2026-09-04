@@ -28,6 +28,7 @@ from ..money import micros_to_cents
 from .base import (
     AdGroupSpec,
     AdPlatform,
+    BreakdownRow,
     CampaignSpec,
     CreativeSpec,
     InsightRow,
@@ -43,6 +44,15 @@ GRAPH_BASE = "https://graph.facebook.com"
 RETRYABLE_CODES = {1, 2, 4, 17, 32, 341, 368, 613}
 
 LEVEL_TO_META = {"campaign": "campaign", "ad_group": "adset", "creative": "ad"}
+
+# What Meta serves when placements are automatic. Needed because dropping one
+# position requires enumerating the ones that stay.
+DEFAULT_POSITIONS = {
+    "facebook": ["feed", "video_feeds", "story", "marketplace", "search", "facebook_reels"],
+    "instagram": ["stream", "story", "explore", "reels", "profile_feed"],
+    "audience_network": ["classic", "rewarded_video"],
+    "messenger": ["messenger_home", "story"],
+}
 
 
 class MetaAdsClient(AdPlatform):
@@ -355,6 +365,168 @@ class MetaAdsClient(AdPlatform):
             reach=int(item.get("reach", 0) or 0),
             video_views=video_views,
             raw=item,
+        )
+
+    # -- breakdowns ------------------------------------------------------
+    # Meta's own names for each slice. `publisher_platform` with
+    # `platform_position` is the pair that exposes Audience Network and Reels
+    # separately, which is where affiliate campaigns most often bleed.
+    BREAKDOWN_FIELDS = {
+        "placement": ("publisher_platform", "platform_position"),
+        "device": ("impression_device",),
+        "age_gender": ("age", "gender"),
+        "region": ("region",),
+        "hour": ("hourly_stats_aggregated_by_advertiser_time_zone",),
+    }
+
+    def fetch_breakdowns(
+        self,
+        level: str,
+        since: date,
+        until: date,
+        dimension: str,
+        external_ids: list[str] | None = None,
+    ) -> list[BreakdownRow]:
+        fields = self.BREAKDOWN_FIELDS.get(dimension)
+        if not fields:
+            raise PlatformError(
+                f"unsupported breakdown '{dimension}'; Meta offers "
+                + ", ".join(sorted(self.BREAKDOWN_FIELDS)),
+                platform=self.platform,
+                code="UNSUPPORTED_BREAKDOWN",
+            )
+
+        meta_level = LEVEL_TO_META.get(level, "ad")
+        id_field = {"campaign": "campaign_id", "adset": "adset_id", "ad": "ad_id"}[
+            meta_level
+        ]
+        params = {
+            "level": meta_level,
+            "time_increment": 1,
+            "limit": 500,
+            "breakdowns": ",".join(fields),
+            "time_range": json.dumps(
+                {"since": since.isoformat(), "until": until.isoformat()}
+            ),
+            "fields": ",".join(
+                [id_field, "impressions", "clicks", "spend", "actions", "date_start"]
+            ),
+        }
+        if external_ids:
+            params["filtering"] = json.dumps(
+                [{"field": f"{meta_level}.id", "operator": "IN", "value": external_ids}]
+            )
+
+        rows: list[BreakdownRow] = []
+        path = f"act_{self.account_id}/insights"
+        page_params: dict = params
+        for _ in range(500):
+            body = self._request("GET", path, params=page_params)
+            for item in body.get("data", []):
+                rows.append(self._to_breakdown_row(item, id_field, dimension, fields))
+            nxt = (body.get("paging") or {}).get("next")
+            if not nxt:
+                break
+            parsed = urlparse(nxt)
+            path = parsed.path.split(f"/{self.api_version}/", 1)[-1].lstrip("/")
+            page_params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+            page_params.pop("access_token", None)
+        return rows
+
+    def _to_breakdown_row(
+        self, item: dict, id_field: str, dimension: str, fields: tuple[str, ...]
+    ) -> BreakdownRow:
+        segment = ":".join(str(item.get(f, "")) for f in fields).strip(":") or "unknown"
+        conversions = 0.0
+        for action in item.get("actions", []) or []:
+            if action.get("action_type") in (
+                "purchase",
+                "offsite_conversion.fb_pixel_purchase",
+                "omni_purchase",
+            ):
+                conversions += float(action.get("value", 0) or 0)
+        return BreakdownRow(
+            external_id=str(item.get(id_field, "")),
+            day=date.fromisoformat(item["date_start"]),
+            dimension=dimension,
+            segment=segment,
+            impressions=int(item.get("impressions", 0) or 0),
+            clicks=int(item.get("clicks", 0) or 0),
+            spend_micros=int(round(float(item.get("spend", 0) or 0) * 1_000_000)),
+            conversions=conversions,
+            raw=item,
+        )
+
+    def apply_exclusion(
+        self, level: str, external_id: str, dimension: str, segment: str
+    ) -> None:
+        """Exclude a placement by pinning the ad set to everything else.
+
+        Meta has no "exclude one placement" call. The only way to drop one is
+        to switch the ad set off automatic placements and enumerate the
+        positions that remain, which is why this is limited to placements and
+        to the ad set level.
+        """
+        if dimension != "placement":
+            raise PlatformError(
+                f"Meta exclusions are supported for placements only, not {dimension}. "
+                "Age, gender and region are targeting changes that reset ad set "
+                "learning and are left to a human.",
+                platform=self.platform,
+                code="UNSUPPORTED",
+            )
+        if level != "ad_group":
+            raise PlatformError(
+                "placement exclusions are set on the ad set",
+                platform=self.platform,
+                code="INVALID_LEVEL",
+            )
+
+        publisher, _, position = segment.partition(":")
+        current = self._request(
+            "GET", external_id, params={"fields": "targeting"}
+        ).get("targeting", {})
+
+        publishers = list(
+            current.get("publisher_platforms")
+            or ["facebook", "instagram", "audience_network", "messenger"]
+        )
+        targeting = dict(current)
+
+        if not position:
+            # Dropping a whole publisher platform.
+            remaining = [p for p in publishers if p != publisher]
+            if not remaining:
+                raise PlatformError(
+                    "excluding this would leave the ad set with no placements",
+                    platform=self.platform,
+                    code="EMPTY_TARGETING",
+                )
+            targeting["publisher_platforms"] = remaining
+            for key in (
+                "facebook_positions", "instagram_positions",
+                "audience_network_positions", "messenger_positions",
+            ):
+                if key.split("_")[0] == publisher:
+                    targeting.pop(key, None)
+        else:
+            key = f"{publisher}_positions"
+            positions = list(current.get(key) or DEFAULT_POSITIONS.get(publisher, []))
+            remaining = [p for p in positions if p != position]
+            if not remaining:
+                raise PlatformError(
+                    f"excluding {segment} would leave {publisher} with no positions; "
+                    "drop the platform instead",
+                    platform=self.platform,
+                    code="EMPTY_TARGETING",
+                )
+            targeting[key] = remaining
+            targeting.setdefault("publisher_platforms", publishers)
+
+        # Automatic placements and an explicit list are mutually exclusive.
+        targeting.pop("targeting_automation", None)
+        self._request(
+            "POST", external_id, data={"targeting": json.dumps(targeting)}
         )
 
     # -- conversions API -------------------------------------------------

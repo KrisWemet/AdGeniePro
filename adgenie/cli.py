@@ -142,6 +142,49 @@ def cmd_optimize(args) -> int:
     return 0
 
 
+def cmd_segments(args) -> int:
+    init_db()
+    from .core.orchestrator import Orchestrator
+    from .models import AdGroup
+
+    since, until = default_window(args.days)
+    with session_scope() as session:
+        groups = (
+            [session.get(AdGroup, args.ad_group)]
+            if args.ad_group
+            else list(session.query(AdGroup).all())
+        )
+        for group in [g for g in groups if g is not None]:
+            try:
+                report = Orchestrator(session).segment_report(
+                    group.id, since, until, args.dimension
+                )
+            except Exception as exc:
+                print(f"ad group {group.id}: {exc}", file=sys.stderr)
+                continue
+            if not report["segments"]:
+                continue
+
+            print(f"\nad group {group.id}  {group.name[:48]}  ({args.dimension})")
+            header = f"  {'segment':<30}{'clicks':>7}{'spend':>10}{'cvr':>8}{'roas':>7}{'':>4}"
+            print(header)
+            print("  " + "-" * (len(header) - 2))
+            for seg in report["segments"]:
+                mark = "CUT" if seg["verdict"] == "exclude" else ""
+                print(
+                    f"  {seg['segment'][:29]:<30}{seg['clicks']:>7}"
+                    f"{seg['spend_usd']:>10.2f}{seg['cvr']:>8.2%}"
+                    f"{seg['roas']:>7.2f}{mark:>4}"
+                )
+            if report["exclusions"]:
+                print(f"  Recoverable: ${report['recoverable_usd']:.2f}/window")
+                for seg in report["exclusions"]:
+                    print(f"    {seg['segment']}: {seg['reason']}")
+            elif report.get("note"):
+                print(f"  {report['note']}")
+    return 0
+
+
 def cmd_report(args) -> int:
     init_db()
     since, until = default_window(args.days)
@@ -387,6 +430,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--apply", action="store_true", help="apply decisions instead of proposing them"
     )
     optimize.set_defaults(func=cmd_optimize)
+
+    segments = sub.add_parser(
+        "segments", help="find placements or audiences that are wasting budget"
+    )
+    segments.add_argument("--ad-group", type=int, default=None)
+    segments.add_argument(
+        "--dimension", default="placement",
+        choices=["placement", "device", "age_gender", "region", "hour"],
+    )
+    segments.add_argument("--days", type=int, default=14)
+    segments.set_defaults(func=cmd_segments)
 
     report = sub.add_parser("report", help="performance by creative")
     report.add_argument("--days", type=int, default=7)

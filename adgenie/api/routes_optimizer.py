@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from ..config import get_settings
 from ..core.metrics import default_window
 from ..core.orchestrator import Orchestrator
+from ..platforms.base import PlatformError
 from ..db import get_session
 from ..models import (
     ActionStatus,
@@ -187,6 +188,30 @@ def rebalance_campaign(
     return Orchestrator(session, settings=get_settings()).rebalance_campaign(
         campaign_id, since, until
     )
+
+
+@router.get("/optimizer/segments/{ad_group_id}")
+def segment_report(
+    ad_group_id: int,
+    dimension: str = Query(default="placement"),
+    days: int = Query(default=14, ge=1, le=90),
+    session: Session = Depends(get_session),
+) -> dict:
+    """Where an ad group's budget actually goes, sliced one way.
+
+    Campaign totals hide their own worst parts. One placement or age bracket
+    quietly taking a fifth of the spend at a fraction of the conversion rate is
+    common, and cutting it usually beats another creative test.
+    """
+    if session.get(AdGroup, ad_group_id) is None:
+        raise HTTPException(404, f"ad group {ad_group_id} not found")
+    since, until = default_window(days)
+    try:
+        return Orchestrator(session, settings=get_settings()).segment_report(
+            ad_group_id, since, until, dimension
+        )
+    except PlatformError as exc:
+        raise HTTPException(422, str(exc))
 
 
 @router.post("/optimizer/push-conversions")
