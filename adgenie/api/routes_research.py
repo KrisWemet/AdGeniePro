@@ -87,6 +87,33 @@ def stored_brief(
     ).as_dict()
 
 
+@router.post("/research/sweep-retirements")
+def sweep_retirements(
+    vertical: str = Query(default=""),
+    countries: str | None = Query(default=None),
+    session: Session = Depends(get_session),
+) -> dict:
+    """Re-scan stored searches including stopped ads.
+
+    A scan restricted to live ads can never observe one stopping, so this pass
+    is what makes the retirement signal mean anything. Worth running on a
+    schedule rather than at launch time.
+    """
+    settings = get_settings()
+    if not settings.has_ad_library:
+        raise HTTPException(503, "META_ACCESS_TOKEN with ads_read is required.")
+    codes = (
+        [c.strip().upper() for c in countries.split(",") if c.strip()]
+        if countries
+        else None
+    )
+    updated = MarketResearcher(session, settings).sweep_for_retirements(
+        vertical=vertical, countries=codes
+    )
+    session.commit()
+    return {"observations_updated": updated}
+
+
 @router.get("/research/retired")
 def retired_ads(
     vertical: str = Query(default=""),

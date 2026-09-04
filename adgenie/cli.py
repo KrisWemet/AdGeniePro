@@ -238,6 +238,34 @@ def cmd_research(args) -> int:
     return 0
 
 
+def cmd_research_sweep(args) -> int:
+    init_db()
+    settings = get_settings()
+    if not settings.has_ad_library:
+        print("META_ACCESS_TOKEN is not set.", file=sys.stderr)
+        return 2
+    from .research.service import MarketResearcher
+
+    with session_scope() as session:
+        researcher = MarketResearcher(session, settings)
+        updated = researcher.sweep_for_retirements(
+            vertical=args.vertical, countries=args.country
+        )
+        retired = researcher.retired_ads(args.vertical)
+
+    print(f"Updated {updated} observation(s).")
+    if retired:
+        print("\nAds that stopped quickly (a negative signal):")
+        for ad in retired[:15]:
+            print(
+                f"  {ad['days_running']:>4}d  {ad['angle'] or 'unknown':<18}"
+                f"{ad['page_name'][:36]}"
+            )
+    else:
+        print("No short-lived retirements recorded yet.")
+    return 0
+
+
 def cmd_media(args) -> int:
     init_db()
     settings = get_settings()
@@ -313,6 +341,14 @@ def build_parser() -> argparse.ArgumentParser:
     research.add_argument("--pages", type=int, default=3)
     research.add_argument("--include-inactive", action="store_true")
     research.set_defaults(func=cmd_research)
+
+    sweep = sub.add_parser(
+        "research-sweep",
+        help="re-scan stored searches including stopped ads, so retirements show up",
+    )
+    sweep.add_argument("--vertical", default="")
+    sweep.add_argument("--country", action="append")
+    sweep.set_defaults(func=cmd_research_sweep)
 
     media = sub.add_parser("media", help="generate imagery for a creative")
     media.add_argument("--creative", type=int, required=True)

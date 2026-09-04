@@ -596,6 +596,7 @@ def test_launching_with_media_attaches_images(
     from adgenie.models import MediaAsset, MediaStatus
 
     settings.media_storage_dir = str(tmp_path / "media")
+    settings.media_public_base_url = "https://cdn.example.com/media"
     result = CampaignLauncher(
         session, settings=settings, platform_client=sandbox_meta,
         media_studio=MediaStudio(session, settings, provider=SandboxMediaProvider()),
@@ -612,6 +613,11 @@ def test_launching_with_media_attaches_images(
     creative = session.get(Creative, result.creative_ids[0])
     assert len(creative.media_urls) == 3
     assert creative.generator_meta["media_asset_ids"] == result.media_asset_ids
+    # The imagery has to reach the platform, not just the database.
+    created = [c for c in sandbox_meta.calls if c[0] == "create_creative"]
+    assert created
+    ad = sandbox_meta.entities[created[0][1]["id"]]
+    assert ad.spec["media_urls"] == creative.media_urls
 
 
 def test_media_failure_does_not_stop_the_launch(

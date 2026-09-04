@@ -411,6 +411,7 @@ class CampaignLauncher:
             primary_texts=creative.primary_texts,
             call_to_action=creative.call_to_action,
             display_url_path=creative.display_url_path,
+            media_urls=creative.media_urls,
             status=status,
         )
         try:

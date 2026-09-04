@@ -17,7 +17,12 @@ from sqlalchemy.orm import Session
 
 from ..config import Settings, get_settings
 from ..models import CompetitorAd, Offer
-from .ad_library import AdLibraryAd, AdLibraryClient, CoverageWarning
+from .ad_library import (
+    EU_UK_COUNTRIES,
+    AdLibraryAd,
+    AdLibraryClient,
+    CoverageWarning,
+)
 from .signals import MarketBrief, build_market_brief, classify_angle, count_variants, score_staying_power
 
 logger = logging.getLogger(__name__)
@@ -92,9 +97,34 @@ class MarketResearcher:
         term = search_term or offer.vertical or offer.name
         return self.research(
             term,
-            countries=countries or (offer.geo_targets or None),
+            countries=countries or self._research_countries(offer),
             vertical=offer.vertical or "",
         )
+
+    def _research_countries(self, offer: Offer) -> list[str]:
+        """Which markets to scan for an offer targeting given countries.
+
+        The offer's own geos are the right answer only where the archive
+        carries commercial ads. A US-targeted offer scanned against US would
+        read the political and issue archive and hand those patterns to the
+        copywriter as if they were commercial market intelligence, so the
+        configured EU and UK markets are added to give it something real to
+        learn from.
+        """
+        targets = [c.upper() for c in (offer.geo_targets or [])]
+        covered = [c for c in targets if c in EU_UK_COUNTRIES]
+        if covered:
+            return covered
+        fallback = self.settings.ad_library_country_codes
+        if targets:
+            logger.info(
+                "Offer targets %s, where the archive carries no commercial ads. "
+                "Scanning %s instead; the audience differs, so treat the result "
+                "as directional.",
+                ", ".join(targets),
+                ", ".join(fallback),
+            )
+        return list(fallback)
 
     # ------------------------------------------------------------------
     def _persist(
@@ -116,7 +146,13 @@ class MarketResearcher:
         }
 
         rows: list[CompetitorAd] = []
+        seen: set[str] = set()
         for ad in ads:
+            # Paging can return the same ad twice; inserting it twice would
+            # violate the unique constraint and lose the whole scan.
+            if ad.ad_archive_id in seen:
+                continue
+            seen.add(ad.ad_archive_id)
             variant_count = variants.get(ad.ad_archive_id, 1)
             row = existing.get(ad.ad_archive_id)
             if row is None:
@@ -127,6 +163,7 @@ class MarketResearcher:
                     vertical=vertical,
                 )
                 self.session.add(row)
+                existing[ad.ad_archive_id] = row
 
             row.page_id = ad.page_id
             row.page_name = ad.page_name
@@ -193,12 +230,41 @@ class MarketResearcher:
             ],
         )
 
+    def sweep_for_retirements(
+        self, vertical: str = "", countries: list[str] | None = None
+    ) -> int:
+        """Re-scan including inactive ads, so stopped ones can be observed.
+
+        A scan restricted to live ads can never see an ad stop: the row simply
+        stops being returned and keeps its stale `is_active`. This pass is what
+        makes `retired_ads` mean anything, and it is worth running on a
+        schedule rather than at launch time.
+        """
+        terms = {
+            row.search_term
+            for row in self.session.execute(
+                select(CompetitorAd).where(
+                    CompetitorAd.vertical == vertical if vertical else True
+                )
+            ).scalars()
+            if row.search_term
+        }
+        updated = 0
+        for term in terms:
+            ads, _ = self.client().search(
+                search_terms=term, countries=countries, active_only=False
+            )
+            updated += len(self._persist(ads, search_term=term, vertical=vertical))
+        self.session.flush()
+        return updated
+
     def retired_ads(self, vertical: str = "", max_days: int = 21) -> list[dict]:
         """Ads that stopped running quickly: the archive's only negative signal.
 
         An advertiser who pulled a creative inside three weeks was almost
         certainly not making money on it, which is worth knowing before writing
-        something similar.
+        something similar. Populated by `sweep_for_retirements`, since a
+        live-only scan never observes a stop.
         """
         query = select(CompetitorAd).where(
             CompetitorAd.is_active.is_(False),

@@ -193,6 +193,11 @@ explicit:
 | EU reach | Actual delivery volume, where the DSA requires it. |
 | Ads that stopped fast | The only negative signal available (`/api/research/retired`). |
 
+The retirement signal needs its own pass: a scan restricted to live ads can
+never *see* an ad stop, it just stops being returned. Run
+`adgenie research-sweep` (or `POST /api/research/sweep-retirements`) on a
+schedule to re-scan stored searches including stopped ads.
+
 Each ad gets a **staying-power** score weighting longevity on a log scale — the
 step from 7 days to 30 says far more than 90 to 120 — plus whether it is live
 and how many variants exist. Angles are weighted by that score rather than
@@ -234,7 +239,13 @@ square 1:1, story 9:16, Google Demand Gen 1.91:1, 1:1 and 4:5. Text-only
 formats generate nothing.
 
 To attach imagery to a *live* ad, set `MEDIA_PUBLIC_BASE_URL` — the platforms
-fetch the image over HTTP, they do not read your disk.
+fetch the image over HTTP, they do not read your disk. Without it the files are
+still generated and stored, but nothing is attached to the ad and the server
+says so rather than handing Meta a filesystem path.
+
+Generation is also suppressed under `DRY_RUN`, which falls back to the sandbox.
+A mode whose purpose is to have no side effects should not have billing as its
+one exception.
 
 ---
 
@@ -359,6 +370,7 @@ whenever the dashboard is served from a known origin.
 | `POST /api/optimizer/push-conversions` | Send sales back to the platforms |
 | `GET /api/research/coverage` | What the Ad Library will actually return |
 | `POST /api/research/scan` | Scan the archive and summarise what is running |
+| `POST /api/research/sweep-retirements` | Re-scan including stopped ads |
 | `GET /api/research/brief` | Rebuild a brief from stored scans, no API call |
 | `GET /api/research/retired` | Competitor ads that stopped quickly |
 | `GET /api/media/placements` | Placement sizes per platform |
@@ -409,7 +421,7 @@ adgenie/
   static/            dashboard
   cli.py             command line
   demo.py            end-to-end simulation
-tests/               405 tests
+tests/               419 tests
 legacy/              the original prototype scripts, kept for reference
 ```
 

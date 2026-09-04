@@ -389,14 +389,31 @@ def test_studio_generates_one_asset_per_placement(
         assert asset.content_hash
 
 
-def test_ready_assets_are_attached_to_the_creative(
+def test_ready_assets_are_attached_as_fetchable_urls(
     session, settings, launched_creative, tmp_path
 ):
     settings.media_storage_dir = str(tmp_path / "media")
+    settings.media_public_base_url = "https://cdn.example.com/media"
     MediaStudio(session, settings, provider=SandboxMediaProvider()).generate_for_creative(
         launched_creative, platform=Platform.META
     )
     assert len(launched_creative.media_urls) == 3
+    assert all(u.startswith("https://") for u in launched_creative.media_urls)
+
+
+def test_a_local_path_is_never_passed_off_as_an_image_url(
+    session, settings, launched_creative, tmp_path
+):
+    """Meta fetches the image over HTTP; a filesystem path would be rejected."""
+    settings.media_storage_dir = str(tmp_path / "media")
+    settings.media_public_base_url = None
+    assets = MediaStudio(
+        session, settings, provider=SandboxMediaProvider()
+    ).generate_for_creative(launched_creative, platform=Platform.META)
+
+    assert all(a.status is MediaStatus.READY for a in assets)
+    assert all(a.local_path for a in assets), "the files are still on disk"
+    assert launched_creative.media_urls == []
 
 
 def test_a_rejected_prompt_is_never_generated(session, settings, launched_creative, tmp_path):

@@ -1527,3 +1527,277 @@ def test_postback_reports_an_unconfigured_secret_distinctly(api_client, settings
     )
     assert response.status_code == 503
     assert "POSTBACK_SECRET" in response.json()["detail"]
+
+
+from adgenie.research.ad_library import EU_UK_COUNTRIES as EU_UK_COUNTRIES_FOR_TEST
+
+
+# --- sixth review round: research and media --------------------------------
+
+
+def test_the_media_package_is_tracked_by_git():
+    """An unanchored 'media/' ignore rule swallowed the source package.
+
+    A fresh clone could not import adgenie.main at all.
+    """
+    import subprocess
+    from pathlib import Path
+
+    import adgenie
+
+    root = Path(adgenie.__file__).parent.parent
+    for path in ("adgenie/media/studio.py", "adgenie/research/service.py"):
+        result = subprocess.run(
+            ["git", "check-ignore", path], cwd=root, capture_output=True
+        )
+        assert result.returncode != 0, f"{path} is gitignored"
+
+
+def test_generated_media_reaches_the_platform(session, settings, offer, tmp_path):
+    """The launcher built its CreativeSpec without the images."""
+    from adgenie.core.launcher import CampaignLauncher, LaunchPlan
+    from adgenie.media.sandbox import SandboxMediaProvider
+    from adgenie.media.studio import MediaStudio
+
+    settings.media_storage_dir = str(tmp_path / "media")
+    settings.media_public_base_url = "https://cdn.example.com/media"
+    sandbox = SandboxPlatform(Platform.META)
+
+    result = CampaignLauncher(
+        session, settings=settings, platform_client=sandbox,
+        media_studio=MediaStudio(session, settings, provider=SandboxMediaProvider()),
+    ).launch(
+        LaunchPlan(
+            offer_id=offer.id, platform=Platform.META, daily_budget_usd=20.0,
+            angle_count=1, generate_media=True,
+        )
+    )
+
+    created = [c for c in sandbox.calls if c[0] == "create_creative"]
+    ad = sandbox.entities[created[0][1]["id"]]
+    assert ad.spec["media_urls"], "the ad reached Meta with no image"
+    assert len(result.media_asset_ids) == 3
+
+
+def test_dry_run_does_not_bill_for_generation(settings):
+    """Dry run suppresses every platform mutation; it must not spend here."""
+    from adgenie.media.sandbox import SandboxMediaProvider
+    from adgenie.media.studio import get_media_provider
+
+    settings.kie_api_key = "real-key"
+    settings.dry_run = True
+    assert isinstance(get_media_provider(settings), SandboxMediaProvider)
+
+    settings.dry_run = False
+    from adgenie.media.kie import KieClient
+
+    assert isinstance(get_media_provider(settings), KieClient)
+
+
+def test_video_placements_exist_for_every_platform():
+    """kind='video' resolved to zero placements and silently generated nothing."""
+    from adgenie.media.specs import default_placements, get_media_spec
+
+    for platform in Platform:
+        placements = default_placements(platform, "video")
+        assert placements, f"{platform.value} has no video placements"
+        assert all(get_media_spec(p).kind == "video" for p in placements)
+
+
+def test_google_video_uses_a_google_placement():
+    from adgenie.media.specs import default_placements
+
+    assert all(
+        not p.startswith("meta_") for p in default_placements(Platform.GOOGLE, "video")
+    )
+
+
+def test_a_provider_failure_keeps_its_real_reason(session, settings, offer, tmp_path):
+    """Indexing urls[0] on a failure replaced the error with an IndexError."""
+    from adgenie.core.launcher import CampaignLauncher, LaunchPlan
+    from adgenie.media.sandbox import SandboxMediaProvider
+    from adgenie.media.studio import MediaStudio
+    from adgenie.models import MediaAsset, MediaStatus
+
+    settings.media_storage_dir = str(tmp_path / "media")
+    launched = CampaignLauncher(
+        session, settings=settings, platform_client=SandboxPlatform(Platform.META)
+    ).launch(
+        LaunchPlan(
+            offer_id=offer.id, platform=Platform.META,
+            daily_budget_usd=20.0, angle_count=1,
+        )
+    )
+    creative = session.get(Creative, launched.creative_ids[0])
+
+    assets = MediaStudio(
+        session, settings, provider=SandboxMediaProvider(fail=True)
+    ).generate_for_creative(creative, platform=Platform.META)
+
+    assert all(a.status is MediaStatus.FAILED for a in assets)
+    for asset in assets:
+        assert "simulated generation failure" in asset.error
+        assert "index out of range" not in asset.error
+
+
+def test_research_scans_markets_the_archive_actually_covers(
+    session, settings, offer
+):
+    """A US-targeted offer scanned against US reads the political archive."""
+    import httpx
+
+    from adgenie.research.ad_library import AdLibraryClient
+    from adgenie.research.service import MarketResearcher
+
+    seen = {}
+
+    def handler(request):
+        seen.update(dict(request.url.params))
+        return httpx.Response(200, json={"data": []})
+
+    settings.meta_access_token = "tok"
+    offer.geo_targets = ["US"]
+    client = AdLibraryClient(
+        settings, client=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+    MarketResearcher(session, settings, client=client).research_offer(offer)
+
+    countries = seen["ad_reached_countries"].split(",")
+    assert "US" not in countries
+    assert any(c in EU_UK_COUNTRIES_FOR_TEST for c in countries)
+
+
+def test_research_keeps_covered_target_markets(session, settings, offer):
+    import httpx
+
+    from adgenie.research.ad_library import AdLibraryClient
+    from adgenie.research.service import MarketResearcher
+
+    seen = {}
+
+    def handler(request):
+        seen.update(dict(request.url.params))
+        return httpx.Response(200, json={"data": []})
+
+    settings.meta_access_token = "tok"
+    offer.geo_targets = ["GB", "US"]
+    client = AdLibraryClient(
+        settings, client=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+    MarketResearcher(session, settings, client=client).research_offer(offer)
+    assert seen["ad_reached_countries"] == "GB"
+
+
+def test_a_repeated_ad_in_one_batch_does_not_break_the_scan(session, settings):
+    """Paging can return the same ad twice; inserting it twice lost the scan."""
+    import httpx
+
+    from adgenie.models import CompetitorAd
+    from adgenie.research.ad_library import AdLibraryClient
+    from adgenie.research.service import MarketResearcher
+
+    settings.meta_access_token = "tok"
+    duplicate = {
+        "id": "same",
+        "page_id": "p1",
+        "ad_creative_bodies": ["How it works"],
+        "ad_delivery_start_time": "2026-01-01T00:00:00+0000",
+    }
+    handler = lambda r: httpx.Response(200, json={"data": [duplicate, duplicate]})
+    client = AdLibraryClient(
+        settings, client=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+    MarketResearcher(session, settings, client=client).research("x", countries=["GB"])
+    session.commit()
+
+    assert session.query(CompetitorAd).count() == 1
+
+
+def test_an_empty_scan_says_so(settings):
+    import httpx
+
+    from adgenie.research.ad_library import AdLibraryClient
+
+    settings.meta_access_token = "tok"
+    client = AdLibraryClient(
+        settings,
+        client=httpx.Client(
+            transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"data": []}))
+        ),
+    )
+    _, warnings = client.search(search_terms="x", countries=["GB"])
+    assert "NO_RESULTS" in {w.code for w in warnings}
+
+
+def test_retirements_need_an_inactive_sweep(session, settings):
+    """A live-only scan never observes an ad stopping."""
+    import httpx
+
+    from adgenie.models import CompetitorAd
+    from adgenie.research.ad_library import AdLibraryClient
+    from adgenie.research.service import MarketResearcher
+
+    settings.meta_access_token = "tok"
+    session.add(
+        CompetitorAd(
+            ad_archive_id="a1", search_term="sleep", vertical="supplements",
+            is_active=True, days_running=5,
+        )
+    )
+    session.commit()
+
+    stopped = {
+        "id": "a1",
+        "page_id": "p1",
+        "ad_creative_bodies": ["50% off today"],
+        "ad_delivery_start_time": "2026-01-01T00:00:00+0000",
+        "ad_delivery_stop_time": "2026-01-08T00:00:00+0000",
+    }
+    seen = {}
+
+    def handler(request):
+        seen.update(dict(request.url.params))
+        return httpx.Response(200, json={"data": [stopped]})
+
+    client = AdLibraryClient(
+        settings, client=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+    researcher = MarketResearcher(session, settings, client=client)
+    researcher.sweep_for_retirements("supplements", countries=["GB"])
+    session.commit()
+
+    assert seen["ad_active_status"] == "ALL"
+    row = session.query(CompetitorAd).one()
+    assert row.is_active is False
+    assert researcher.retired_ads("supplements")
+
+
+@pytest.mark.parametrize(
+    "module,exc",
+    [("ad_library", "non-JSON"), ("kie", "non-JSON")],
+)
+def test_a_non_json_success_body_is_a_typed_error(settings, module, exc):
+    """A gateway page answering 200 with HTML left assets stuck GENERATING."""
+    import httpx
+
+    handler = lambda r: httpx.Response(
+        200, content=b"<html>gateway</html>", headers={"content-type": "text/html"}
+    )
+    transport = httpx.MockTransport(handler)
+
+    if module == "ad_library":
+        from adgenie.research.ad_library import AdLibraryClient
+
+        settings.meta_access_token = "tok"
+        client = AdLibraryClient(settings, client=httpx.Client(transport=transport))
+        with pytest.raises(PlatformError, match=exc):
+            client.search(search_terms="x", countries=["GB"])
+    else:
+        from adgenie.media.base import MediaError
+        from adgenie.media.kie import KieClient
+        from adgenie.media.base import MediaRequest
+
+        settings.kie_api_key = "k"
+        client = KieClient(settings, client=httpx.Client(transport=transport))
+        with pytest.raises(MediaError, match=exc):
+            client.submit(MediaRequest(prompt="x"))

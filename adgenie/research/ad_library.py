@@ -219,12 +219,12 @@ class AdLibraryClient:
             search_terms or page_ids,
             ",".join(countries),
         )
-        if not ads and not warnings:
+        if not ads:
             warnings.append(
                 CoverageWarning(
                     "NO_RESULTS",
                     "The archive returned nothing for this search. Try a broader "
-                    "term, more countries, or ad_active_status=ALL.",
+                    "term, more countries, or active_only=False.",
                 )
             )
         return ads, warnings
@@ -270,12 +270,33 @@ class AdLibraryClient:
                 )
             else:
                 if response.status_code < 400:
-                    return response.json() if response.content else {}
+                    return self._decode(response)
                 last = self._to_error(response)
             if not last.retryable or attempt == 3:
                 raise last
             time.sleep(2**attempt)
         raise last  # pragma: no cover
+
+    @staticmethod
+    def _decode(response: httpx.Response) -> dict:
+        """Parse a success body, turning malformed JSON into a PlatformError.
+
+        A gateway or captcha page can answer 200 with HTML; letting the decode
+        error escape would bypass every caller's error handling.
+        """
+        if not response.content:
+            return {}
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise PlatformError(
+                f"the Ad Library returned a non-JSON response: {exc}",
+                platform=Platform.META,
+                code="BAD_RESPONSE",
+                retryable=True,
+                payload={"body": response.text[:300]},
+            ) from exc
+        return body if isinstance(body, dict) else {"data": body}
 
     @staticmethod
     def _to_error(response: httpx.Response) -> PlatformError:
