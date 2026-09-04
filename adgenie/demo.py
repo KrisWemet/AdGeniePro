@@ -16,7 +16,8 @@ import argparse
 import random
 from datetime import date, datetime, time, timedelta, timezone
 
-from sqlalchemy.orm import Session
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
 
 from .config import get_settings
 from .core.launcher import CampaignLauncher, LaunchPlan
@@ -28,7 +29,7 @@ from .core.tracking import (
     record_click,
     record_conversion,
 )
-from .db import Base, SessionLocal, engine, init_db
+from .db import Base
 from .models import (
     AdGroup,
     Campaign,
@@ -186,16 +187,42 @@ def print_report(session: Session, since: date, until: date) -> None:
     print(f"{'PROFIT':<44}{fmt_usd(profit):>25}")
 
 
-def run(days: int = 21, budget: float = 60.0, seed: int = 11, verbose: bool = True) -> dict:
-    settings = get_settings()
-    settings.dry_run = False  # act on the sandbox, not on a live account
+def run(
+    days: int = 21,
+    budget: float = 60.0,
+    seed: int = 11,
+    verbose: bool = True,
+    database_url: str | None = None,
+) -> dict:
+    """Simulate `days` of a campaign against the sandbox.
+
+    The demo builds its own settings and its own throwaway database rather than
+    touching the configured ones. Reusing them would mean `adgenie demo` run
+    against a real deployment drops that deployment's tables and leaves live
+    spend enabled for the rest of the process.
+    """
+    base = get_settings()
+    settings = base.model_copy(
+        update={
+            # Act on the sandbox, which is the only thing this touches.
+            "dry_run": False,
+            "database_url": database_url or "sqlite:///./adgenie-demo.db",
+            "global_daily_budget_cap_usd": max(
+                base.global_daily_budget_cap_usd, budget * 20
+            ),
+        }
+    )
     reset_sandboxes()
 
+    engine = create_engine(
+        settings.database_url, connect_args={"check_same_thread": False}
+    )
     Base.metadata.drop_all(bind=engine)
-    init_db()
+    Base.metadata.create_all(bind=engine)
+    factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
     rng = random.Random(seed)
 
-    session = SessionLocal()
+    session = factory()
     offer = seed_offer(session)
 
     sandbox = SandboxPlatform(Platform.META, seed=seed)
@@ -256,6 +283,7 @@ def run(days: int = 21, budget: float = 60.0, seed: int = 11, verbose: bool = Tr
         "applied": sum(c["applied"] for c in cycles),
     }
     session.close()
+    engine.dispose()
     return summary
 
 
@@ -264,8 +292,18 @@ def main() -> None:
     parser.add_argument("--days", type=int, default=21)
     parser.add_argument("--budget", type=float, default=60.0)
     parser.add_argument("--seed", type=int, default=11)
+    parser.add_argument(
+        "--database-url",
+        default=None,
+        help="where to build the throwaway demo database (it is dropped first)",
+    )
     args = parser.parse_args()
-    summary = run(days=args.days, budget=args.budget, seed=args.seed)
+    summary = run(
+        days=args.days,
+        budget=args.budget,
+        seed=args.seed,
+        database_url=args.database_url,
+    )
     print(f"\n{summary}")
 
 

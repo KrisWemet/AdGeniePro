@@ -194,6 +194,12 @@ Evaluated in order; the first match wins.
 | `frequency_fatigue` | Frequency above the ceiling | Generate new creative |
 | `ctr_decay` | CTR decayed against the ad's own opening week | Generate new creative |
 
+Levers are matched to the level that has them. Neither platform funds an
+individual ad, so at creative level a winner is held (its gain is realised by
+funding the parent ad set and by the budget split across its siblings) and the
+usable actions are pause, resume and creative refresh. Budget changes apply to
+ad sets and campaigns.
+
 Three properties are deliberate:
 
 - **The bar for scaling is higher than the bar for pausing.** Pausing a good ad
@@ -280,7 +286,7 @@ adgenie/
   static/            dashboard
   cli.py             command line
   demo.py            end-to-end simulation
-tests/               277 tests
+tests/               290 tests
 legacy/              the original prototype scripts, kept for reference
 ```
 

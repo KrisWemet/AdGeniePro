@@ -379,8 +379,10 @@ class MetaAdsClient(AdPlatform):
                 )
             if conv.get("email_sha256"):
                 user_data["em"] = [conv["email_sha256"]]
-            if conv.get("ip_hash"):
-                user_data["client_ip_address"] = conv["ip_hash"]
+            # `client_ip_address` must be the raw address; Meta hashes the
+            # fields that need hashing itself. This platform deliberately never
+            # stores a raw IP, so the field is omitted rather than filled with a
+            # salted hash, which Meta would simply fail to match against.
             if not user_data:
                 continue
             events.append(

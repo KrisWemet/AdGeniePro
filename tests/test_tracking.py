@@ -111,7 +111,12 @@ def test_signed_payload_round_trips(settings):
     assert verify_signature(token, settings.postback_secret)["conversion"] == 5
 
 
-@pytest.mark.parametrize("mutate", [lambda t: t[:-1] + "0", lambda t: "x" + t, lambda t: "nodot"])
+def _flip_last(token: str) -> str:
+    """Change the final signature character to a definitely different one."""
+    return token[:-1] + ("1" if token[-1] == "0" else "0")
+
+
+@pytest.mark.parametrize("mutate", [_flip_last, lambda t: "x" + t, lambda t: "nodot"])
 def test_tampered_tokens_are_rejected(settings, mutate):
     token = sign_payload({"a": 1}, secret=settings.postback_secret)
     assert verify_signature(mutate(token), settings.postback_secret) is None

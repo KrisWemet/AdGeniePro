@@ -275,9 +275,20 @@ class SandboxPlatform(AdPlatform):
             if ad.created_on is None:
                 ad.created_on = day
 
-            budget = group.daily_budget_micros or (
-                campaign.daily_budget_micros if campaign else 0
-            )
+            # An ad group with no budget of its own is sharing the campaign's,
+            # which is exactly how Google campaigns are launched. Splitting it
+            # across the sibling groups keeps the simulated account from
+            # spending N times its daily budget.
+            budget = group.daily_budget_micros
+            if not budget and campaign is not None:
+                sibling_groups = [
+                    e
+                    for e in self.entities.values()
+                    if e.level == "ad_group"
+                    and e.parent_id == campaign.external_id
+                    and e.active
+                ] or [group]
+                budget = campaign.daily_budget_micros // len(sibling_groups)
             siblings = [
                 e
                 for e in self.entities.values()

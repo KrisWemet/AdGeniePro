@@ -182,7 +182,13 @@ def cmd_report(args) -> int:
 def cmd_demo(args) -> int:
     from .demo import run
 
-    run(days=args.days, budget=args.budget, seed=args.seed)
+    # The demo builds and drops its own database, never the configured one.
+    run(
+        days=args.days,
+        budget=args.budget,
+        seed=args.seed,
+        database_url=args.database_url,
+    )
     return 0
 
 
@@ -246,6 +252,9 @@ def build_parser() -> argparse.ArgumentParser:
     demo.add_argument("--days", type=int, default=21)
     demo.add_argument("--budget", type=float, default=60.0)
     demo.add_argument("--seed", type=int, default=11)
+    demo.add_argument(
+        "--database-url", default=None, help="throwaway demo database location"
+    )
     demo.set_defaults(func=cmd_demo)
 
     return parser

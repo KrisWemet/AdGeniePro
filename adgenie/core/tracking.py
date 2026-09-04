@@ -336,7 +336,7 @@ def record_click(
 
     click = Click(
         click_id=new_click_id(),
-        offer_id=ctx.offer_id,
+        offer_id=ctx.offer_id or None,
         campaign_id=campaign_id,
         ad_group_id=ad_group_id,
         creative_id=creative_id,
@@ -440,7 +440,7 @@ def record_conversion(
 
     conversion = Conversion(
         click_id=click.click_id if click else click_id,
-        offer_id=(click.offer_id if click else (ctx.offer_id if ctx else 0)),
+        offer_id=(click.offer_id if click else (ctx.offer_id if ctx else None)) or None,
         campaign_id=click.campaign_id if click else (ctx.campaign_id if ctx else None),
         ad_group_id=click.ad_group_id if click else (ctx.ad_group_id if ctx else None),
         creative_id=click.creative_id if click else (ctx.creative_id if ctx else None),

@@ -342,7 +342,9 @@ class Click(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     click_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
-    offer_id: Mapped[int] = mapped_column(ForeignKey("offers.id"), index=True)
+    # Nullable: a click whose sub-id was mangled still has to be recorded, and
+    # a non-nullable column would make the redirect fail instead.
+    offer_id: Mapped[int | None] = mapped_column(ForeignKey("offers.id"), index=True)
     campaign_id: Mapped[int | None] = mapped_column(ForeignKey("campaigns.id"))
     ad_group_id: Mapped[int | None] = mapped_column(ForeignKey("ad_groups.id"))
     creative_id: Mapped[int | None] = mapped_column(
@@ -371,7 +373,10 @@ class Conversion(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     click_id: Mapped[str | None] = mapped_column(String(64), index=True)
-    offer_id: Mapped[int] = mapped_column(ForeignKey("offers.id"), index=True)
+    # Nullable for the same reason as `Click.offer_id`: an unmatched postback is
+    # recorded as unattributed revenue rather than dropped or 500'd, so the
+    # network stops retrying and the gap stays visible.
+    offer_id: Mapped[int | None] = mapped_column(ForeignKey("offers.id"), index=True)
     campaign_id: Mapped[int | None] = mapped_column(ForeignKey("campaigns.id"))
     ad_group_id: Mapped[int | None] = mapped_column(ForeignKey("ad_groups.id"))
     creative_id: Mapped[int | None] = mapped_column(

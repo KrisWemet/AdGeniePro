@@ -676,3 +676,235 @@ def test_dashboard_escapes_untrusted_text():
     assert "const esc =" in page
     for unescaped in ("${a.reason}", "${c.name}", "${a.rule}", "${r.name"):
         assert unescaped not in page
+
+
+# --- second review round ---------------------------------------------------
+
+
+def test_budget_actions_are_not_emitted_for_individual_ads():
+    """Ad-level budgets do not exist, so such an action could only ever fail."""
+    winner = _window(400, 25, 300, budget_usd=25)
+    decision = Optimizer(OptimizerPolicy()).evaluate(winner, has_own_budget=False)
+    assert decision.action is ActionType.NO_ACTION
+    assert decision.rule == "winner_hold"
+
+    marginal = _window(3000, 78, 3000, budget_usd=40)
+    decision = Optimizer(OptimizerPolicy()).evaluate(marginal, has_own_budget=False)
+    assert decision.action is ActionType.NO_ACTION
+    assert decision.rule == "marginal_hold"
+
+
+def test_budget_actions_still_fire_where_a_budget_exists():
+    decision = Optimizer(OptimizerPolicy()).evaluate(
+        _window(400, 25, 300, budget_usd=25), has_own_budget=True
+    )
+    assert decision.action is ActionType.INCREASE_BUDGET
+
+
+def test_creative_refresh_is_not_proposed_for_an_ad_group():
+    """An ad group is a container; there is no creative in it to regenerate."""
+    w = _window(400, 20, 300, budget_usd=40)
+    w.level = EntityLevel.AD_GROUP
+    w.frequency = 5.0
+    decision = Optimizer(OptimizerPolicy()).evaluate(w)
+    assert decision.action is not ActionType.GENERATE_VARIANTS
+
+
+def test_setting_a_budget_on_an_ad_is_refused(session, settings, offer):
+    campaign = Campaign(
+        offer_id=offer.id, platform=Platform.META, name="m", external_id="c",
+        status=EntityStatus.ACTIVE,
+    )
+    session.add(campaign)
+    session.flush()
+    group = AdGroup(campaign_id=campaign.id, name="g", external_id="a")
+    session.add(group)
+    session.flush()
+    creative = Creative(ad_group_id=group.id, name="ad", external_id="x")
+    session.add(creative)
+    session.flush()
+
+    orchestrator = Orchestrator(
+        session, settings=settings, platform_clients={Platform.META: _NullPlatform()}
+    )
+    action = OptimizationAction(
+        level=EntityLevel.CREATIVE, entity_id=creative.id,
+        action=ActionType.INCREASE_BUDGET, rule="scale_winner", reason="t",
+        payload={"from_micros": usd_to_micros(10), "to_micros": usd_to_micros(12)},
+    )
+    session.add(action)
+    session.flush()
+
+    assert orchestrator.apply_action(action) is False
+    assert "individual ad" in action.error
+
+
+def test_variant_generation_on_an_ad_group_fails_without_aborting_the_run(
+    session, settings, offer
+):
+    """It used to raise AttributeError, which escaped and killed the cycle."""
+    campaign = Campaign(
+        offer_id=offer.id, platform=Platform.META, name="m", external_id="c",
+        status=EntityStatus.ACTIVE,
+    )
+    session.add(campaign)
+    session.flush()
+    group = AdGroup(campaign_id=campaign.id, name="g", external_id="a")
+    session.add(group)
+    session.flush()
+
+    orchestrator = Orchestrator(session, settings=settings)
+    action = OptimizationAction(
+        level=EntityLevel.AD_GROUP, entity_id=group.id,
+        action=ActionType.GENERATE_VARIANTS, rule="frequency_fatigue",
+        reason="t", payload={"variants": 2},
+    )
+    session.add(action)
+    session.flush()
+
+    assert orchestrator.apply_action(action) is False
+    assert action.status is ActionStatus.FAILED
+
+
+def test_an_unexpected_error_fails_one_action_not_the_whole_run(
+    session, settings, offer
+):
+    campaign = Campaign(
+        offer_id=offer.id, platform=Platform.META, name="m", external_id="c",
+        status=EntityStatus.ACTIVE,
+    )
+    session.add(campaign)
+    session.flush()
+
+    class Exploding:
+        platform = Platform.META
+
+        def set_status(self, *a, **k):
+            raise ZeroDivisionError("boom")
+
+    orchestrator = Orchestrator(
+        session, settings=settings, platform_clients={Platform.META: Exploding()}
+    )
+    action = OptimizationAction(
+        level=EntityLevel.CAMPAIGN, entity_id=campaign.id,
+        action=ActionType.PAUSE, rule="t", reason="t",
+    )
+    session.add(action)
+    session.flush()
+
+    assert orchestrator.apply_action(action) is False
+    assert "ZeroDivisionError" in action.error
+
+
+# --- unattributed revenue --------------------------------------------------
+
+
+def test_offer_foreign_keys_are_nullable():
+    """An unmatched postback must record an unattributed row, not raise."""
+    assert Conversion.__table__.c.offer_id.nullable
+    from adgenie.models import Click as ClickModel
+
+    assert ClickModel.__table__.c.offer_id.nullable
+
+
+def test_unmatched_conversion_writes_a_null_offer(session):
+    conversion, method = record_conversion(
+        session, network="x", network_txn_id="orphan-1", revenue_micros=usd_to_micros(40)
+    )
+    session.commit()
+    assert method == "unmatched"
+    assert conversion.offer_id is None
+
+
+def test_click_with_a_mangled_subid_is_still_recorded(session):
+    click, offer = record_click(session, "garbage", user_agent=BROWSER_UA)
+    session.commit()
+    assert offer is None
+    assert click.offer_id is None
+
+
+# --- sandbox economics -----------------------------------------------------
+
+
+def test_ad_groups_sharing_a_campaign_budget_do_not_multiply_it():
+    """Each group used to fall back to the full campaign budget on its own."""
+    sandbox = SandboxPlatform(Platform.GOOGLE, seed=5)
+    campaign = sandbox.create_campaign(
+        CampaignSpec(
+            name="c", objective="SEARCH",
+            daily_budget_micros=usd_to_micros(90), status="ACTIVE",
+        )
+    )
+    for i in range(3):
+        group = sandbox.create_ad_group(
+            AdGroupSpec(
+                campaign_external_id=campaign, name=f"g{i}",
+                daily_budget_micros=0, status="ACTIVE",
+            )
+        )
+        sandbox.create_creative(
+            CreativeSpec(
+                ad_group_external_id=group, name=f"ad{i}",
+                final_url="https://track.test/r?s=o1",
+                headlines=["A Headline Here", "B Headline Here", "C Headline"],
+                status="ACTIVE",
+            )
+        )
+
+    rows = sandbox.simulate_day(date(2026, 1, 1))
+    assert sum(r.spend_micros for r in rows) <= usd_to_micros(90)
+
+
+# --- variant count ---------------------------------------------------------
+
+
+def test_variant_count_is_honoured_beyond_the_platform_angle_list(offer, settings):
+    """Asking for ten used to return only as many angles as the platform had."""
+    from adgenie.core.copywriter import CopyStudio, build_brief
+
+    brief = build_brief(offer, Platform.GOOGLE, keyword="sleep aid")
+    drafts = CopyStudio(settings=settings).write_variants(brief, count=10)
+    assert len(drafts) == 10
+
+
+# --- Meta conversions API --------------------------------------------------
+
+
+def test_meta_never_sends_a_hashed_ip(meta_settings):
+    """Meta wants client_ip_address raw; a hash is a wrong value, not a safe one."""
+    seen = {}
+
+    def handler(request):
+        seen.update(dict(httpx.QueryParams(request.content.decode())))
+        return httpx.Response(200, json={})
+
+    client = MetaAdsClient(
+        meta_settings,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        dry_run=False,
+    )
+    client.upload_conversions(
+        [{"event_time": 1772000000, "value": 40.0, "fbclid": "x", "ip_hash": "deadbeef"}]
+    )
+    events = json.loads(seen["data"])
+    assert "client_ip_address" not in events[0]["user_data"]
+
+
+# --- demo isolation --------------------------------------------------------
+
+
+def test_demo_does_not_touch_the_configured_database_or_settings(tmp_path):
+    """`adgenie demo` used to drop the real database and enable live spend."""
+    from adgenie.config import get_settings
+    from adgenie.demo import run
+
+    before = get_settings()
+    configured_url, configured_dry_run = before.database_url, before.dry_run
+
+    run(days=3, budget=20.0, verbose=False,
+        database_url=f"sqlite:///{tmp_path / 'demo.db'}")
+
+    after = get_settings()
+    assert after.database_url == configured_url
+    assert after.dry_run == configured_dry_run
+    assert (tmp_path / "demo.db").exists()

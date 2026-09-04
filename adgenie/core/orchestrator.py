@@ -367,6 +367,8 @@ class Orchestrator:
                     window,
                     lifetime=lifetimes[creative.id],
                     now=now,
+                    # Neither platform funds an individual ad.
+                    has_own_budget=False,
                     is_active=creative.status is EntityStatus.ACTIVE,
                     compliance_blocked=creative.compliance_verdict
                     is ComplianceVerdict.BLOCK,
@@ -411,6 +413,9 @@ class Orchestrator:
                 window,
                 lifetime=lifetime,
                 now=now,
+                # Meta funds ad sets directly; on Google the change is applied
+                # to the parent campaign by delta.
+                has_own_budget=True,
                 is_active=True,
                 last_action_at=self._last_action_at(EntityLevel.AD_GROUP, group.id),
             )
@@ -498,6 +503,17 @@ class Orchestrator:
             )
             self.session.flush()
             return False
+        except Exception as exc:  # one bad action must not abort the whole run
+            action.status = ActionStatus.FAILED
+            action.error = f"{type(exc).__name__}: {exc}"
+            logger.exception(
+                "Unexpected failure applying %s on %s %s",
+                action.action.value,
+                action.level.value,
+                action.entity_id,
+            )
+            self.session.flush()
+            return False
 
         action.status = ActionStatus.APPLIED
         action.applied_at = now or datetime.now(timezone.utc)
@@ -534,6 +550,13 @@ class Orchestrator:
     def _set_budget(
         self, platform: Platform, action: OptimizationAction, entity
     ) -> None:
+        if action.level is EntityLevel.CREATIVE:
+            raise PlatformError(
+                "neither Meta nor Google exposes a budget on an individual ad; "
+                "fund the ad set or campaign instead",
+                platform=platform,
+                code="INVALID_LEVEL",
+            )
         target = int(action.payload["to_micros"])
 
         # Portfolio guard: no combination of individually sensible increases may
@@ -628,16 +651,25 @@ class Orchestrator:
         )
         return max(0, cap - committed)
 
-    def _generate_variants(self, action: OptimizationAction, entity: Creative) -> None:
+    def _generate_variants(self, action: OptimizationAction, entity) -> None:
         """Breed fresh creatives from a fatigued one.
 
         The parent stays live until the children have delivered, and lineage is
         recorded so a family of creatives can be traced back to the angle that
         started it.
         """
+        if action.level is not EntityLevel.CREATIVE or not isinstance(entity, Creative):
+            raise PlatformError(
+                "creative variants can only be bred from a creative",
+                code="INVALID_LEVEL",
+            )
         group = self.session.get(AdGroup, entity.ad_group_id)
-        campaign = self.session.get(Campaign, group.campaign_id)
-        offer = self.session.get(Offer, campaign.offer_id)
+        campaign = self.session.get(Campaign, group.campaign_id) if group else None
+        offer = self.session.get(Offer, campaign.offer_id) if campaign else None
+        if offer is None:
+            raise PlatformError(
+                f"creative {entity.id} has no reachable offer", code="NOT_FOUND"
+            )
         count = int(action.payload.get("variants", 2))
 
         brief = build_brief(

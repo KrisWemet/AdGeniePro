@@ -121,12 +121,19 @@ class Optimizer:
         *,
         lifetime: PerformanceWindow | None = None,
         is_active: bool = True,
+        has_own_budget: bool = True,
         compliance_blocked: bool = False,
         last_action_at: datetime | None = None,
         opening_ctr: float | None = None,
         now: datetime | None = None,
     ) -> Decision:
         """Return exactly one decision. Rules are ordered by severity.
+
+        `has_own_budget` says whether this entity is something the platform
+        will actually let you fund. Individual ads are not: neither Meta nor
+        Google exposes an ad-level budget, so a scale decision there has to be
+        reported against the parent rather than issued as a budget change that
+        can only fail.
 
         `window` is the recent window that scaling and throttling read, because
         recent performance is what predicts tomorrow. `lifetime` is everything
@@ -238,6 +245,18 @@ class Optimizer:
                 and roas_ci.lower >= p.floor_roas
                 and window.prob_profitable(p.target_roas) >= p.scale_confidence
             ):
+                if not has_own_budget:
+                    return self._no_action(
+                        window,
+                        "winner_hold",
+                        (
+                            f"ROAS {window.roas:.2f} beats the {p.target_roas:.2f} "
+                            "target. This level carries no budget of its own, so "
+                            "the gain is realised by funding its parent and by "
+                            "the budget split across its siblings."
+                        ),
+                        evidence=evidence,
+                    )
                 return self._budget_decision(
                     window,
                     direction=1,
@@ -255,6 +274,18 @@ class Optimizer:
             # 7. Marginal. Profitable but under target: cut spend rather than
             #    kill, because the angle may still be worth keeping alive.
             if p.floor_roas <= window.roas < p.target_roas and roas_ci.upper < p.target_roas:
+                if not has_own_budget:
+                    return self._no_action(
+                        window,
+                        "marginal_hold",
+                        (
+                            f"ROAS {window.roas:.2f} is below the "
+                            f"{p.target_roas:.2f} target but still above "
+                            "breakeven. This level carries no budget to reduce, "
+                            "so it is left running and given a smaller share."
+                        ),
+                        evidence=evidence,
+                    )
                 return self._budget_decision(
                     window,
                     direction=-1,
@@ -269,8 +300,12 @@ class Optimizer:
                 )
 
         # 8. Creative fatigue. Delivery is fine and economics are fine, but the
-        #    audience has seen it too often. Refresh rather than pause.
-        if window.frequency >= p.frequency_ceiling:
+        #    audience has seen it too often. Refresh rather than pause. Only a
+        #    creative can be regenerated; an ad group is a container.
+        if (
+            window.frequency >= p.frequency_ceiling
+            and window.level is EntityLevel.CREATIVE
+        ):
             return Decision(
                 level=window.level,
                 entity_id=window.entity_id,
@@ -287,7 +322,8 @@ class Optimizer:
             )
 
         if (
-            opening_ctr
+            window.level is EntityLevel.CREATIVE
+            and opening_ctr
             and window.ctr > 0
             and (opening_ctr - window.ctr) / opening_ctr >= p.ctr_decay_threshold
             and window.clicks >= p.min_clicks_to_judge

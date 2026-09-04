@@ -27,7 +27,7 @@ from pydantic import BaseModel, Field
 from ..config import Settings, get_settings
 from ..models import ComplianceVerdict, Platform
 from ..platforms.specs import get_spec, truncate_to_spec
-from .angles import Angle, angles_for, get_angle
+from .angles import ANGLES, Angle, angles_for, get_angle
 from .compliance import ComplianceEngine, ComplianceReport
 
 logger = logging.getLogger(__name__)
@@ -554,7 +554,14 @@ class CopyStudio:
         self, brief: CopyBrief, count: int = 3, offer=None
     ) -> list[CreativeDraft]:
         """One draft per angle, so a test explores arguments rather than synonyms."""
-        pool = angles_for(brief.platform.value, count)
+        # Start with the angles that suit this platform's intent, then fall back
+        # to the rest of the library, then repeat from the top. A caller asking
+        # for ten variants gets ten, rather than silently fewer.
+        preferred = angles_for(brief.platform.value)
+        remaining = [a for a in ANGLES if a not in preferred]
+        ordered = preferred + remaining
+        pool = [ordered[i % len(ordered)] for i in range(count)]
+
         drafts: list[CreativeDraft] = []
         for angle in pool:
             variant = CopyBrief(**{**brief.__dict__, "angle": angle, "repair_notes": []})
