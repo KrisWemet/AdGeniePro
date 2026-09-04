@@ -211,6 +211,10 @@ Three properties are deliberate:
   Ranking by observed conversion rate hands the budget to whichever ad got
   lucky first. Sampling from each posterior keeps a promising-but-unproven
   creative funded long enough to actually be measured.
+- **The shrinkage prior is leave-one-out.** Each creative is judged against a
+  prior built from its peers, never from itself, so an ad group holding a
+  single creative does not treat that creative's own rate as extra evidence
+  for it.
 
 ### Guard rails
 
@@ -286,7 +290,7 @@ adgenie/
   static/            dashboard
   cli.py             command line
   demo.py            end-to-end simulation
-tests/               290 tests
+tests/               303 tests
 legacy/              the original prototype scripts, kept for reference
 ```
 

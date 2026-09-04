@@ -375,6 +375,7 @@ class Orchestrator:
                     last_action_at=self._last_action_at(
                         EntityLevel.CREATIVE, creative.id
                     ),
+                    last_refresh_at=self._last_refresh_at(creative.id),
                     opening_ctr=self._opening_ctr(creative.id),
                 )
                 out.append((decision, creative))
@@ -434,6 +435,19 @@ class Orchestrator:
             .limit(1)
         ).scalar_one_or_none()
 
+    def _last_refresh_at(self, creative_id: int) -> datetime | None:
+        """When this creative last had replacements bred from it.
+
+        Read from the children themselves rather than from the action log, so
+        the answer stays right even if actions are pruned.
+        """
+        return self.session.execute(
+            select(Creative.created_at)
+            .where(Creative.parent_id == creative_id)
+            .order_by(Creative.created_at.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+
     def _opening_ctr(self, creative_id: int) -> float | None:
         """CTR over the creative's first seven delivering days.
 
@@ -472,8 +486,11 @@ class Orchestrator:
             action.error = "entity no longer exists"
             return False
 
-        platform = self._platform_of(action.level, entity)
+        platform: Platform | None = None
         try:
+            # Resolving the parent chain can fail on an orphaned row, so it has
+            # to sit inside the guard or it would abort the whole run.
+            platform = self._platform_of(action.level, entity)
             if action.action is ActionType.PAUSE:
                 self._set_status(platform, action.level, entity, active=False)
             elif action.action is ActionType.RESUME:
@@ -536,9 +553,18 @@ class Orchestrator:
         if level is EntityLevel.CAMPAIGN:
             return entity.platform
         if level is EntityLevel.AD_GROUP:
-            return self.session.get(Campaign, entity.campaign_id).platform
-        group = self.session.get(AdGroup, entity.ad_group_id)
-        return self.session.get(Campaign, group.campaign_id).platform
+            campaign = self.session.get(Campaign, entity.campaign_id)
+        else:
+            group = self.session.get(AdGroup, entity.ad_group_id)
+            campaign = (
+                self.session.get(Campaign, group.campaign_id) if group else None
+            )
+        if campaign is None:
+            raise PlatformError(
+                f"{level.value} {getattr(entity, 'id', '?')} has no parent campaign",
+                code="ORPHANED",
+            )
+        return campaign.platform
 
     def _set_status(
         self, platform: Platform, level: EntityLevel, entity, active: bool
@@ -560,16 +586,20 @@ class Orchestrator:
         target = int(action.payload["to_micros"])
 
         # Portfolio guard: no combination of individually sensible increases may
-        # push total committed daily spend past the global cap.
+        # push total committed daily spend past the global cap. The comparison
+        # is on the *increase*, not the entity's new absolute budget, because
+        # the money it already spends is part of the committed total either way.
         if action.action is ActionType.INCREASE_BUDGET:
-            headroom = self._budget_headroom_micros(exclude_entity=entity, level=action.level)
-            if target > headroom:
-                target = max(int(action.payload["from_micros"]), headroom)
+            current = int(action.payload["from_micros"])
+            headroom = self._budget_headroom_micros()
+            delta = target - current
+            if delta > headroom:
+                target = current + max(0, headroom)
                 action.reason += (
                     f" Capped at {micros_to_usd(target):.2f} USD by the global "
                     "daily spend limit."
                 )
-                if target <= action.payload["from_micros"]:
+                if target <= current:
                     raise PlatformError(
                         "global daily budget cap reached; no headroom to scale",
                         platform=platform,
@@ -644,12 +674,10 @@ class Orchestrator:
             committed += max(campaign.daily_budget_micros, group_total)
         return committed
 
-    def _budget_headroom_micros(self, exclude_entity, level: EntityLevel) -> int:
+    def _budget_headroom_micros(self) -> int:
+        """How much more daily spend the portfolio may commit."""
         cap = int(self.settings.global_daily_budget_cap_usd * 1_000_000)
-        committed = self._committed_daily_micros(
-            exclude_level=level, exclude_id=getattr(exclude_entity, "id", None)
-        )
-        return max(0, cap - committed)
+        return max(0, cap - self._committed_daily_micros())
 
     def _generate_variants(self, action: OptimizationAction, entity) -> None:
         """Breed fresh creatives from a fatigued one.
@@ -871,12 +899,24 @@ class Orchestrator:
                 select(Conversion).where(
                     Conversion.uploaded_to_platform.is_(False),
                     Conversion.status == ConversionStatus.APPROVED,
-                    Conversion.created_at >= cutoff,
+                    # A conversion often arrives pending and is approved days
+                    # later. Windowing on creation would skip it forever, so the
+                    # window follows the last update instead.
+                    Conversion.updated_at >= cutoff,
                 )
             ).scalars()
         )
         if not pending:
             return {"uploaded": 0}
+        if self.settings.dry_run:
+            # Marking these as uploaded while sending nothing would filter them
+            # out permanently: once dry run is switched off they would never be
+            # retried and the platforms would never learn about those sales.
+            logger.info(
+                "Dry run: %s conversion(s) ready to upload, sending none.",
+                len(pending),
+            )
+            return {"uploaded": 0, "pending": len(pending), "dry_run": True}
 
         # Track which conversions belong to which platform so one platform's
         # failure cannot force a re-upload of what another already accepted.

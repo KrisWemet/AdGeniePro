@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from ..config import Settings, get_settings
@@ -251,10 +251,12 @@ def verify_signature(
     if not token or "." not in token:
         return None
     encoded, _, sig = token.rpartition(".")
-    expected = hmac.new(secret.encode(), encoded.encode(), hashlib.sha256).hexdigest()[
-        :32
-    ]
-    if not hmac.compare_digest(sig, expected):
+    expected = hmac.new(
+        secret.encode(), encoded.encode("utf-8", "surrogateescape"), hashlib.sha256
+    ).hexdigest()[:32]
+    if not hmac.compare_digest(
+        sig.encode("utf-8", "surrogateescape"), expected.encode()
+    ):
         return None
     try:
         padded = encoded + "=" * (-len(encoded) % 4)
@@ -267,9 +269,18 @@ def verify_signature(
 
 
 def verify_postback_secret(provided: str | None, settings: Settings | None = None) -> bool:
-    """Compare a shared postback secret without leaking timing information."""
+    """Compare a shared postback secret without leaking timing information.
+
+    Compared as bytes: `compare_digest` raises TypeError on a non-ASCII str,
+    which would turn a malformed query parameter into a 500 rather than a 401.
+    """
     settings = settings or get_settings()
-    return bool(provided) and hmac.compare_digest(str(provided), settings.postback_secret)
+    if not provided:
+        return False
+    return hmac.compare_digest(
+        str(provided).encode("utf-8", "surrogateescape"),
+        settings.postback_secret.encode("utf-8"),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -319,9 +330,17 @@ def record_click(
     campaign_id = ctx.campaign_id
     ad_group_id = ctx.ad_group_id
     if creative_id is None and query_params.get("pa", "").isdigit():
+        platform_ad_id = query_params["pa"]
+        # Meta stores the ad id verbatim; Google stores "{adGroupId}~{adId}",
+        # so an exact match alone would never resolve a Google click.
         match = session.execute(
-            select(Creative).where(Creative.external_id == query_params["pa"])
-        ).scalar_one_or_none()
+            select(Creative).where(
+                or_(
+                    Creative.external_id == platform_ad_id,
+                    Creative.external_id.like(f"%~{platform_ad_id}"),
+                )
+            )
+        ).scalars().first()
         if match:
             creative_id = match.id
 

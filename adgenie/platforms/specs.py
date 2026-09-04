@@ -141,7 +141,12 @@ def truncate_to_spec(text: str, max_chars: int) -> str:
     if window.endswith((".", "!", "?")):
         return window.strip()
 
-    cut = window.rsplit(" ", 1)[0] if " " in window else window
+    # If the budget lands exactly on a word boundary the last word fits whole,
+    # so splitting it off would throw away a word that was never too long.
+    if text[max_chars] == " ":
+        cut = window
+    else:
+        cut = window.rsplit(" ", 1)[0] if " " in window else window
     cut = cut.rstrip(" ,;:-")
     # Never end a headline on a word that leaves the reader hanging.
     dangling = {

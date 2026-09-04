@@ -396,6 +396,11 @@ class Conversion(Base):
     raw: Mapped[dict] = mapped_column(JSON, default=dict)
     occurred_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    # Networks approve or reverse a sale long after they first post it, so the
+    # upload job windows on this rather than on creation.
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utcnow, onupdate=utcnow, index=True
+    )
 
 
 class OptimizationAction(Base):

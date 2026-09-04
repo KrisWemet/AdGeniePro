@@ -908,3 +908,262 @@ def test_demo_does_not_touch_the_configured_database_or_settings(tmp_path):
     assert after.database_url == configured_url
     assert after.dry_run == configured_dry_run
     assert (tmp_path / "demo.db").exists()
+
+
+# --- third review round ----------------------------------------------------
+
+
+def test_global_cap_is_checked_against_the_increase_not_the_total(
+    session, settings, offer
+):
+    """Comparing the new absolute budget refused scales that fit comfortably."""
+    settings.global_daily_budget_cap_usd = 500.0
+    campaign = Campaign(
+        offer_id=offer.id, platform=Platform.META, name="m", external_id="c",
+        daily_budget_micros=usd_to_micros(450), status=EntityStatus.ACTIVE,
+    )
+    session.add(campaign)
+    session.flush()
+    groups = []
+    for i in range(3):
+        group = AdGroup(
+            campaign_id=campaign.id, name=f"g{i}", external_id=f"a{i}",
+            daily_budget_micros=usd_to_micros(150), status=EntityStatus.ACTIVE,
+        )
+        session.add(group)
+        groups.append(group)
+    session.commit()
+
+    orchestrator = Orchestrator(
+        session, settings=settings, platform_clients={Platform.META: _NullPlatform()}
+    )
+    action = OptimizationAction(
+        level=EntityLevel.AD_GROUP, entity_id=groups[0].id,
+        action=ActionType.INCREASE_BUDGET, rule="scale_winner", reason="t",
+        payload={"from_micros": usd_to_micros(150), "to_micros": usd_to_micros(180)},
+    )
+    session.add(action)
+    session.flush()
+
+    # $450 committed + a $30 increase = $480, comfortably under the $500 cap.
+    assert orchestrator.apply_action(action) is True
+    assert groups[0].daily_budget_micros == usd_to_micros(180)
+
+
+def test_global_cap_still_clamps_an_increase_that_exceeds_it(
+    session, settings, offer
+):
+    settings.global_daily_budget_cap_usd = 100.0
+    campaign = Campaign(
+        offer_id=offer.id, platform=Platform.META, name="m", external_id="c",
+        daily_budget_micros=usd_to_micros(90), status=EntityStatus.ACTIVE,
+    )
+    session.add(campaign)
+    session.flush()
+    session.add(
+        AdGroup(
+            campaign_id=campaign.id, name="g", external_id="a",
+            daily_budget_micros=usd_to_micros(90), status=EntityStatus.ACTIVE,
+        )
+    )
+    session.commit()
+
+    orchestrator = Orchestrator(
+        session, settings=settings, platform_clients={Platform.META: _NullPlatform()}
+    )
+    action = OptimizationAction(
+        level=EntityLevel.CAMPAIGN, entity_id=campaign.id,
+        action=ActionType.INCREASE_BUDGET, rule="scale_winner", reason="t",
+        payload={"from_micros": usd_to_micros(90), "to_micros": usd_to_micros(200)},
+    )
+    session.add(action)
+    session.flush()
+
+    assert orchestrator.apply_action(action) is True
+    assert campaign.daily_budget_micros == usd_to_micros(100)
+    assert "Capped at" in action.reason
+
+
+def test_dry_run_does_not_mark_conversions_as_uploaded(session, settings, offer):
+    """Marking them sent while sending nothing loses them permanently."""
+    campaign = Campaign(
+        offer_id=offer.id, platform=Platform.META, name="m", external_id="c",
+        status=EntityStatus.ACTIVE,
+    )
+    session.add(campaign)
+    session.flush()
+    group = AdGroup(campaign_id=campaign.id, name="g", external_id="a")
+    session.add(group)
+    session.flush()
+    creative = Creative(ad_group_id=group.id, name="ad", external_id="x")
+    session.add(creative)
+    session.flush()
+    session.commit()
+    _conversion_for(session, offer, creative.id, Platform.META, "fbclid", "dry-1")
+
+    settings.dry_run = True
+    orchestrator = Orchestrator(
+        session, settings=settings, platform_clients={Platform.META: _NullPlatform()}
+    )
+    result = orchestrator.push_conversions()
+
+    assert result["uploaded"] == 0
+    assert result["dry_run"] is True
+    conversion = session.execute(
+        select(Conversion).where(Conversion.network_txn_id == "dry-1")
+    ).scalar_one()
+    assert conversion.uploaded_to_platform is False
+
+
+def test_upload_window_follows_the_last_update_not_creation(session, offer):
+    """A sale approved days after it was posted must still be uploaded."""
+    args = dict(network="cb", network_txn_id="late-1", click_id=None)
+    conversion, _ = record_conversion(
+        session, revenue_micros=0, status=ConversionStatus.PENDING, **args
+    )
+    conversion.created_at = datetime(2026, 1, 1)
+    session.commit()
+
+    record_conversion(
+        session, revenue_micros=usd_to_micros(40),
+        status=ConversionStatus.APPROVED, **args
+    )
+    session.commit()
+    session.refresh(conversion)
+    assert conversion.updated_at > conversion.created_at
+
+
+def test_creative_refresh_does_not_re_fire_after_a_recent_refresh():
+    """The parent keeps running, so the rule used to breed ads every cycle."""
+    optimizer = Optimizer(OptimizerPolicy())
+    fatigued = _window(200, 7, 200, budget_usd=25)
+    fatigued.frequency = 4.5
+
+    first = optimizer.evaluate(fatigued, has_own_budget=False)
+    assert first.action is ActionType.GENERATE_VARIANTS
+
+    now = datetime(2026, 3, 10, tzinfo=timezone.utc)
+    second = optimizer.evaluate(
+        fatigued,
+        has_own_budget=False,
+        last_refresh_at=now - timedelta(days=2),
+        now=now,
+    )
+    assert second.action is not ActionType.GENERATE_VARIANTS
+
+
+def test_creative_refresh_returns_once_the_cooldown_expires():
+    optimizer = Optimizer(OptimizerPolicy())
+    fatigued = _window(200, 7, 200, budget_usd=25)
+    fatigued.frequency = 4.5
+    now = datetime(2026, 3, 10, tzinfo=timezone.utc)
+    decision = optimizer.evaluate(
+        fatigued,
+        has_own_budget=False,
+        last_refresh_at=now - timedelta(days=30),
+        now=now,
+    )
+    assert decision.action is ActionType.GENERATE_VARIANTS
+
+
+def test_a_bad_api_key_is_rejected_not_a_crash(api_client, settings):
+    """compare_digest raises TypeError on a non-ASCII str, which would 500.
+
+    HTTP headers decode as latin-1, so an accented character reaches the
+    handler intact and is exactly the input that used to crash it.
+    """
+    settings.api_key = "s3cret"
+    # Sent as raw bytes because that is what travels on the wire; Starlette
+    # decodes it back to a non-ASCII str before the handler sees it.
+    response = api_client.get(
+        "/api/offers", headers={"X-API-Key": "café".encode("latin-1")}
+    )
+    assert response.status_code == 401
+
+
+def test_a_non_ascii_postback_secret_is_rejected_not_a_crash(api_client, settings):
+    """A query parameter carries full UTF-8, so this reaches the handler too."""
+    response = api_client.get("/postback?transaction_id=t&secret=caf%C3%A9%E2%98%95")
+    assert response.status_code == 401
+
+
+def test_prior_is_built_from_peers_not_from_the_entity_itself():
+    """An ad group of one would otherwise shrink a creative toward its own rate."""
+    from adgenie.core.metrics import apply_pooled_prior
+
+    solo = _window(200, 20, 200, budget_usd=25)
+    apply_pooled_prior([solo])
+    prior_mean = solo.prior_a / (solo.prior_a + solo.prior_b)
+    assert solo.cvr == pytest.approx(0.10)
+    assert prior_mean < 0.05, "the prior must not echo the creative's own rate"
+
+
+def test_peers_shape_each_other_but_not_themselves():
+    from adgenie.core.metrics import apply_pooled_prior
+
+    hot = _window(200, 20, 200, budget_usd=25)
+    hot.entity_id = 1
+    cold_a = _window(500, 10, 500, budget_usd=25)
+    cold_a.entity_id = 2
+    cold_b = _window(500, 10, 500, budget_usd=25)
+    cold_b.entity_id = 3
+    apply_pooled_prior([hot, cold_a, cold_b])
+
+    hot_prior = hot.prior_a / (hot.prior_a + hot.prior_b)
+    cold_prior = cold_a.prior_a / (cold_a.prior_a + cold_a.prior_b)
+    # The hot creative is judged against the cold pool, and vice versa.
+    assert hot_prior < cold_prior
+
+
+def test_truncation_keeps_a_word_that_fits_exactly():
+    from adgenie.platforms.specs import truncate_to_spec
+
+    assert truncate_to_spec("Sleep Better Tonight Naturally", 20) == "Sleep Better Tonight"
+    assert (
+        truncate_to_spec("Wind Down Without Grogginess Today", 28)
+        == "Wind Down Without Grogginess"
+    )
+
+
+def test_google_macro_fallback_matches_a_composite_creative_id(session, offer):
+    """Google's `{creative}` macro is the bare ad id; storage is composite."""
+    campaign = Campaign(
+        offer_id=offer.id, platform=Platform.GOOGLE, name="g", external_id="c",
+        status=EntityStatus.ACTIVE,
+    )
+    session.add(campaign)
+    session.flush()
+    group = AdGroup(campaign_id=campaign.id, name="g", external_id="22")
+    session.add(group)
+    session.flush()
+    creative = Creative(ad_group_id=group.id, name="ad", external_id="22~33")
+    session.add(creative)
+    session.commit()
+
+    click, _ = record_click(
+        session,
+        encode_subid(TrackingContext(offer.id)),
+        user_agent=BROWSER_UA,
+        query_params={"pa": "33", "gclid": "Cj0"},
+    )
+    session.commit()
+    assert click.creative_id == creative.id
+
+
+def test_an_orphaned_entity_fails_one_action_not_the_run(session, settings, offer):
+    """_platform_of used to dereference a missing parent outside the guard."""
+    group = AdGroup(campaign_id=9999, name="orphan", external_id="a")
+    session.add(group)
+    session.flush()
+
+    orchestrator = Orchestrator(session, settings=settings)
+    action = OptimizationAction(
+        level=EntityLevel.AD_GROUP, entity_id=group.id,
+        action=ActionType.PAUSE, rule="t", reason="t",
+    )
+    session.add(action)
+    session.flush()
+
+    assert orchestrator.apply_action(action) is False
+    assert action.status is ActionStatus.FAILED
+    assert "parent campaign" in action.error

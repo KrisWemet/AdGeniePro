@@ -400,11 +400,24 @@ def pooled_prior(
 def apply_pooled_prior(
     windows: list[PerformanceWindow], strength: float = 25.0
 ) -> tuple[float, float]:
-    """Compute the pooled prior and set it on every window in the group."""
-    prior_a, prior_b = pooled_prior(windows, strength=strength)
+    """Give each window a prior built from its *peers*, not from itself.
+
+    Pooling over a group that includes the entity being judged means a creative
+    is shrunk toward its own result, which tightens its interval with pseudo-
+    observations of itself and defeats the point of the prior. That is most
+    acute where it matters most: an ad group holding a single creative would
+    otherwise have that creative's own rate treated as 25 extra clicks of
+    independent evidence, right before the kill and scale gates read it.
+
+    Returns the prior computed over the whole group, for reporting.
+    """
+    group_prior = pooled_prior(windows, strength=strength)
     for window in windows:
-        window.prior_a, window.prior_b = prior_a, prior_b
-    return prior_a, prior_b
+        peers = [w for w in windows if w is not window]
+        window.prior_a, window.prior_b = (
+            pooled_prior(peers, strength=strength) if peers else pooled_prior([], strength=strength)
+        )
+    return group_prior
 
 
 def default_window(lookback_days: int, today: date | None = None) -> tuple[date, date]:

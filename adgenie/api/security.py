@@ -26,7 +26,11 @@ async def require_api_key(
     settings: Settings = get_settings()
     if not settings.requires_api_key:
         return
-    if not x_api_key or not hmac.compare_digest(x_api_key, settings.api_key or ""):
+    # compare_digest raises TypeError on a non-ASCII str, which would turn a
+    # bad header into a 500. Comparing bytes keeps it a clean 401.
+    provided = (x_api_key or "").encode("utf-8", "surrogateescape")
+    expected = (settings.api_key or "").encode("utf-8")
+    if not x_api_key or not hmac.compare_digest(provided, expected):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="a valid X-API-Key header is required",

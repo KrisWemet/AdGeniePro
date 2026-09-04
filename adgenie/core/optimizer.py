@@ -82,6 +82,10 @@ class OptimizerPolicy:
     frequency_ceiling: float = 3.2
     # A creative whose CTR has decayed this far from its own opening week.
     ctr_decay_threshold: float = 0.35
+    # How long a creative counts as already refreshed. Without this the fatigue
+    # rules re-fire every cycle and breed a new batch of ads each time, since
+    # the parent keeps running and its frequency never falls.
+    refresh_cooldown_days: int = 14
     auto_apply_budget_ceiling_micros: int = 50_000_000
 
     @classmethod
@@ -124,6 +128,7 @@ class Optimizer:
         has_own_budget: bool = True,
         compliance_blocked: bool = False,
         last_action_at: datetime | None = None,
+        last_refresh_at: datetime | None = None,
         opening_ctr: float | None = None,
         now: datetime | None = None,
     ) -> Decision:
@@ -302,9 +307,11 @@ class Optimizer:
         # 8. Creative fatigue. Delivery is fine and economics are fine, but the
         #    audience has seen it too often. Refresh rather than pause. Only a
         #    creative can be regenerated; an ad group is a container.
+        already_refreshed = self._recently_refreshed(last_refresh_at, now)
         if (
             window.frequency >= p.frequency_ceiling
             and window.level is EntityLevel.CREATIVE
+            and not already_refreshed
         ):
             return Decision(
                 level=window.level,
@@ -323,6 +330,7 @@ class Optimizer:
 
         if (
             window.level is EntityLevel.CREATIVE
+            and not already_refreshed
             and opening_ctr
             and window.ctr > 0
             and (opening_ctr - window.ctr) / opening_ctr >= p.ctr_decay_threshold
@@ -369,6 +377,18 @@ class Optimizer:
         if now.tzinfo is None:
             now = now.replace(tzinfo=timezone.utc)
         return now - last_action_at < timedelta(hours=self.policy.cooldown_hours)
+
+    def _recently_refreshed(
+        self, last_refresh_at: datetime | None, now: datetime | None
+    ) -> bool:
+        if last_refresh_at is None:
+            return False
+        if last_refresh_at.tzinfo is None:
+            last_refresh_at = last_refresh_at.replace(tzinfo=timezone.utc)
+        now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        return now - last_refresh_at < timedelta(days=self.policy.refresh_cooldown_days)
 
     def _no_action(
         self,
