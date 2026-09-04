@@ -91,6 +91,9 @@ def cmd_launch(args) -> int:
                 keywords=args.keyword or [],
                 geo_targets=args.geo or [],
                 start_paused=not args.start_active,
+                research_market=args.research,
+                research_term=args.research_term,
+                generate_media=args.with_media,
             )
         )
     print(json.dumps(result.as_dict(), indent=2))
@@ -179,6 +182,84 @@ def cmd_report(args) -> int:
     return 0
 
 
+def cmd_research(args) -> int:
+    init_db()
+    settings = get_settings()
+    from .research.ad_library import commercial_ads_available
+    from .research.service import MarketResearcher
+
+    countries = args.country or settings.ad_library_country_codes
+    if not commercial_ads_available(countries):
+        print(
+            "Warning: none of "
+            + ", ".join(countries)
+            + " is an EU or UK market, so the archive carries only political and "
+            "issue ads there. Add --country GB (or an EU code) to see commercial "
+            "competitors.",
+            file=sys.stderr,
+        )
+    if not settings.has_ad_library:
+        print(
+            "META_ACCESS_TOKEN is not set; the Ad Library needs a token with "
+            "ads_read.",
+            file=sys.stderr,
+        )
+        return 2
+
+    with session_scope() as session:
+        brief = MarketResearcher(session, settings).research(
+            args.term, countries=countries, vertical=args.vertical,
+            active_only=not args.include_inactive, max_pages=args.pages,
+        )
+
+    print(f"\n{args.term}  ({brief.confidence} confidence)")
+    print(
+        f"  {brief.ads_seen} ads from {brief.advertisers} advertisers, "
+        f"{brief.proven_ads} running {settings.ad_library_proven_days}+ days"
+    )
+    if brief.angle_ranking:
+        print("\n  Arguments surviving longest:")
+        for angle, share in brief.angle_ranking:
+            bar = "#" * max(1, int(share * 30))
+            print(f"    {angle:<20}{share:>6.0%}  {bar}")
+    if brief.top_ads:
+        print("\n  Longest-running ads:")
+        for ad in brief.top_ads[:5]:
+            live = "live" if ad["still_running"] else "ended"
+            print(
+                f"    {ad['days_running']:>4}d {live:<6} {ad['angle']:<18}"
+                f"{ad['page_name'][:32]}"
+            )
+    print("\n  Direction for the copywriter:")
+    for note in brief.to_prompt_notes():
+        print(f"    - {note}")
+    for warning in brief.warnings:
+        print(f"\n  Note [{warning['code']}]: {warning['message']}")
+    return 0
+
+
+def cmd_media(args) -> int:
+    init_db()
+    settings = get_settings()
+    from .media.studio import MediaStudio
+
+    with session_scope() as session:
+        creative = session.get(Creative, args.creative)
+        if creative is None:
+            print(f"creative {args.creative} not found", file=sys.stderr)
+            return 1
+        assets = MediaStudio(session, settings).generate_for_creative(
+            creative, placements=args.placement or None, kind=args.kind
+        )
+        for asset in assets:
+            location = asset.local_path or asset.error or ""
+            print(
+                f"  {asset.status.value:<10}{(asset.extra or {}).get('placement',''):<18}"
+                f"{asset.aspect_ratio:<7}{location}"
+            )
+        return 0 if any(a.status.value == "ready" for a in assets) else 1
+
+
 def cmd_demo(args) -> int:
     from .demo import run
 
@@ -220,6 +301,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("offers", help="list offers").set_defaults(func=cmd_offers)
 
+    research = sub.add_parser(
+        "research", help="scan the Meta Ad Library for what is still running"
+    )
+    research.add_argument("--term", required=True, help="what to search for")
+    research.add_argument(
+        "--country", action="append",
+        help="repeatable; commercial ads are EU and UK only",
+    )
+    research.add_argument("--vertical", default="")
+    research.add_argument("--pages", type=int, default=3)
+    research.add_argument("--include-inactive", action="store_true")
+    research.set_defaults(func=cmd_research)
+
+    media = sub.add_parser("media", help="generate imagery for a creative")
+    media.add_argument("--creative", type=int, required=True)
+    media.add_argument("--kind", default="image", choices=["image", "video"])
+    media.add_argument("--placement", action="append", help="repeatable")
+    media.set_defaults(func=cmd_media)
+
     launch = sub.add_parser("launch", help="build and launch a structured test")
     launch.add_argument("--offer", type=int, required=True)
     launch.add_argument("--platform", required=True, choices=[p.value for p in Platform])
@@ -230,6 +330,14 @@ def build_parser() -> argparse.ArgumentParser:
     launch.add_argument("--geo", action="append")
     launch.add_argument(
         "--start-active", action="store_true", help="start spending immediately"
+    )
+    launch.add_argument(
+        "--research", action="store_true",
+        help="scan the Ad Library first and feed the patterns to the copywriter",
+    )
+    launch.add_argument("--research-term", default="")
+    launch.add_argument(
+        "--with-media", action="store_true", help="generate imagery for each ad"
     )
     launch.set_defaults(func=cmd_launch)
 

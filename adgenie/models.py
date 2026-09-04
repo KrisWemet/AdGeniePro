@@ -103,6 +103,19 @@ class ConversionStatus(str, enum.Enum):
     REVERSED = "reversed"  # refund / chargeback
 
 
+class MediaKind(str, enum.Enum):
+    IMAGE = "image"
+    VIDEO = "video"
+
+
+class MediaStatus(str, enum.Enum):
+    PENDING = "pending"
+    GENERATING = "generating"
+    READY = "ready"
+    FAILED = "failed"
+    REJECTED = "rejected"  # blocked by the image policy pre-screen
+
+
 class EntityLevel(str, enum.Enum):
     CAMPAIGN = "campaign"
     AD_GROUP = "ad_group"
@@ -444,6 +457,102 @@ class OptimizerRun(Base):
     actions_applied: Mapped[int] = mapped_column(Integer, default=0)
     summary: Mapped[dict] = mapped_column(JSON, default=dict)
     error: Mapped[str | None] = mapped_column(Text)
+
+
+class MediaAsset(Base):
+    """An image or video generated for a creative.
+
+    The provider's result URLs expire within about a day, so `local_path` is
+    the durable copy and `remote_url` is kept only for provenance.
+    """
+
+    __tablename__ = "media_assets"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    creative_id: Mapped[int | None] = mapped_column(
+        ForeignKey("creatives.id"), index=True
+    )
+    offer_id: Mapped[int | None] = mapped_column(ForeignKey("offers.id"), index=True)
+    kind: Mapped[MediaKind] = mapped_column(Enum(MediaKind), default=MediaKind.IMAGE)
+
+    provider: Mapped[str] = mapped_column(String(60), default="kie")
+    model: Mapped[str] = mapped_column(String(120), default="")
+    task_id: Mapped[str | None] = mapped_column(String(120), index=True)
+
+    prompt: Mapped[str] = mapped_column(Text, default="")
+    negative_prompt: Mapped[str] = mapped_column(Text, default="")
+    aspect_ratio: Mapped[str] = mapped_column(String(16), default="1:1")
+    width: Mapped[int] = mapped_column(Integer, default=0)
+    height: Mapped[int] = mapped_column(Integer, default=0)
+    duration_seconds: Mapped[float] = mapped_column(Float, default=0.0)
+
+    remote_url: Mapped[str | None] = mapped_column(Text)
+    local_path: Mapped[str | None] = mapped_column(Text)
+    public_url: Mapped[str | None] = mapped_column(Text)
+    content_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    bytes: Mapped[int] = mapped_column(Integer, default=0)
+
+    status: Mapped[MediaStatus] = mapped_column(
+        Enum(MediaStatus), default=MediaStatus.PENDING
+    )
+    compliance_report: Mapped[dict] = mapped_column(JSON, default=dict)
+    error: Mapped[str | None] = mapped_column(Text)
+    cost_micros: Mapped[int] = mapped_column(BigInteger, default=0)
+    extra: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class CompetitorAd(Base):
+    """One ad observed in the Meta Ad Library.
+
+    The library carries no click-through rate, conversion or spend data for
+    commercial ads, so `days_running` and whether it is still live are the
+    evidence this platform reasons from: an advertiser does not fund a losing
+    ad for three months.
+    """
+
+    __tablename__ = "competitor_ads"
+    __table_args__ = (
+        UniqueConstraint("ad_archive_id", name="uq_competitor_ad"),
+        Index("ix_competitor_vertical", "vertical", "last_seen_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ad_archive_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    page_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    page_name: Mapped[str] = mapped_column(String(200), default="")
+
+    search_term: Mapped[str] = mapped_column(String(200), default="")
+    vertical: Mapped[str] = mapped_column(String(80), default="", index=True)
+    countries: Mapped[list] = mapped_column(JSON, default=list)
+    publisher_platforms: Mapped[list] = mapped_column(JSON, default=list)
+    languages: Mapped[list] = mapped_column(JSON, default=list)
+
+    bodies: Mapped[list] = mapped_column(JSON, default=list)
+    titles: Mapped[list] = mapped_column(JSON, default=list)
+    descriptions: Mapped[list] = mapped_column(JSON, default=list)
+    captions: Mapped[list] = mapped_column(JSON, default=list)
+    snapshot_url: Mapped[str | None] = mapped_column(Text)
+
+    started_at: Mapped[datetime | None] = mapped_column(DateTime)
+    stopped_at: Mapped[datetime | None] = mapped_column(DateTime)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    days_running: Mapped[int] = mapped_column(Integer, default=0)
+    # EU ads carry a reach figure; commercial ads carry no spend at all.
+    eu_total_reach: Mapped[int] = mapped_column(BigInteger, default=0)
+    # How many near-identical variants the same page is running. An advertiser
+    # producing fifteen versions of one idea is scaling it.
+    variant_count: Mapped[int] = mapped_column(Integer, default=1)
+
+    # What this platform inferred from the copy.
+    angle: Mapped[str | None] = mapped_column(String(80), index=True)
+    staying_power: Mapped[float] = mapped_column(Float, default=0.0)
+    raw: Mapped[dict] = mapped_column(JSON, default=dict)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utcnow, onupdate=utcnow
+    )
 
 
 class AuditLog(Base):

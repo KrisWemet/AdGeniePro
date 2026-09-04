@@ -17,7 +17,13 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__
-from .api import routes_campaigns, routes_offers, routes_optimizer, routes_tracking
+from .api import (
+    routes_campaigns,
+    routes_offers,
+    routes_optimizer,
+    routes_research,
+    routes_tracking,
+)
 from .api.security import require_api_key
 from .config import get_settings
 from .db import init_db
@@ -69,6 +75,15 @@ async def lifespan(app: FastAPI):
             "No ANTHROPIC_API_KEY set: copy will be generated from templates. "
             "Set it for materially better ad copy."
         )
+    if not settings.has_media_generation:
+        logger.info(
+            "No KIE_API_KEY set: images and video are simulated placeholders at "
+            "the correct dimensions."
+        )
+    if not settings.has_ad_library:
+        logger.info(
+            "No META_ACCESS_TOKEN set: competitor research is unavailable."
+        )
     yield
 
 
@@ -114,6 +129,7 @@ _guard = [Depends(require_api_key)]
 app.include_router(routes_offers.router, prefix="/api", dependencies=_guard)
 app.include_router(routes_campaigns.router, prefix="/api", dependencies=_guard)
 app.include_router(routes_optimizer.router, prefix="/api", dependencies=_guard)
+app.include_router(routes_research.router, prefix="/api", dependencies=_guard)
 app.include_router(routes_tracking.router)
 
 
@@ -136,6 +152,8 @@ def health() -> dict:
         "environment": settings.environment,
         "dry_run": settings.dry_run,
         "copywriter": "claude" if settings.has_copywriter_llm else "template",
+        "media": "kie" if settings.has_media_generation else "sandbox",
+        "ad_library": "connected" if settings.has_ad_library else "unavailable",
         "authenticated": settings.requires_api_key,
         "global_daily_budget_cap_usd": settings.global_daily_budget_cap_usd,
         "platforms": platforms,

@@ -66,6 +66,16 @@ class LaunchPlan:
     start_paused: bool = True
     max_daily_budget_usd: float | None = None
     ad_format: str | None = None
+    # Scan the Ad Library for what is still running in this market and feed the
+    # patterns to the copywriter. Off by default: it costs an API round trip
+    # and returns nothing outside the EU and UK.
+    research_market: bool = False
+    research_term: str = ""
+    # Generate imagery for each creative. A Meta ad without an image is not an
+    # ad; Google search ads carry no imagery and skip this.
+    generate_media: bool = False
+    media_kind: str = "image"
+    media_placements: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -75,6 +85,8 @@ class LaunchResult:
     ad_group_ids: list[int] = field(default_factory=list)
     creative_ids: list[int] = field(default_factory=list)
     blocked_creative_ids: list[int] = field(default_factory=list)
+    media_asset_ids: list[int] = field(default_factory=list)
+    market_brief: dict | None = None
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     dry_run: bool = True
@@ -88,6 +100,8 @@ class LaunchResult:
             "blocked_creative_ids": self.blocked_creative_ids,
             "launched": len(self.creative_ids),
             "blocked": len(self.blocked_creative_ids),
+            "media_asset_ids": self.media_asset_ids,
+            "market_brief": self.market_brief,
             "warnings": self.warnings,
             "errors": self.errors,
             "dry_run": self.dry_run,
@@ -107,11 +121,22 @@ class CampaignLauncher:
         settings: Settings | None = None,
         studio: CopyStudio | None = None,
         platform_client: AdPlatform | None = None,
+        media_studio=None,
+        researcher=None,
     ) -> None:
         self.session = session
         self.settings = settings or get_settings()
         self.studio = studio or CopyStudio(settings=self.settings)
         self._platform_client = platform_client
+        self._media_studio = media_studio
+        self._researcher = researcher
+
+    def _media(self):
+        if self._media_studio is None:
+            from ..media.studio import MediaStudio
+
+            self._media_studio = MediaStudio(self.session, self.settings)
+        return self._media_studio
 
     def _client(self, platform: Platform) -> AdPlatform:
         return self._platform_client or get_platform(platform, self.settings)
@@ -127,12 +152,19 @@ class CampaignLauncher:
         budget_micros = usd_to_micros(plan.daily_budget_usd)
         status = "PAUSED" if plan.start_paused else "ACTIVE"
 
+        self._media_asset_ids: list[int] = []
+        market_notes: list[str] = []
+        market_brief: dict | None = None
+        if plan.research_market:
+            market_notes, market_brief = self._research(offer, plan)
+
         campaign = self._create_campaign(offer, plan, client, budget_micros, status)
         result = LaunchResult(
             campaign_id=campaign.id,
             campaign_external_id=campaign.external_id,
             dry_run=self.settings.dry_run,
         )
+        result.market_brief = market_brief
         if campaign.status is EntityStatus.FAILED:
             result.errors.append(campaign.last_error or "campaign creation failed")
             return result
@@ -155,7 +187,8 @@ class CampaignLauncher:
 
             for index in range(plan.creatives_per_angle):
                 creative = self._create_creative(
-                    offer, campaign, group, plan, client, angle_key, ad_format, index, status
+                    offer, campaign, group, plan, client, angle_key, ad_format,
+                    index, status, market_notes,
                 )
                 if creative.compliance_verdict is ComplianceVerdict.BLOCK:
                     result.blocked_creative_ids.append(creative.id)
@@ -172,6 +205,7 @@ class CampaignLauncher:
                             f"{creative.name}: launched with policy warnings"
                         )
 
+        result.media_asset_ids = self._media_asset_ids
         self.session.commit()
         logger.info(
             "Launched campaign %s (%s): %s creatives live, %s blocked",
@@ -305,6 +339,7 @@ class CampaignLauncher:
         ad_format: str,
         index: int,
         status: str,
+        market_notes: list[str] | None = None,
     ) -> Creative:
         brief = build_brief(
             offer,
@@ -312,6 +347,7 @@ class CampaignLauncher:
             ad_format=ad_format,
             angle_key=angle_key,
             keyword=(plan.keywords[0] if plan.keywords else ""),
+            market_notes=market_notes,
         )
         draft = self.studio.write(brief, offer=offer)
 
@@ -361,6 +397,11 @@ class CampaignLauncher:
             self.session.flush()
             return creative
 
+        if plan.generate_media:
+            self._media_asset_ids.extend(
+                self._attach_media(creative, plan, campaign.platform, ad_format)
+            )
+
         spec = CreativeSpec(
             ad_group_external_id=group.external_id or "",
             name=creative.name,
@@ -388,6 +429,50 @@ class CampaignLauncher:
         return creative
 
     # ------------------------------------------------------------------
+    def _research(self, offer: Offer, plan: LaunchPlan) -> tuple[list[str], dict | None]:
+        """Scan the Ad Library for what is still running in this market."""
+        try:
+            researcher = self._researcher
+            if researcher is None:
+                from ..research.service import MarketResearcher
+
+                researcher = MarketResearcher(self.session, self.settings)
+            brief = researcher.research_offer(
+                offer, search_term=plan.research_term or None
+            )
+        except Exception as exc:
+            # Research is an optional prior. Losing it should never stop a
+            # launch, so the failure is reported and the launch continues.
+            logger.warning("Market research failed, launching without it: %s", exc)
+            return [], {"error": str(exc)}
+        return brief.to_prompt_notes(), brief.as_dict()
+
+    def _attach_media(
+        self,
+        creative: Creative,
+        plan: LaunchPlan,
+        platform: Platform,
+        ad_format: str,
+    ) -> list[int]:
+        try:
+            assets = self._media().generate_for_creative(
+                creative,
+                placements=plan.media_placements or None,
+                kind=plan.media_kind,
+                platform=platform,
+                ad_format=ad_format,
+            )
+        except Exception as exc:
+            logger.error("Media generation failed for %s: %s", creative.name, exc)
+            creative.generator_meta = {
+                **creative.generator_meta,
+                "media_error": str(exc),
+            }
+            return []
+        ids = [a.id for a in assets]
+        creative.generator_meta = {**creative.generator_meta, "media_asset_ids": ids}
+        return ids
+
     def _audit(
         self, platform: Platform, operation: str, target: str, request: dict, entity
     ) -> None:

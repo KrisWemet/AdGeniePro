@@ -88,7 +88,8 @@ sandbox, and the logs say so explicitly rather than silently doing nothing.
 | Setting | Effect when unset |
 |---|---|
 | `ANTHROPIC_API_KEY` | Copy comes from the built-in angle templates instead of Claude |
-| `META_*` | Meta calls go to the simulator |
+| `META_*` | Meta calls go to the simulator; competitor research is unavailable |
+| `KIE_API_KEY` | Images are simulated placeholders at the correct dimensions |
 | `GOOGLE_*` | Google calls go to the simulator |
 | `DRY_RUN` | Defaults to `true`: nothing is sent to a live ad account |
 | `API_KEY` | The `/api` routes are unauthenticated; bind to localhost |
@@ -123,7 +124,29 @@ angle is what actually finds a winner. Ten angles ship in
 
 Campaigns start paused. Turning on spend is a separate, deliberate call.
 
-### 4. Measure and optimize
+### 4. See what the market is already running
+
+```bash
+python -m adgenie.cli research --term "sleep supplement" --country GB --country DE
+```
+
+Read the section below on what this can and cannot tell you before relying on
+it. Add `--research` to a launch to feed the patterns straight into the
+copywriter.
+
+### 5. Generate the imagery
+
+```bash
+python -m adgenie.cli launch --offer 1 --platform meta --budget 45 --with-media
+python -m adgenie.cli media --creative 3 --kind video
+```
+
+One asset per placement, at the size the placement actually serves. Every
+prompt is screened against Meta's imagery rules *before* generation, because a
+rejected prompt costs nothing and a generated one costs money and a minute.
+Google search ads carry no imagery and are skipped.
+
+### 6. Measure and optimize
 
 ```bash
 python -m adgenie.cli sync              # pull delivery from the platforms
@@ -132,13 +155,86 @@ python -m adgenie.cli optimize --apply  # act (requires DRY_RUN=false)
 python -m adgenie.cli report            # performance by creative
 ```
 
-### 5. Or run the server
+### 7. Or run the server
 
 ```bash
 uvicorn adgenie.main:app --reload
 ```
 
 Dashboard at `http://localhost:8000`, API docs at `/docs`.
+
+---
+
+## Competitor research: what it can and cannot tell you
+
+Read this before trusting the output.
+
+**The Ad Library has no performance data for commercial ads.** No click-through
+rate, no conversions, no ROAS, no spend. Political and issue ads report spend
+and impressions as wide ranges; EU commercial ads report a single reach figure;
+everything else reports nothing.
+
+**Outside the EU and UK it carries no commercial ads at all.** Ordinary product
+ads are archived under the Digital Services Act, which covers the EU and UK
+only. A US search returns political and issue ads plus the US special
+categories (housing, employment, financial products). An empty US result means
+"not carried", not "no competition" — so `/api/research/coverage` and the CLI
+both say so out loud rather than handing back an empty list.
+
+**What it can tell you is what is still running, and for how long.** That is
+the inference experienced buyers make from it, and this platform makes it
+explicit:
+
+| Signal | What it means |
+|---|---|
+| Days running | The main one. Nobody funds a losing ad for three months. |
+| Still live | A stopped ad is a finished experiment. |
+| Variant count | Fifteen versions of one idea means the advertiser is scaling it. |
+| EU reach | Actual delivery volume, where the DSA requires it. |
+| Ads that stopped fast | The only negative signal available (`/api/research/retired`). |
+
+Each ad gets a **staying-power** score weighting longevity on a log scale — the
+step from 7 days to 30 says far more than 90 to 120 — plus whether it is live
+and how many variants exist. Angles are weighted by that score rather than
+counted, so one advertiser flooding the archive with new ads cannot outvote a
+durable competitor. The result carries a `confidence` of none, low, moderate or
+high, because a handful of ads from two advertisers is an anecdote.
+
+**Competitor copy is never reused.** What reaches the copywriter is *pattern*
+guidance — which arguments survive, how long-running copy is structured, the
+register and CTA distribution — never wording. Reproducing a competitor's copy
+risks their trademark, and this platform's own policy engine would block it.
+
+Scans are stored, so repeated scans build a history. That history is what makes
+the negative signal possible: an ad you saw last month that has since vanished
+was probably not working.
+
+## Media generation
+
+Meta ads need imagery; a text-only Meta ad barely delivers. Generation runs
+through [kie.ai](https://kie.ai), which fronts Nano Banana, Flux, Veo, Kling and
+others behind one asynchronous job API.
+
+The sequence is deliberate:
+
+1. **Plan** a prompt from the offer and the creative's angle, so the image
+   carries the same argument as the copy. A mismatch between them is a common
+   reason a well-written ad still fails.
+2. **Screen** it against Meta's imagery rules — no before-and-after, no
+   idealised or negative body framing, nothing mimicking a UI element, no
+   third-party marks or likenesses, no graphic medical or wealth-bait imagery.
+   A rejected prompt is never submitted.
+3. **Generate**, polling the task. A timeout says explicitly not to resubmit,
+   because a resubmitted task is charged twice.
+4. **Download immediately.** Provider URLs expire in about a day, so the local
+   copy is the source of truth and files are content-addressed.
+
+One asset per placement, at the size the placement serves: Meta feed 4:5,
+square 1:1, story 9:16, Google Demand Gen 1.91:1, 1:1 and 4:5. Text-only
+formats generate nothing.
+
+To attach imagery to a *live* ad, set `MEDIA_PUBLIC_BASE_URL` — the platforms
+fetch the image over HTTP, they do not read your disk.
 
 ---
 
@@ -261,6 +357,14 @@ whenever the dashboard is served from a known origin.
 | `GET /api/optimizer/rebalance/{ad_group_id}` | Advisory split across creatives |
 | `GET /api/optimizer/rebalance-campaign/{id}` | Applicable split across ad groups |
 | `POST /api/optimizer/push-conversions` | Send sales back to the platforms |
+| `GET /api/research/coverage` | What the Ad Library will actually return |
+| `POST /api/research/scan` | Scan the archive and summarise what is running |
+| `GET /api/research/brief` | Rebuild a brief from stored scans, no API call |
+| `GET /api/research/retired` | Competitor ads that stopped quickly |
+| `GET /api/media/placements` | Placement sizes per platform |
+| `POST /api/media/preview-prompt` | Build and screen a prompt, generating nothing |
+| `POST /api/media/generate/{creative_id}` | Generate the imagery a creative needs |
+| `GET /api/media/assets` | Generated assets |
 | `GET /api/audit` | Every mutation ever sent to an ad account |
 | `GET /r` | Click redirect (public) |
 | `GET,POST /postback` | Network conversion postback (public, authenticated) |
@@ -290,11 +394,22 @@ adgenie/
     meta.py          Meta Marketing API
     google.py        Google Ads API
     sandbox.py       auction simulator
+  media/
+    specs.py         placement sizes
+    prompts.py       prompt building and pre-generation screening
+    kie.py           kie.ai async job client
+    store.py         download before the URL expires
+    sandbox.py       real PNGs at the right size, no key needed
+    studio.py        plan, screen, generate, persist
+  research/
+    ad_library.py    Meta Ad Library client
+    signals.py       staying power, angle inference, market brief
+    service.py       persistence and history
   api/               FastAPI routers
   static/            dashboard
   cli.py             command line
   demo.py            end-to-end simulation
-tests/               323 tests
+tests/               405 tests
 legacy/              the original prototype scripts, kept for reference
 ```
 
@@ -314,8 +429,13 @@ specific defect found in review, so a fix that silently reverts fails loudly.
 
 ## Limits worth knowing
 
-- Image and video generation is not included. Creatives carry an
-  `image_prompt`; supplying the asset is still manual.
+- The Ad Library carries no commercial ads outside the EU and UK, and no
+  performance data anywhere. Longevity is a proxy for profitability, not a
+  measurement of it.
+- Ad Library creative images sit behind a rendered snapshot page rather than a
+  media endpoint. This platform records the URL and does not fetch it.
+- Generated video is short-form only, and the models are stronger at product
+  and lifestyle imagery than at anything needing legible on-screen text.
 - Google holds one budget per campaign. An ad-group scale decision therefore
   moves the parent campaign's budget by the delta, and per-ad-group
   reallocation is unavailable there.

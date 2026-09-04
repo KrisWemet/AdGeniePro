@@ -506,3 +506,154 @@ def test_conversions_are_not_uploaded_twice(simulated, session, offer, launched,
     second = orchestrator.push_conversions()["uploaded"]
     assert first >= 1
     assert second == 0
+
+
+# --- research and media wired into the launch ------------------------------
+
+
+def test_market_research_reaches_the_copywriter(session, offer, settings, sandbox_meta):
+    """Competitor patterns must arrive in the brief, not just be fetched."""
+    from adgenie.core.copywriter import CopyStudio, CreativeDraft
+    from adgenie.research.signals import build_market_brief
+    from adgenie.research.ad_library import AdLibraryAd
+    from datetime import timezone as _tz
+
+    seen_notes: list[list[str]] = []
+
+    class RecordingGenerator:
+        name = "stub"
+
+        def generate(self, brief):
+            seen_notes.append(list(brief.market_notes))
+            return CreativeDraft(
+                angle="mechanism",
+                headlines=["A Calm Evening"],
+                descriptions=[],
+                primary_texts=["A 12-minute wind-down routine. #ad"],
+            )
+
+    now = datetime(2026, 6, 1, tzinfo=_tz.utc)
+    ads = [
+        AdLibraryAd(
+            ad_archive_id=f"a{i}",
+            page_id=f"p{i}",
+            bodies=["How it works: our clinically studied blend"],
+            started_at=now - timedelta(days=120),
+        )
+        for i in range(8)
+    ]
+
+    class StubResearcher:
+        def research_offer(self, offer, search_term=None):
+            return build_market_brief(ads, "supplements", as_of=now)
+
+    result = CampaignLauncher(
+        session,
+        settings=settings,
+        studio=CopyStudio(generator=RecordingGenerator(), settings=settings),
+        platform_client=sandbox_meta,
+        researcher=StubResearcher(),
+    ).launch(
+        LaunchPlan(
+            offer_id=offer.id, platform=Platform.META, daily_budget_usd=20.0,
+            angle_count=1, research_market=True,
+        )
+    )
+
+    assert seen_notes and seen_notes[0], "the copywriter got no market notes"
+    assert any("surviving longest" in n for n in seen_notes[0])
+    assert result.market_brief["dominant_angles"] == ["mechanism"]
+
+
+def test_a_research_failure_does_not_stop_the_launch(
+    session, offer, settings, sandbox_meta
+):
+    """Research is an optional prior, never a launch dependency."""
+
+    class BrokenResearcher:
+        def research_offer(self, offer, search_term=None):
+            raise RuntimeError("ad library unavailable")
+
+    result = CampaignLauncher(
+        session, settings=settings, platform_client=sandbox_meta,
+        researcher=BrokenResearcher(),
+    ).launch(
+        LaunchPlan(
+            offer_id=offer.id, platform=Platform.META, daily_budget_usd=20.0,
+            angle_count=1, research_market=True,
+        )
+    )
+
+    assert len(result.creative_ids) == 1
+    assert result.market_brief["error"]
+
+
+def test_launching_with_media_attaches_images(
+    session, offer, settings, sandbox_meta, tmp_path
+):
+    from adgenie.media.sandbox import SandboxMediaProvider
+    from adgenie.media.studio import MediaStudio
+    from adgenie.models import MediaAsset, MediaStatus
+
+    settings.media_storage_dir = str(tmp_path / "media")
+    result = CampaignLauncher(
+        session, settings=settings, platform_client=sandbox_meta,
+        media_studio=MediaStudio(session, settings, provider=SandboxMediaProvider()),
+    ).launch(
+        LaunchPlan(
+            offer_id=offer.id, platform=Platform.META, daily_budget_usd=20.0,
+            angle_count=1, generate_media=True,
+        )
+    )
+
+    assert len(result.media_asset_ids) == 3
+    assets = session.execute(select(MediaAsset)).scalars().all()
+    assert all(a.status is MediaStatus.READY for a in assets)
+    creative = session.get(Creative, result.creative_ids[0])
+    assert len(creative.media_urls) == 3
+    assert creative.generator_meta["media_asset_ids"] == result.media_asset_ids
+
+
+def test_media_failure_does_not_stop_the_launch(
+    session, offer, settings, sandbox_meta, tmp_path
+):
+    from adgenie.media.sandbox import SandboxMediaProvider
+    from adgenie.media.studio import MediaStudio
+
+    settings.media_storage_dir = str(tmp_path / "media")
+    result = CampaignLauncher(
+        session, settings=settings, platform_client=sandbox_meta,
+        media_studio=MediaStudio(
+            session, settings, provider=SandboxMediaProvider(fail=True)
+        ),
+    ).launch(
+        LaunchPlan(
+            offer_id=offer.id, platform=Platform.META, daily_budget_usd=20.0,
+            angle_count=1, generate_media=True,
+        )
+    )
+    assert len(result.creative_ids) == 1
+
+
+def test_google_search_launch_generates_no_media(
+    session, offer, settings, tmp_path
+):
+    from adgenie.media.sandbox import SandboxMediaProvider
+    from adgenie.media.studio import MediaStudio
+    from adgenie.platforms.sandbox import SandboxPlatform
+
+    settings.media_storage_dir = str(tmp_path / "media")
+    provider = SandboxMediaProvider()
+    result = CampaignLauncher(
+        session, settings=settings,
+        platform_client=SandboxPlatform(Platform.GOOGLE),
+        media_studio=MediaStudio(session, settings, provider=provider),
+    ).launch(
+        LaunchPlan(
+            offer_id=offer.id, platform=Platform.GOOGLE, daily_budget_usd=20.0,
+            angle_count=1, generate_media=True, keywords=["sleep aid"],
+        )
+    )
+    assert result.creative_ids
+    assert result.media_asset_ids == []
+    assert provider.generated == []

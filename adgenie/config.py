@@ -72,6 +72,28 @@ class Settings(BaseSettings):
     google_conversion_action_id: str | None = None
     google_api_version: str = "v18"
 
+    # --- media generation (kie.ai) ---
+    kie_api_key: str | None = None
+    kie_base_url: str = "https://api.kie.ai"
+    kie_image_model: str = "google/nano-banana-pro-text-to-image"
+    kie_video_model: str = "veo3.1-fast"
+    kie_poll_interval_seconds: float = 5.0
+    kie_poll_timeout_seconds: float = 600.0
+    # Generated asset URLs expire within about a day, so they are downloaded
+    # and kept locally as soon as a task finishes.
+    media_storage_dir: str = "./media"
+    media_public_base_url: str | None = None
+
+    # --- competitor research (Meta Ad Library) ---
+    # Uses meta_access_token. The library returns commercial ads only for
+    # EU and UK delivery; elsewhere it carries political and issue ads only.
+    ad_library_country_codes: list[str] = Field(
+        default_factory=lambda: ["GB", "IE", "DE", "FR", "NL", "ES", "IT"]
+    )
+    ad_library_page_size: int = 100
+    # An ad still running after this many days is treated as proven.
+    ad_library_proven_days: int = 30
+
     # --- affiliate networks ---
     clickbank_api_key: str | None = None
     clickbank_nickname: str | None = None
@@ -111,6 +133,16 @@ class Settings(BaseSettings):
     @property
     def has_copywriter_llm(self) -> bool:
         return bool(self.anthropic_api_key)
+
+    @property
+    def has_media_generation(self) -> bool:
+        return bool(self.kie_api_key)
+
+    @property
+    def has_ad_library(self) -> bool:
+        # The Ad Library rides on the same token as the Marketing API, but only
+        # needs ads_read, so an account with no ad account can still research.
+        return bool(self.meta_access_token)
 
 
 @lru_cache

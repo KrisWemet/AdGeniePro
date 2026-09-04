@@ -66,6 +66,10 @@ class CopyBrief:
     required_disclosures: list[str] = field(default_factory=list)
     is_regulated: bool = False
     angle: Angle | None = None
+    # Pattern guidance from the competitor scan: which arguments are surviving
+    # in this market and how long-running copy is shaped. Never competitor
+    # wording, which would be both a trademark risk and a policy finding.
+    market_notes: list[str] = field(default_factory=list)
     # Findings from a previous failed attempt, fed back on regeneration.
     repair_notes: list[str] = field(default_factory=list)
 
@@ -437,6 +441,16 @@ class LLMCopywriter:
                 brief.angle.guidance,
             ]
 
+        if brief.market_notes:
+            parts += [
+                "",
+                "## What is running in this market",
+                "Observed from ads still live in the Meta Ad Library. These are "
+                "patterns to learn from, not copy to reuse: never reproduce a "
+                "competitor's wording, claims or brand.",
+                *[f"- {note}" for note in brief.market_notes],
+            ]
+
         parts += ["", "## Hard format limits", *limits]
 
         rules = [
@@ -564,7 +578,9 @@ class CopyStudio:
 
         drafts: list[CreativeDraft] = []
         for angle in pool:
-            variant = CopyBrief(**{**brief.__dict__, "angle": angle, "repair_notes": []})
+            variant = CopyBrief(
+                **{**brief.__dict__, "angle": angle, "repair_notes": []}
+            )
             drafts.append(self.write(variant, offer=offer))
         return drafts
 
@@ -603,6 +619,7 @@ def build_brief(
     angle_key: str | None = None,
     keyword: str = "",
     destination_url: str | None = None,
+    market_notes: list[str] | None = None,
 ) -> CopyBrief:
     """Build a brief from an `Offer` row."""
     from ..platforms.specs import DEFAULT_FORMAT
@@ -622,4 +639,5 @@ def build_brief(
         is_regulated=bool(offer.is_regulated),
         angle=get_angle(angle_key) if angle_key else None,
         keyword=keyword,
+        market_notes=list(market_notes or []),
     )
