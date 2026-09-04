@@ -24,7 +24,7 @@ import httpx
 
 from ..config import Settings, get_settings
 from ..models import Platform
-from ..money import cents_to_micros, micros_to_cents
+from ..money import micros_to_cents
 from .base import (
     AdGroupSpec,
     AdPlatform,
@@ -364,9 +364,18 @@ class MetaAdsClient(AdPlatform):
         Each entry needs `event_time` (unix seconds), `value` (float),
         `currency`, and at least one identifier such as `fbclid`.
         """
-        pixel_id = self.settings.meta_pixel_id
-        if not pixel_id or not conversions:
+        if not conversions:
             return 0
+        pixel_id = self.settings.meta_pixel_id
+        if not pixel_id:
+            # Returning 0 here would let the caller mark these sales as sent and
+            # filter them out for good, so a missing pixel has to be an error.
+            raise PlatformError(
+                "META_PIXEL_ID is required to upload conversions through the "
+                "Conversions API",
+                platform=self.platform,
+                code="NO_PIXEL",
+            )
 
         events = []
         for conv in conversions:

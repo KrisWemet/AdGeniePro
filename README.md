@@ -220,7 +220,9 @@ Three properties are deliberate:
 
 Three independent limits stand between the optimizer and your money:
 
-1. `DRY_RUN` blocks every mutation globally.
+1. `DRY_RUN` blocks every mutation globally. While it is on, the API and CLI
+   both refuse to apply rather than rewriting stored budgets to match changes
+   that were never sent.
 2. Budget changes above `AUTO_APPLY_BUDGET_CEILING_USD` are held for approval
    (`POST /api/optimizer/actions/{id}/approve`).
 3. `GLOBAL_DAILY_BUDGET_CAP_USD` caps total committed daily spend, so no
@@ -290,7 +292,7 @@ adgenie/
   static/            dashboard
   cli.py             command line
   demo.py            end-to-end simulation
-tests/               303 tests
+tests/               314 tests
 legacy/              the original prototype scripts, kept for reference
 ```
 

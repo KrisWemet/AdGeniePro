@@ -18,6 +18,10 @@ from .sandbox import SandboxPlatform
 logger = logging.getLogger(__name__)
 
 _SANDBOX_CACHE: dict[tuple[Platform, int], SandboxPlatform] = {}
+# Live clients are cached too: each one owns an httpx connection pool and, for
+# Google, a cached OAuth token. Rebuilding one per request would open a fresh
+# pool that is never closed and re-authenticate on every call.
+_LIVE_CACHE: dict[tuple[Platform, int], AdPlatform] = {}
 
 
 def get_platform(
@@ -28,14 +32,21 @@ def get_platform(
     settings = settings or get_settings()
 
     if not force_sandbox:
-        if platform is Platform.META and settings.has_meta:
-            from .meta import MetaAdsClient
+        configured = (
+            settings.has_meta if platform is Platform.META else settings.has_google
+        )
+        if configured:
+            key = (platform, id(settings))
+            if key not in _LIVE_CACHE:
+                if platform is Platform.META:
+                    from .meta import MetaAdsClient
 
-            return MetaAdsClient(settings)
-        if platform is Platform.GOOGLE and settings.has_google:
-            from .google import GoogleAdsClient
+                    _LIVE_CACHE[key] = MetaAdsClient(settings)
+                else:
+                    from .google import GoogleAdsClient
 
-            return GoogleAdsClient(settings)
+                    _LIVE_CACHE[key] = GoogleAdsClient(settings)
+            return _LIVE_CACHE[key]
         logger.warning(
             "No %s credentials configured; using the sandbox simulator. "
             "Numbers are simulated, not real.",
@@ -55,3 +66,4 @@ def is_sandbox(client: AdPlatform) -> bool:
 def reset_sandboxes() -> None:
     """Used by tests to get a clean simulated account."""
     _SANDBOX_CACHE.clear()
+    _LIVE_CACHE.clear()

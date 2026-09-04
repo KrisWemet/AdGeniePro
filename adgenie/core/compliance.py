@@ -330,10 +330,15 @@ RULES: list[Rule] = [
         pattern=r"\b[A-Z]{5,}\b",
         message="All-caps word. Google rejects gimmicky capitalization.",
         policy_ref="Google: Editorial Standards",
-        suggestion="Use sentence case or title case. Acronyms of four letters or fewer are fine.",
+        suggestion=(
+            "Use sentence case or title case. Acronyms of four letters or fewer "
+            "never match this rule, so FREE, USA and FDA are already fine."
+        ),
         platforms=(Platform.GOOGLE,),
         flags=0,
-        exempt_pattern=r"\b(FREE|USA|FDA|NASA|SALE|GMO|CBD|HIIT|NEW)\b",
+        # Only genuine acronyms of five letters or more belong here: the rule
+        # itself needs five, so a shorter entry never fires and never matches.
+        exempt_pattern=r"\b(NASDAQ|HIPAA|NHTSA|USDOT|COBRA|ASHRAE|ENERGY)\b",
     ),
     Rule(
         code="REPEATED_PUNCTUATION",

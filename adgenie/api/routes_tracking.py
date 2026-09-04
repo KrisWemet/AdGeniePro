@@ -22,7 +22,7 @@ from ..core.tracking import (
     verify_postback_secret,
 )
 from ..db import get_session
-from ..models import ConversionStatus
+from ..models import Campaign, ConversionStatus, Offer
 from ..money import usd_to_micros
 from ..schemas import PostbackIn
 
@@ -57,6 +57,15 @@ def redirect_click(
         country=request.headers.get("cf-ipcountry") or request.headers.get("x-country"),
         query_params=params,
     )
+    if offer is None and click.campaign_id:
+        # The sub-id was mangled or truncated, but the platform's own macros
+        # resolved the creative. A paid click should not be thrown away when
+        # the offer is still reachable through the campaign.
+        campaign = session.get(Campaign, click.campaign_id)
+        if campaign is not None:
+            offer = session.get(Offer, campaign.offer_id)
+            if offer is not None:
+                click.offer_id = offer.id
     if offer is None:
         session.rollback()
         raise HTTPException(404, "unknown offer")

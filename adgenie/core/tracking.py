@@ -329,7 +329,10 @@ def record_click(
     creative_id = ctx.creative_id
     campaign_id = ctx.campaign_id
     ad_group_id = ctx.ad_group_id
-    if creative_id is None and query_params.get("pa", "").isdigit():
+    if creative_id is None and query_params.get("pa"):
+        # No format check: the value is only ever compared against ids this
+        # platform stored itself, so an unexpanded macro or junk simply fails
+        # to match. Requiring digits here would reject Google's composite ids.
         platform_ad_id = query_params["pa"]
         # Meta stores the ad id verbatim; Google stores "{adGroupId}~{adId}",
         # so an exact match alone would never resolve a Google click.

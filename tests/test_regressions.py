@@ -1167,3 +1167,221 @@ def test_an_orphaned_entity_fails_one_action_not_the_run(session, settings, offe
     assert orchestrator.apply_action(action) is False
     assert action.status is ActionStatus.FAILED
     assert "parent campaign" in action.error
+
+
+def _launch(api_client, offer_id):
+    return api_client.post(
+        "/api/campaigns/launch",
+        json={
+            "offer_id": offer_id, "platform": "meta",
+            "daily_budget_usd": 20.0, "angle_count": 1,
+        },
+    ).json()
+
+
+@pytest.fixture
+def created_offer(api_client) -> dict:
+    return api_client.post(
+        "/api/offers",
+        json={
+            "name": "CalmLeaf Sleep Support",
+            "destination_url": "https://offer.test/calmleaf",
+            "payout_usd": 40.0,
+        },
+    ).json()
+
+
+# --- fourth review round ---------------------------------------------------
+
+
+def test_meta_upload_fails_loudly_without_a_pixel(meta_settings):
+    """Returning 0 let the caller mark the sales sent and lose them for good."""
+    meta_settings.meta_pixel_id = None
+    client = MetaAdsClient(
+        meta_settings,
+        client=httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={}))),
+        dry_run=False,
+    )
+    with pytest.raises(PlatformError, match="META_PIXEL_ID"):
+        client.upload_conversions(
+            [{"event_time": 1772000000, "value": 40.0, "fbclid": "x"}]
+        )
+
+
+def test_google_upload_fails_loudly_without_a_conversion_action(google_settings):
+    google_settings.google_conversion_action_id = None
+    client = _mock_google(lambda r: httpx.Response(200, json={}), google_settings)
+    with pytest.raises(PlatformError, match="GOOGLE_CONVERSION_ACTION_ID"):
+        client.upload_conversions(
+            [{"gclid": "Cj0", "event_time": 1772000000, "value": 40.0}]
+        )
+
+
+def test_a_partial_upload_leaves_everything_queued(session, settings, offer):
+    """The adapter cannot say which it accepted, so none may be marked sent."""
+    campaign = Campaign(
+        offer_id=offer.id, platform=Platform.META, name="m", external_id="c",
+        status=EntityStatus.ACTIVE,
+    )
+    session.add(campaign)
+    session.flush()
+    group = AdGroup(campaign_id=campaign.id, name="g", external_id="a")
+    session.add(group)
+    session.flush()
+    creative = Creative(ad_group_id=group.id, name="ad", external_id="x")
+    session.add(creative)
+    session.commit()
+
+    for i in range(2):
+        _conversion_for(
+            session, offer, creative.id, Platform.META, "fbclid", f"partial-{i}"
+        )
+
+    class SilentlyDropping:
+        platform = Platform.META
+
+        def upload_conversions(self, conversions):
+            return 0  # accepted nothing, raised nothing
+
+    orchestrator = Orchestrator(
+        session, settings=settings,
+        platform_clients={Platform.META: SilentlyDropping()},
+    )
+    result = orchestrator.push_conversions()
+
+    assert result["uploaded"] == 0
+    assert "meta" in result["errors"]
+    assert all(
+        c.uploaded_to_platform is False
+        for c in session.execute(select(Conversion)).scalars()
+    )
+
+
+def test_a_failed_refresh_does_not_suppress_the_fatigue_rule(
+    session, settings, offer
+):
+    """Failed children used to count as a refresh and silence it for 14 days."""
+    from adgenie.core.launcher import CampaignLauncher, LaunchPlan
+
+    sandbox = SandboxPlatform(Platform.META)
+    launched = CampaignLauncher(
+        session, settings=settings, platform_client=sandbox
+    ).launch(
+        LaunchPlan(
+            offer_id=offer.id, platform=Platform.META,
+            daily_budget_usd=30.0, angle_count=1, start_paused=False,
+        )
+    )
+    parent_id = launched.creative_ids[0]
+
+    sandbox.fail_on = {"create_creative"}
+    orchestrator = Orchestrator(
+        session, settings=settings, platform_clients={Platform.META: sandbox}
+    )
+    action = OptimizationAction(
+        level=EntityLevel.CREATIVE, entity_id=parent_id,
+        action=ActionType.GENERATE_VARIANTS, rule="frequency_fatigue",
+        reason="t", payload={"variants": 2},
+    )
+    session.add(action)
+    session.flush()
+    assert orchestrator.apply_action(action) is False
+    session.commit()
+
+    assert orchestrator._last_refresh_at(parent_id) is None
+
+
+def test_a_successful_refresh_does_suppress_it(session, settings, offer, sandbox_meta):
+    from adgenie.core.launcher import CampaignLauncher, LaunchPlan
+
+    launched = CampaignLauncher(
+        session, settings=settings, platform_client=sandbox_meta
+    ).launch(
+        LaunchPlan(
+            offer_id=offer.id, platform=Platform.META,
+            daily_budget_usd=30.0, angle_count=1, start_paused=False,
+        )
+    )
+    parent_id = launched.creative_ids[0]
+    orchestrator = Orchestrator(
+        session, settings=settings, platform_clients={Platform.META: sandbox_meta}
+    )
+    action = OptimizationAction(
+        level=EntityLevel.CREATIVE, entity_id=parent_id,
+        action=ActionType.GENERATE_VARIANTS, rule="frequency_fatigue",
+        reason="t", payload={"variants": 2},
+    )
+    session.add(action)
+    session.flush()
+    assert orchestrator.apply_action(action)
+    session.commit()
+
+    assert orchestrator._last_refresh_at(parent_id) is not None
+
+
+def test_a_mangled_subid_still_redirects_when_the_macro_resolves_it(
+    api_client, created_offer
+):
+    """A paid click must not be thrown away when the offer is still reachable."""
+    launched = _launch(api_client, created_offer["id"])
+    creative = api_client.get(f"/api/creatives/{launched['creative_ids'][0]}").json()
+
+    response = api_client.get(
+        f"/r?s=truncated-garbage&pa={creative['external_id']}",
+        follow_redirects=False,
+    )
+    assert response.status_code == 302
+    assert response.headers["location"].startswith("https://offer.test/calmleaf")
+
+
+def test_a_click_with_no_resolvable_offer_is_still_404(api_client):
+    assert api_client.get("/r?s=o9999", follow_redirects=False).status_code == 404
+
+
+def test_live_platform_clients_are_reused(settings):
+    """A new client per call leaks a connection pool and re-authenticates."""
+    from adgenie.platforms.factory import get_platform, reset_sandboxes
+
+    reset_sandboxes()
+    settings.meta_access_token = "tok"
+    settings.meta_ad_account_id = "123"
+    first = get_platform(Platform.META, settings)
+    second = get_platform(Platform.META, settings)
+    assert first is second
+    reset_sandboxes()
+
+
+def test_applying_under_dry_run_is_refused_by_the_api(api_client, settings):
+    """The CLI refuses this; the API used to rewrite budgets and send nothing."""
+    settings.dry_run = True
+    response = api_client.post("/api/optimizer/run", json={"apply": True})
+    assert response.status_code == 409
+    assert "DRY_RUN" in response.json()["detail"]
+
+
+def test_approving_under_dry_run_is_refused(api_client, settings, session):
+    settings.dry_run = True
+    action = OptimizationAction(
+        level=EntityLevel.CREATIVE, entity_id=1,
+        action=ActionType.PAUSE, rule="t", reason="t",
+    )
+    session.add(action)
+    session.commit()
+
+    response = api_client.post(f"/api/optimizer/actions/{action.id}/approve")
+    assert response.status_code == 409
+    assert session.get(OptimizationAction, action.id).status is ActionStatus.PROPOSED
+
+
+def test_shouting_rule_exemptions_can_actually_match():
+    """Every exempt token must be long enough for the rule to have fired."""
+    import re
+
+    from adgenie.core.compliance import RULES
+
+    rule = next(r for r in RULES if r.code == "EXCESSIVE_CAPS")
+    tokens = re.findall(r"[A-Z]+", rule.exempt_pattern)
+    assert tokens
+    assert all(len(t) >= 5 for t in tokens), (
+        "an exemption shorter than the rule's own minimum is dead code"
+    )

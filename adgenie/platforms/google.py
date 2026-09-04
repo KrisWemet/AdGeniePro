@@ -546,7 +546,16 @@ class GoogleAdsClient(AdPlatform):
         Each entry needs `gclid`, `event_time` (unix seconds), `value` and the
         `conversion_action` resource name or id.
         """
+        if not conversions:
+            return 0
         action_id = self.settings.google_conversion_action_id
+        if not action_id and not any(c.get("conversion_action") for c in conversions):
+            raise PlatformError(
+                "GOOGLE_CONVERSION_ACTION_ID is required to upload offline "
+                "conversions",
+                platform=self.platform,
+                code="NO_CONVERSION_ACTION",
+            )
         operations = []
         for conv in conversions:
             gclid = conv.get("gclid")

@@ -443,7 +443,12 @@ class Orchestrator:
         """
         return self.session.execute(
             select(Creative.created_at)
-            .where(Creative.parent_id == creative_id)
+            .where(
+                Creative.parent_id == creative_id,
+                # A refresh that failed to reach the platform is not a refresh,
+                # and must not suppress the rule for another two weeks.
+                Creative.status != EntityStatus.FAILED,
+            )
             .order_by(Creative.created_at.desc())
             .limit(1)
         ).scalar_one_or_none()
@@ -642,9 +647,7 @@ class Orchestrator:
         entity.daily_budget_micros = target
         action.payload = {**action.payload, "applied_micros": target}
 
-    def _committed_daily_micros(
-        self, exclude_level: EntityLevel | None = None, exclude_id: int | None = None
-    ) -> int:
+    def _committed_daily_micros(self) -> int:
         """Total daily spend currently committed across active campaigns.
 
         A campaign either carries its own budget (campaign budget optimisation)
@@ -659,8 +662,6 @@ class Orchestrator:
             ).scalars()
         )
         for campaign in campaigns:
-            if exclude_level is EntityLevel.CAMPAIGN and campaign.id == exclude_id:
-                continue
             group_total = 0
             for group in self.session.execute(
                 select(AdGroup).where(
@@ -668,8 +669,6 @@ class Orchestrator:
                     AdGroup.status == EntityStatus.ACTIVE,
                 )
             ).scalars():
-                if exclude_level is EntityLevel.AD_GROUP and group.id == exclude_id:
-                    continue
                 group_total += group.daily_budget_micros
             committed += max(campaign.daily_budget_micros, group_total)
         return committed
@@ -953,11 +952,23 @@ class Orchestrator:
         failed: dict[str, str] = {}
         for platform, entries in by_platform.items():
             try:
-                uploaded += self.client(platform).upload_conversions(entries)
+                sent = self.client(platform).upload_conversions(entries)
             except PlatformError as exc:
                 logger.error("Conversion upload failed for %s: %s", platform.value, exc)
                 failed[platform.value] = str(exc)
                 continue
+            # An adapter that accepted fewer than it was given cannot say which,
+            # so nothing is marked. Marking them all on a partial send would
+            # filter the unsent ones out permanently.
+            if sent < len(entries):
+                message = (
+                    f"{platform.value} accepted {sent} of {len(entries)} "
+                    "conversions; leaving all of them queued for retry"
+                )
+                logger.warning(message)
+                failed[platform.value] = message
+                continue
+            uploaded += sent
             for conversion in conversions_by_platform[platform]:
                 conversion.uploaded_to_platform = True
             succeeded.append(platform.value)

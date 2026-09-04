@@ -60,7 +60,15 @@ def run_optimizer(
     With `apply` false (the default in a dry-run deployment) this changes
     nothing on the ad platforms; it produces a reviewable set of proposals.
     """
-    return Orchestrator(session, settings=get_settings()).run_cycle(
+    settings = get_settings()
+    if payload.apply and settings.dry_run:
+        raise HTTPException(
+            409,
+            "DRY_RUN is on. Applying would rewrite stored budgets and statuses "
+            "while sending nothing to the ad platforms, leaving this database "
+            "disagreeing with the live accounts. Set DRY_RUN=false first.",
+        )
+    return Orchestrator(session, settings=settings).run_cycle(
         lookback_days=payload.lookback_days, apply=payload.apply
     )
 
@@ -115,7 +123,14 @@ def approve_action(
             409, f"action {action_id} is already {action.status.value}"
         )
 
-    orchestrator = Orchestrator(session, settings=get_settings())
+    settings = get_settings()
+    if settings.dry_run:
+        raise HTTPException(
+            409,
+            "DRY_RUN is on, so approving would change this database without "
+            "changing the ad account. Set DRY_RUN=false first.",
+        )
+    orchestrator = Orchestrator(session, settings=settings)
     applied = orchestrator.apply_action(action, actor="human")
     session.commit()
     if not applied:
