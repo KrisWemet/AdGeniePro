@@ -78,6 +78,11 @@ class OptimizerPolicy:
     max_daily_budget_micros: int = 0  # 0 means "no explicit cap"
     min_daily_budget_micros: int = 5_000_000  # $5
     cooldown_hours: int = 12
+    # Scaling requires most of the window's conversions to be in. Killing is
+    # blocked much earlier, at MIN_MATURITY_TO_JUDGE: the asymmetry is
+    # deliberate, because a wrong kill loses a winner and a slow scale only
+    # loses a little upside.
+    scale_maturity_floor: float = 0.60
     # Meta-specific: audience saturation.
     frequency_ceiling: float = 3.2
     # A creative whose CTR has decayed this far from its own opening week.
@@ -199,7 +204,24 @@ class Optimizer:
                 evidence=evidence,
             )
 
-        # 4. Zero-conversion kill. The classic affiliate money pit: an ad that
+        # 4. Too young to judge. The spend is real, the conversions it bought
+        #    may simply not have been reported yet, and killing on that is how
+        #    a winner dies the week before it starts paying.
+        basis_for_maturity = lifetime if lifetime is not None else window
+        if not basis_for_maturity.is_mature:
+            return self._no_action(
+                window,
+                "awaiting_conversions",
+                (
+                    f"Only {basis_for_maturity.maturity:.0%} of this entity's "
+                    "clicks have had time to convert. The spend is real but the "
+                    "conversions it bought may still be in flight, so there is "
+                    "nothing here to act on yet."
+                ),
+                evidence=evidence,
+            )
+
+        # 5. Zero-conversion kill. The classic affiliate money pit: an ad that
         #    gets clicks and never converts. Judged on lifetime evidence so a
         #    rolling window cannot keep resetting the case against it, and
         #    gated on the posterior so a cheap offer with few clicks is not
@@ -218,14 +240,15 @@ class Optimizer:
                     rule="zero_conversion_kill",
                     reason=(
                         f"Spent {spend_multiple:.1f}x the offer payout across "
-                        f"{basis.clicks} clicks ({scope}) with no conversions. "
+                        f"{basis.clicks} clicks ({scope}, "
+                        f"{basis.maturity:.0%} matured) with no conversions. "
                         f"Probability of reaching breakeven is {probability:.1%}."
                     ),
                     confidence=round(confidence, 4),
                     evidence=evidence,
                 )
 
-        # 5. Every rule below reads a ROAS credible interval, which is
+        # 6. Every rule below reads a ROAS credible interval, which is
         #    meaningless without a per-conversion value. Judging on the
         #    degenerate interval that results would pause healthy entities with
         #    fabricated confidence, so say so instead.
@@ -241,10 +264,52 @@ class Optimizer:
                 evidence=evidence,
             )
 
-        # 6. Losing money with enough evidence to be sure.
+        # 7. Losing money with enough evidence to be sure.
         if window.clicks >= p.min_clicks_to_judge:
             roas_ci = window.roas_interval(p.credible_level)
-            if window.roas < p.floor_roas and roas_ci.upper < p.floor_roas:
+            # Both kill rules answer to the same bar: the chance this is
+            # actually profitable has to be small, not merely unproven.
+            window_is_losing = (
+                window.roas < p.floor_roas
+                and roas_ci.upper < p.floor_roas
+                and window.prob_profitable(p.floor_roas) <= p.kill_confidence
+            )
+            if window_is_losing:
+                # A creative that has demonstrably made money and then had a bad
+                # week has decayed, not failed. Retiring it outright throws away
+                # a proven angle over a run of noise, so the response is to cut
+                # its budget and let the next window decide.
+                proven_before = (
+                    lifetime is not None
+                    and lifetime.can_model_roas
+                    and lifetime.conversions > 0
+                    and lifetime.roas_interval(p.credible_level).upper >= p.floor_roas
+                )
+                if proven_before:
+                    return self._budget_decision(
+                        window,
+                        direction=-1,
+                        rule="decayed_winner_throttle",
+                        reason=(
+                            f"ROAS fell to {window.roas:.2f} in this window, but "
+                            f"lifetime ROAS is {lifetime.roas:.2f} across "
+                            f"{lifetime.conversions} conversions. Treating this as "
+                            "decay rather than failure and cutting exposure."
+                        ),
+                        confidence=round(p.credible_level, 4),
+                        evidence=evidence,
+                    ) if has_own_budget else self._no_action(
+                        window,
+                        "decayed_winner_hold",
+                        (
+                            f"ROAS fell to {window.roas:.2f} in this window, but "
+                            f"lifetime ROAS is {lifetime.roas:.2f}. This level "
+                            "carries no budget to cut, so it is left to the next "
+                            "window rather than retired on one bad run."
+                        ),
+                        evidence=evidence,
+                    )
+
                 return Decision(
                     level=window.level,
                     entity_id=window.entity_id,
@@ -259,12 +324,17 @@ class Optimizer:
                     evidence=evidence,
                 )
 
-            # 7. Scale. The bar is deliberately high: the lower bound of the
+            # 8. Scale. The bar is deliberately high: the lower bound of the
             #    credible interval must clear breakeven, not just the mean.
+            # Note which ROAS this reads: the *observed* one. Projected ROAS is
+            # reported as evidence but never funded against, because scaling on
+            # revenue that has not arrived is how a campaign compounds a
+            # forecast instead of a profit.
             if (
                 window.roas >= p.target_roas
                 and roas_ci.lower >= p.floor_roas
                 and window.prob_profitable(p.target_roas) >= p.scale_confidence
+                and window.maturity >= p.scale_maturity_floor
             ):
                 if not has_own_budget:
                     return self._no_action(
@@ -285,14 +355,15 @@ class Optimizer:
                     reason=(
                         f"ROAS {window.roas:.2f} against a {p.target_roas:.2f} target, "
                         f"with a {int(p.credible_level * 100)}% lower bound of "
-                        f"{roas_ci.lower:.2f}. Profit "
+                        f"{roas_ci.lower:.2f} on "
+                        f"{window.maturity:.0%}-matured data. Profit "
                         f"{micros_to_usd(window.profit_micros):.2f} USD."
                     ),
                     confidence=round(window.prob_profitable(p.target_roas), 4),
                     evidence=evidence,
                 )
 
-            # 8. Marginal. Profitable but under target: cut spend rather than
+            # 9. Marginal. Profitable but under target: cut spend rather than
             #    kill, because the angle may still be worth keeping alive.
             if p.floor_roas <= window.roas < p.target_roas and roas_ci.upper < p.target_roas:
                 if not has_own_budget:
@@ -320,7 +391,7 @@ class Optimizer:
                     evidence=evidence,
                 )
 
-        # 9. Creative fatigue. Delivery is fine and economics are fine, but the
+        # 10. Creative fatigue. Delivery is fine and economics are fine, but the
         #    audience has seen it too often. Refresh rather than pause. Only a
         #    creative can be regenerated; an ad group is a container.
         already_refreshed = self._recently_refreshed(last_refresh_at, now)

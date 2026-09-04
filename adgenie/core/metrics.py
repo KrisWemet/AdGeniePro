@@ -31,6 +31,7 @@ from ..models import (
     Offer,
 )
 from ..money import micros_to_usd, safe_div
+from .lag import MIN_MATURITY_TO_JUDGE, LagModel
 from .stats import Interval, beta_interval, prob_rate_above
 
 __all__ = ["PerformanceWindow", "load_performance", "load_many"]
@@ -69,9 +70,47 @@ class PerformanceWindow:
     # small samples; `pooled_prior` replaces it with the account's own history.
     prior_a: float = 1.0
     prior_b: float = 1.0
+    # How much of this window's conversion window has actually elapsed. Below
+    # 1.0 the data is incomplete, not disappointing.
+    maturity: float = 1.0
+    effective_clicks: float = 0.0
+    lag_median_hours: float | None = None
     daily: list[dict] = field(default_factory=list)
 
     # -- rates -----------------------------------------------------------
+    def trials(self) -> float:
+        """Clicks that have had a real chance to convert.
+
+        This is what the posterior should count. Using raw clicks asserts every
+        one of them has had its full conversion window, which for anything
+        recent is false and reads as failure.
+        """
+        return self.effective_clicks or float(self.clicks)
+
+    @property
+    def is_mature(self) -> bool:
+        return self.maturity >= MIN_MATURITY_TO_JUDGE
+
+    @property
+    def projected_conversions(self) -> float:
+        """What this window is on course to report once the lag plays out.
+
+        For reporting only. Funding against a projection is how a campaign
+        scales on money that has not arrived and may never.
+        """
+        if self.maturity <= 0:
+            return float(self.conversions)
+        return self.conversions / max(self.maturity, MIN_MATURITY_TO_JUDGE)
+
+    @property
+    def projected_roas(self) -> float:
+        if not self.spend_micros or self.maturity <= 0:
+            return self.roas
+        projected_revenue = self.revenue_micros / max(
+            self.maturity, MIN_MATURITY_TO_JUDGE
+        )
+        return safe_div(projected_revenue, self.spend_micros)
+
     @property
     def ctr(self) -> float:
         return safe_div(self.clicks, self.impressions)
@@ -157,7 +196,7 @@ class PerformanceWindow:
     def cvr_interval(self, level: float | None = None) -> Interval:
         return beta_interval(
             self.conversions,
-            self.clicks,
+            self.trials(),
             level or self.credible_level,
             prior_a=self.prior_a,
             prior_b=self.prior_b,
@@ -175,17 +214,25 @@ class PerformanceWindow:
         return prob_rate_above(
             needed,
             self.conversions,
-            self.clicks,
+            self.trials(),
             prior_a=self.prior_a,
             prior_b=self.prior_b,
         )
 
     def roas_interval(self, level: float | None = None) -> Interval:
-        """Credible interval on ROAS, derived from the interval on CVR.
+        """Credible interval on the ROAS this window is heading for.
 
         Revenue per conversion is treated as the offer's expected payout, so
         the uncertainty that matters is entirely in the conversion rate. That
         holds for fixed-payout CPA offers, which is most affiliate inventory.
+
+        Two different click counts appear here and the distinction is the whole
+        point. The *rate* is estimated from matured clicks only, since those are
+        the ones that have had a chance to convert. That rate is then applied to
+        every click already paid for, because they will all eventually convert
+        at it. Scaling the rate by matured clicks instead would quietly assume
+        the outstanding clicks are worth nothing, which is the censoring
+        mistake this whole module exists to avoid.
         """
         if not self.clicks or not self.spend_micros or not self.can_model_roas:
             return Interval(0.0, 0.0, 0.0, level or self.credible_level)
@@ -224,6 +271,11 @@ class PerformanceWindow:
             "roas_upper": round(roas_ci.upper, 4),
             "breakeven_cvr": round(self.breakeven_cvr, 5),
             "can_model_roas": self.can_model_roas,
+            "maturity": round(self.maturity, 4),
+            "effective_clicks": round(self.trials(), 1),
+            "projected_conversions": round(self.projected_conversions, 2),
+            "projected_roas": round(self.projected_roas, 4),
+            "lag_median_hours": self.lag_median_hours,
             "prob_profitable": round(self.prob_profitable(), 4),
             "platform_conversions": self.platform_conversions,
             "platform_roas": round(self.platform_roas, 4),
@@ -310,6 +362,8 @@ def load_performance(
     until: date,
     credible_level: float = 0.90,
     count_pending_as_revenue: bool = False,
+    lag_model: LagModel | None = None,
+    as_of: datetime | None = None,
 ) -> PerformanceWindow:
     """Aggregate delivery and revenue for one entity over a date window.
 
@@ -386,6 +440,15 @@ def load_performance(
     if offer is not None:
         window.offer_payout_micros = offer.expected_value_micros()
     window.daily_budget_micros = _budget_for(session, level, entity_id)
+
+    # Discount recent clicks by how little of their conversion window has run.
+    lag_model = lag_model or LagModel()
+    daily_clicks = [
+        (date.fromisoformat(row["day"]), row["clicks"]) for row in window.daily
+    ]
+    window.effective_clicks = lag_model.effective_clicks(daily_clicks, as_of)
+    window.maturity = lag_model.window_maturity(daily_clicks, as_of)
+    window.lag_median_hours = lag_model.median_hours
     return window
 
 
@@ -396,10 +459,12 @@ def load_many(
     since: date,
     until: date,
     credible_level: float = 0.90,
+    lag_model: LagModel | None = None,
 ) -> dict[int, PerformanceWindow]:
     return {
         entity_id: load_performance(
-            session, level, entity_id, since, until, credible_level
+            session, level, entity_id, since, until, credible_level,
+            lag_model=lag_model,
         )
         for entity_id in entity_ids
     }

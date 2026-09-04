@@ -12,8 +12,8 @@ pip install -r requirements.txt
 python -m adgenie.cli demo --days 21
 ```
 
-The demo runs the entire pipeline against a built-in auction simulator. No
-credentials, no spend.
+The demo runs the entire pipeline against a built-in auction simulator,
+including realistic conversion reporting delay. No credentials, no spend.
 
 ---
 
@@ -296,10 +296,12 @@ Evaluated in order; the first match wins.
 | `compliance_block` | Creative has a blocking policy finding | Pause |
 | `cooldown` | Acted on this entity within the cooldown window | Hold |
 | `learning` | Not enough spend or clicks to say anything | Hold |
+| `awaiting_conversions` | Too little of the conversion window has elapsed | Hold |
 | `zero_conversion_kill` | Lifetime spend past N× payout, no conversions, and breakeven is implausible | Pause |
 | `unprofitable_kill` | ROAS and its upper credible bound both below breakeven | Pause |
 | `scale_winner` | ROAS above target **and** the lower bound clears breakeven | Raise budget |
 | `throttle_marginal` | Profitable but the upper bound cannot reach target | Cut budget |
+| `decayed_winner_throttle` | Bad window, but a profitable lifetime record | Cut budget |
 | `frequency_fatigue` | Frequency above the ceiling | Generate new creative |
 | `ctr_decay` | CTR decayed against the ad's own opening week | Generate new creative |
 
@@ -309,13 +311,45 @@ funding the parent ad set and by the budget split across its siblings) and the
 usable actions are pause, resume and creative refresh. Budget changes apply to
 ad sets and campaigns.
 
-Three properties are deliberate:
+### Conversion lag
+
+A click does not convert instantly. A third convert in-session, most within a
+day, and a long tail runs for weeks on trials and networks that confirm late.
+That makes recent data **right-censored**: the spend has happened, some of the
+conversions it bought have not been reported yet.
+
+Comparing the two as if both were complete is the most expensive mistake an ad
+optimizer can make, because incomplete looks exactly like failure. A four-day-
+old ad with a real 5% conversion rate shows zero conversions, and a naive kill
+rule retires it with 98% "confidence" the week before it starts paying.
+
+So each day of clicks is weighted by how much of its conversion window has
+elapsed, and the posterior counts that **effective exposure** instead of raw
+clicks. The curve is fitted per offer from your own history and shrunk toward a
+sensible default while that history is thin, so a trial offer that confirms
+after ten days is judged on a slower clock than an impulse purchase.
+
+Two asymmetries fall out of this, both deliberate:
+
+- **Killing is blocked early** (below 15% maturity nothing is judged at all),
+  because a wrong kill destroys a winner.
+- **Scaling waits much longer** (60% maturity), because a wrong scale spends
+  real money where a slow scale only forgoes a little upside. Projected ROAS is
+  reported as evidence and never funded against.
+
+The rate is estimated from matured clicks only, then applied to *every* click
+already paid for — scaling it by matured clicks instead would quietly write off
+the outstanding ones, which is the same censoring error in a different place.
+
+Three further properties are deliberate:
 
 - **The bar for scaling is higher than the bar for pausing.** Pausing a good ad
   costs opportunity; scaling a bad one costs cash.
-- **The zero-conversion kill reads lifetime data, not the rolling window.** An
-  ad that has burned money for three weeks should not get a clean slate every
-  Monday because the window moved on.
+- **Kill rules read lifetime data, not the rolling window.** An ad that has
+  burned money for three weeks should not get a clean slate every Monday
+  because the window moved on. Conversely a creative with a profitable lifetime
+  record that has one bad week has *decayed*, not failed, so it is throttled
+  rather than retired.
 - **Budget is allocated by Thompson sampling with an exploration floor.**
   Ranking by observed conversion rate hands the budget to whichever ad got
   lucky first. Sampling from each posterior keeps a promising-but-unproven
@@ -392,6 +426,7 @@ adgenie/
   money.py           micro conversions
   core/
     stats.py         Beta-Binomial helpers, no numpy or scipy
+    lag.py           conversion delay curves and maturity weighting
     compliance.py    Meta and Google policy engine
     angles.py        the angle library
     copywriter.py    Claude generation + template fallback + repair loop
@@ -421,7 +456,7 @@ adgenie/
   static/            dashboard
   cli.py             command line
   demo.py            end-to-end simulation
-tests/               419 tests
+tests/               444 tests
 legacy/              the original prototype scripts, kept for reference
 ```
 

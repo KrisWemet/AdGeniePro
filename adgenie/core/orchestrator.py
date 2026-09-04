@@ -45,6 +45,7 @@ from ..money import micros_to_usd
 from ..platforms.base import AdPlatform, CreativeSpec, InsightRow, PlatformError
 from ..platforms.factory import get_platform
 from .copywriter import CopyStudio, build_brief
+from .lag import LagModel, fit_lag_model
 from .metrics import (
     PerformanceWindow,
     apply_pooled_prior,
@@ -84,6 +85,25 @@ class Orchestrator:
         )
         self.studio = studio or CopyStudio(settings=self.settings)
         self._clients = platform_clients or {}
+        # One fitted lag curve per offer, reused across a run.
+        self._lag_models: dict[int | None, LagModel] = {}
+
+    def lag_model(self, offer_id: int | None = None) -> LagModel:
+        """The click-to-conversion delay curve for an offer.
+
+        Fitted from this account's own history, shrunk toward a sensible
+        default while the history is thin, so a brand-new offer is not judged
+        on a curve derived from nine conversions.
+        """
+        if offer_id not in self._lag_models:
+            self._lag_models[offer_id] = fit_lag_model(self.session, offer_id)
+        return self._lag_models[offer_id]
+
+    def _lag_for_entity(self, level: EntityLevel, entity_id: int) -> LagModel:
+        from .metrics import _offer_for
+
+        offer = _offer_for(self.session, level, entity_id)
+        return self.lag_model(offer.id if offer else None)
 
     def client(self, platform: Platform) -> AdPlatform:
         if platform not in self._clients:
@@ -296,6 +316,14 @@ class Orchestrator:
             "by_rule": _count_by(actions, lambda a: a.rule),
             "by_action": _count_by(actions, lambda a: a.action.value),
             "needs_approval": sum(1 for a in actions if a.requires_approval),
+            "lag_models": {
+                str(offer_id): {
+                    "fitted": model.fitted,
+                    "sample_size": model.sample_size,
+                    "median_hours": model.median_hours,
+                }
+                for offer_id, model in self._lag_models.items()
+            },
         }
         self.session.commit()
 
@@ -336,6 +364,7 @@ class Orchestrator:
 
         out: list[tuple[Decision, Creative]] = []
         for group_id, members in by_group.items():
+            lag = self._lag_for_entity(EntityLevel.CREATIVE, members[0].id)
             windows = {
                 c.id: load_performance(
                     self.session,
@@ -344,6 +373,8 @@ class Orchestrator:
                     since,
                     until,
                     self.settings.optimizer_credible_level,
+                    lag_model=lag,
+                    as_of=now,
                 )
                 for c in members
             }
@@ -356,6 +387,8 @@ class Orchestrator:
                     _EPOCH,
                     until,
                     self.settings.optimizer_credible_level,
+                    lag_model=lag,
+                    as_of=now,
                 )
                 for c in members
             }
@@ -397,13 +430,17 @@ class Orchestrator:
                 since,
                 until,
                 self.settings.optimizer_credible_level,
+                lag_model=self._lag_for_entity(EntityLevel.AD_GROUP, g.id),
+                as_of=now,
             )
             for g in groups
         ]
         apply_pooled_prior(windows)
         lifetimes = [
             load_performance(
-                self.session, EntityLevel.AD_GROUP, g.id, _EPOCH, until
+                self.session, EntityLevel.AD_GROUP, g.id, _EPOCH, until,
+                lag_model=self._lag_for_entity(EntityLevel.AD_GROUP, g.id),
+                as_of=now,
             )
             for g in groups
         ]
@@ -836,8 +873,11 @@ class Orchestrator:
         if not creatives:
             return {"ad_group_id": ad_group_id, "allocation": {}, "allocation_micros": {}}
 
+        lag = self._lag_for_entity(EntityLevel.CREATIVE, creatives[0].id)
         windows = [
-            load_performance(self.session, EntityLevel.CREATIVE, c.id, since, until)
+            load_performance(
+                self.session, EntityLevel.CREATIVE, c.id, since, until, lag_model=lag
+            )
             for c in creatives
         ]
         allocation = allocate_budget(windows, group.daily_budget_micros)
@@ -870,7 +910,10 @@ class Orchestrator:
             return {"campaign_id": campaign_id, "allocation": {}, "allocation_micros": {}}
 
         windows = [
-            load_performance(self.session, EntityLevel.AD_GROUP, g.id, since, until)
+            load_performance(
+                self.session, EntityLevel.AD_GROUP, g.id, since, until,
+                lag_model=self._lag_for_entity(EntityLevel.AD_GROUP, g.id),
+            )
             for g in groups
         ]
         total = campaign.daily_budget_micros or sum(

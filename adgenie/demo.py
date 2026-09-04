@@ -45,6 +45,32 @@ from .money import fmt_usd, usd_to_micros
 from .platforms.factory import reset_sandboxes
 from .platforms.sandbox import SandboxPlatform
 
+# How long after the click a conversion may still arrive.
+LAG_HORIZON_DAYS = 21
+
+# A realistic direct-response delay mix: most convert in-session, the rest
+# trail off over days. Weights are relative.
+_DELAY_BUCKETS: tuple[tuple[float, float, float], ...] = (
+    (0.0, 1.0, 40.0),      # same session
+    (1.0, 24.0, 30.0),     # same day
+    (24.0, 72.0, 18.0),    # next couple of days
+    (72.0, 168.0, 9.0),    # within the week
+    (168.0, 504.0, 3.0),   # the long tail
+)
+
+
+def _sample_conversion_delay(rng: random.Random) -> float:
+    """Hours between the click and the network reporting the conversion."""
+    total = sum(weight for _, _, weight in _DELAY_BUCKETS)
+    draw = rng.random() * total
+    running = 0.0
+    for low, high, weight in _DELAY_BUCKETS:
+        running += weight
+        if draw <= running:
+            return rng.uniform(low, high)
+    return _DELAY_BUCKETS[-1][1]
+
+
 DEMO_OFFER = {
     "name": "CalmLeaf Sleep Support",
     "network": "clickbank",
@@ -134,6 +160,16 @@ def simulate_conversions(
                 if rng.random() < offer.expected_reversal_rate
                 else ConversionStatus.APPROVED
             )
+            # Conversions do not land the instant the click happens. Simulating
+            # them as instant would hide the censoring problem the optimizer has
+            # to survive: on a real account the most recent days always look
+            # worse than they are.
+            delay_hours = _sample_conversion_delay(rng)
+            converted_at = occurred + timedelta(hours=delay_hours)
+            if converted_at > datetime.combine(day, time(23, 59), tzinfo=timezone.utc) + timedelta(
+                days=LAG_HORIZON_DAYS
+            ):
+                continue
             record_conversion(
                 session,
                 network=offer.network,
@@ -142,14 +178,16 @@ def simulate_conversions(
                 revenue_micros=offer.payout_micros,
                 sale_amount_micros=usd_to_micros(97.0),
                 status=status,
-                occurred_at=occurred,
+                occurred_at=converted_at,
             )
             created += 1
     session.commit()
     return created
 
 
-def print_report(session: Session, since: date, until: date) -> None:
+def print_report(
+    session: Session, since: date, until: date, as_of: datetime | None = None
+) -> None:
     print("\n" + "=" * 96)
     print(f"PERFORMANCE  {since} .. {until}")
     print("=" * 96)
@@ -163,7 +201,7 @@ def print_report(session: Session, since: date, until: date) -> None:
     totals = {"spend": 0, "revenue": 0, "clicks": 0, "conversions": 0}
     for creative in session.query(Creative).order_by(Creative.id):
         window = load_performance(
-            session, EntityLevel.CREATIVE, creative.id, since, until
+            session, EntityLevel.CREATIVE, creative.id, since, until, as_of=as_of
         )
         if not window.clicks and not window.spend_micros:
             continue
@@ -185,6 +223,11 @@ def print_report(session: Session, since: date, until: date) -> None:
         f"{totals['conversions']:>6}{fmt_usd(totals['revenue']):>11}{roas:>7.2f}"
     )
     print(f"{'PROFIT':<44}{fmt_usd(profit):>25}")
+    print(
+        f"\n  Conversions were simulated with a realistic reporting delay and "
+        f"allowed {LAG_HORIZON_DAYS} days to settle,"
+    )
+    print("  so these totals are mature. The optimizer had to decide without that luxury.")
 
 
 def run(
@@ -271,8 +314,17 @@ def run(
                     )
                     print(f"      {action['reason']}")
 
+    # Let the trailing conversions land before reporting. Without this the
+    # final table understates revenue for exactly the reason the optimizer has
+    # to reason about: the last few days of clicks have not finished converting.
+    settle_until = start + timedelta(days=days - 1 + LAG_HORIZON_DAYS)
     if verbose:
-        print_report(session, start, start + timedelta(days=days - 1))
+        print_report(
+            session,
+            start,
+            settle_until,
+            as_of=datetime.combine(settle_until, time(23, 59), tzinfo=timezone.utc),
+        )
 
     summary = {
         "campaign_id": result.campaign_id,
