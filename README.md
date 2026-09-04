@@ -340,11 +340,20 @@ before anything is cut, and each stops a specific way of being wrong:
 | Keep a minimum number of segments | Starving the entity of anywhere to deliver |
 
 At most two are cut per cycle so the effect of each stays measurable, and every
-exclusion requires human approval: on Meta it means switching the ad set off
-automatic placements and enumerating what remains, which resets learning.
+exclusion requires human approval, because Meta has no "exclude this placement"
+call: the only way to stop serving somewhere is to list every placement that
+stays, which resets ad set learning.
 
-Age, gender and region are reported but never auto-excluded — those are
-targeting changes with consequences a human should weigh.
+That also means an ad set on **automatic placements is refused rather than
+guessed at**. Meta's automatic set changes over time, so enumerating it from a
+constant would silently switch off placements nobody asked to lose. Set the
+placements explicitly first, then re-run.
+
+Each platform is offered a lever it can actually apply — placements on Meta,
+devices on Google — so an exclusion is never reviewed, approved and then
+rejected at apply time. Age, gender and region are reported but never
+auto-excluded: those are targeting changes with consequences a human should
+weigh.
 
 ### Conversion lag
 
@@ -493,7 +502,7 @@ adgenie/
   static/            dashboard
   cli.py             command line
   demo.py            end-to-end simulation
-tests/               471 tests
+tests/               481 tests
 legacy/              the original prototype scripts, kept for reference
 ```
 

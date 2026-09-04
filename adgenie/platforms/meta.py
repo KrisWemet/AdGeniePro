@@ -45,14 +45,6 @@ RETRYABLE_CODES = {1, 2, 4, 17, 32, 341, 368, 613}
 
 LEVEL_TO_META = {"campaign": "campaign", "ad_group": "adset", "creative": "ad"}
 
-# What Meta serves when placements are automatic. Needed because dropping one
-# position requires enumerating the ones that stay.
-DEFAULT_POSITIONS = {
-    "facebook": ["feed", "video_feeds", "story", "marketplace", "search", "facebook_reels"],
-    "instagram": ["stream", "story", "explore", "reels", "profile_feed"],
-    "audience_network": ["classic", "rewarded_video"],
-    "messenger": ["messenger_home", "story"],
-}
 
 
 class MetaAdsClient(AdPlatform):
@@ -460,12 +452,14 @@ class MetaAdsClient(AdPlatform):
     def apply_exclusion(
         self, level: str, external_id: str, dimension: str, segment: str
     ) -> None:
-        """Exclude a placement by pinning the ad set to everything else.
+        """Drop one placement by pinning the ad set to the ones that remain.
 
-        Meta has no "exclude one placement" call. The only way to drop one is
-        to switch the ad set off automatic placements and enumerate the
-        positions that remain, which is why this is limited to placements and
-        to the ad set level.
+        Meta has no "exclude this placement" call. The only way to stop serving
+        somewhere is to list every placement that stays, which means the ad set
+        must already have an explicit list. An ad set on automatic placements is
+        refused rather than guessed at: Meta's automatic set changes over time,
+        so enumerating it from a constant in this file would silently switch off
+        placements nobody asked to lose.
         """
         if dimension != "placement":
             raise PlatformError(
@@ -482,19 +476,24 @@ class MetaAdsClient(AdPlatform):
                 code="INVALID_LEVEL",
             )
 
-        publisher, _, position = segment.partition(":")
         current = self._request(
             "GET", external_id, params={"fields": "targeting"}
         ).get("targeting", {})
+        publishers = list(current.get("publisher_platforms") or [])
+        if not publishers:
+            raise PlatformError(
+                "This ad set uses automatic placements. Excluding one means "
+                "listing every placement that stays, and guessing that list "
+                "would switch off placements you did not ask to lose. Set the "
+                "ad set's placements explicitly first, then re-run this.",
+                platform=self.platform,
+                code="AUTOMATIC_PLACEMENTS",
+            )
 
-        publishers = list(
-            current.get("publisher_platforms")
-            or ["facebook", "instagram", "audience_network", "messenger"]
-        )
+        publisher, _, position = segment.partition(":")
         targeting = dict(current)
 
         if not position:
-            # Dropping a whole publisher platform.
             remaining = [p for p in publishers if p != publisher]
             if not remaining:
                 raise PlatformError(
@@ -503,25 +502,28 @@ class MetaAdsClient(AdPlatform):
                     code="EMPTY_TARGETING",
                 )
             targeting["publisher_platforms"] = remaining
-            for key in (
-                "facebook_positions", "instagram_positions",
-                "audience_network_positions", "messenger_positions",
-            ):
-                if key.split("_")[0] == publisher:
-                    targeting.pop(key, None)
+            # Positions for a platform no longer targeted are invalid.
+            targeting.pop(f"{publisher}_positions", None)
         else:
             key = f"{publisher}_positions"
-            positions = list(current.get(key) or DEFAULT_POSITIONS.get(publisher, []))
+            positions = list(current.get(key) or [])
+            if not positions:
+                raise PlatformError(
+                    f"The ad set does not list {publisher} positions explicitly, "
+                    f"so {position} cannot be removed without enumerating them. "
+                    "Set them explicitly first, or exclude the whole platform.",
+                    platform=self.platform,
+                    code="POSITIONS_NOT_ENUMERATED",
+                )
             remaining = [p for p in positions if p != position]
             if not remaining:
                 raise PlatformError(
-                    f"excluding {segment} would leave {publisher} with no positions; "
-                    "drop the platform instead",
+                    f"excluding {segment} would leave {publisher} with no "
+                    "positions; drop the platform instead",
                     platform=self.platform,
                     code="EMPTY_TARGETING",
                 )
             targeting[key] = remaining
-            targeting.setdefault("publisher_platforms", publishers)
 
         # Automatic placements and an explicit list are mutually exclusive.
         targeting.pop("targeting_automation", None)

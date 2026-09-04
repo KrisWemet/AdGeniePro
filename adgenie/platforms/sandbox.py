@@ -402,21 +402,28 @@ class SandboxPlatform(AdPlatform):
             )
 
         # Delivery is recorded per creative, so a request for an ad group or a
-        # campaign has to be resolved down to the creatives underneath it.
-        wanted = self._descendant_creatives(external_ids) if external_ids else None
+        # campaign resolves down to the creatives underneath it and reports
+        # back under the id that was asked for, which is what the real
+        # adapters do.
+        creative_to_requested = (
+            self._descendant_creatives(external_ids) if external_ids else None
+        )
         out: list[BreakdownRow] = []
         for (eid, day), row in self.insights.items():
             if not (since <= day <= until):
                 continue
-            if wanted is not None and eid not in wanted:
+            if creative_to_requested is not None and eid not in creative_to_requested:
                 continue
+            reported_id = (
+                creative_to_requested[eid] if creative_to_requested is not None else eid
+            )
             rng = self._rng_for(f"bd:{dimension}:{eid}:{day.isoformat()}")
             for segment, share, quality in profile:
                 jitter = rng.uniform(0.85, 1.15)
                 clicks = int(row.clicks * share * jitter)
                 out.append(
                     BreakdownRow(
-                        external_id=eid,
+                        external_id=reported_id,
                         day=day,
                         dimension=dimension,
                         segment=segment,
@@ -431,19 +438,21 @@ class SandboxPlatform(AdPlatform):
                 )
         return sorted(out, key=lambda r: (r.day, r.external_id, r.segment))
 
-    def _descendant_creatives(self, external_ids: list[str]) -> set[str]:
-        """Every creative at or beneath the given entities."""
+    def _descendant_creatives(self, external_ids: list[str]) -> dict[str, str]:
+        """Map each creative to the requested entity it rolls up into."""
         requested = set(external_ids)
-        resolved: set[str] = set()
+        resolved: dict[str, str] = {}
         for entity in self.entities.values():
             if entity.level != "creative":
                 continue
-            if entity.external_id in requested or entity.parent_id in requested:
-                resolved.add(entity.external_id)
-                continue
-            group = self.entities.get(entity.parent_id or "")
-            if group is not None and group.parent_id in requested:
-                resolved.add(entity.external_id)
+            if entity.external_id in requested:
+                resolved[entity.external_id] = entity.external_id
+            elif entity.parent_id in requested:
+                resolved[entity.external_id] = entity.parent_id
+            else:
+                group = self.entities.get(entity.parent_id or "")
+                if group is not None and group.parent_id in requested:
+                    resolved[entity.external_id] = group.parent_id
         return resolved
 
     def apply_exclusion(

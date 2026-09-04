@@ -1801,3 +1801,229 @@ def test_a_non_json_success_body_is_a_typed_error(settings, module, exc):
         client = KieClient(settings, client=httpx.Client(transport=transport))
         with pytest.raises(MediaError, match=exc):
             client.submit(MediaRequest(prompt="x"))
+
+
+# --- seventh review round: segments ----------------------------------------
+
+
+@pytest.fixture
+def meta_ads(meta_settings):
+    def build(handler):
+        return MetaAdsClient(
+            meta_settings,
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+            dry_run=False,
+        )
+
+    return build
+
+
+def test_dropping_a_platform_removes_its_positions_key(meta_ads):
+    """`key.split("_")[0]` never matched audience_network_positions.
+
+    The result was a targeting object naming positions for a platform no
+    longer targeted, which Meta rejects — on this module's headline case.
+    """
+    posted = {}
+
+    def handler(request):
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "targeting": {
+                        "publisher_platforms": ["facebook", "audience_network"],
+                        "audience_network_positions": ["classic"],
+                        "facebook_positions": ["feed"],
+                    }
+                },
+            )
+        posted.update(dict(httpx.QueryParams(request.content.decode())))
+        return httpx.Response(200, json={})
+
+    meta_ads(handler).apply_exclusion(
+        "ad_group", "as1", "placement", "audience_network"
+    )
+    targeting = json.loads(posted["targeting"])
+    assert targeting["publisher_platforms"] == ["facebook"]
+    assert "audience_network_positions" not in targeting
+    assert targeting["facebook_positions"] == ["feed"]
+
+
+def test_an_automatic_placement_ad_set_is_refused_not_guessed(meta_ads):
+    """Enumerating Meta's automatic set from a constant switches off placements
+    nobody asked to lose."""
+    def handler(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"targeting": {}})
+        raise AssertionError("must not post a guessed placement list")
+
+    with pytest.raises(PlatformError, match="automatic placements"):
+        meta_ads(handler).apply_exclusion(
+            "ad_group", "as1", "placement", "instagram:reels"
+        )
+
+
+def test_excluding_a_position_never_adds_new_platforms(meta_ads):
+    posted = {}
+
+    def handler(request):
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "targeting": {
+                        "publisher_platforms": ["instagram"],
+                        "instagram_positions": ["stream", "reels"],
+                    }
+                },
+            )
+        posted.update(dict(httpx.QueryParams(request.content.decode())))
+        return httpx.Response(200, json={})
+
+    meta_ads(handler).apply_exclusion(
+        "ad_group", "as1", "placement", "instagram:reels"
+    )
+    targeting = json.loads(posted["targeting"])
+    assert targeting["publisher_platforms"] == ["instagram"]
+    assert targeting["instagram_positions"] == ["stream"]
+
+
+def test_removing_an_unenumerated_position_is_refused(meta_ads):
+    def handler(request):
+        if request.method == "GET":
+            return httpx.Response(
+                200, json={"targeting": {"publisher_platforms": ["instagram"]}}
+            )
+        raise AssertionError("must not post")
+
+    with pytest.raises(PlatformError, match="not list instagram positions"):
+        meta_ads(handler).apply_exclusion(
+            "ad_group", "as1", "placement", "instagram:reels"
+        )
+
+
+def test_each_platform_is_offered_a_lever_it_can_actually_apply(
+    session, settings, offer
+):
+    """A Google 'placement' exclusion would be approved and then fail."""
+    from adgenie.core.launcher import CampaignLauncher, LaunchPlan
+    from adgenie.core.orchestrator import Orchestrator
+
+    google = SandboxPlatform(Platform.GOOGLE, seed=5)
+    CampaignLauncher(session, settings=settings, platform_client=google).launch(
+        LaunchPlan(
+            offer_id=offer.id, platform=Platform.GOOGLE, daily_budget_usd=120,
+            angle_count=1, start_paused=False, keywords=["sleep aid"],
+        )
+    )
+    orchestrator = Orchestrator(
+        session, settings=settings, platform_clients={Platform.GOOGLE: google}
+    )
+    assert orchestrator.SEGMENT_DIMENSION[Platform.GOOGLE] == "device"
+    assert orchestrator.SEGMENT_DIMENSION[Platform.META] == "placement"
+
+
+def test_breakdowns_are_fetched_once_per_platform_not_once_per_ad_group(
+    session, settings, offer, sandbox_meta
+):
+    """Breakdown queries are heavy and rate-limited; N+1 burns the quota."""
+    from datetime import date as _date
+
+    from adgenie.core.launcher import CampaignLauncher, LaunchPlan
+    from adgenie.core.orchestrator import Orchestrator
+
+    CampaignLauncher(session, settings=settings, platform_client=sandbox_meta).launch(
+        LaunchPlan(
+            offer_id=offer.id, platform=Platform.META, daily_budget_usd=120,
+            angle_count=4, start_paused=False,
+        )
+    )
+    calls = {"n": 0}
+    original = sandbox_meta.fetch_breakdowns
+
+    def counting(*args, **kwargs):
+        calls["n"] += 1
+        return original(*args, **kwargs)
+
+    sandbox_meta.fetch_breakdowns = counting
+    orchestrator = Orchestrator(
+        session, settings=settings, platform_clients={Platform.META: sandbox_meta}
+    )
+    start = _date(2026, 3, 1)
+    for i in range(10):
+        sandbox_meta.simulate_day(start + timedelta(days=i))
+    orchestrator.sync_metrics(start, start + timedelta(days=9))
+    orchestrator._evaluate_segments(start, start + timedelta(days=9))
+
+    assert calls["n"] == 1, "four ad groups should cost one breakdown request"
+
+
+def test_breakdown_rows_are_attributed_to_the_entity_that_was_asked_for(
+    session, settings, offer, sandbox_meta
+):
+    """Rows keyed by creative silently attributed nothing once batched."""
+    from datetime import date as _date
+
+    from adgenie.core.launcher import CampaignLauncher, LaunchPlan
+
+    launched = CampaignLauncher(
+        session, settings=settings, platform_client=sandbox_meta
+    ).launch(
+        LaunchPlan(
+            offer_id=offer.id, platform=Platform.META, daily_budget_usd=120,
+            angle_count=2, start_paused=False,
+        )
+    )
+    start = _date(2026, 3, 1)
+    for i in range(5):
+        sandbox_meta.simulate_day(start + timedelta(days=i))
+
+    groups = session.execute(select(AdGroup)).scalars().all()
+    ids = [g.external_id for g in groups]
+    rows = sandbox_meta.fetch_breakdowns(
+        "ad_group", start, start + timedelta(days=4), "placement", ids
+    )
+    assert rows
+    assert {r.external_id for r in rows} <= set(ids)
+
+
+def test_an_ad_group_never_created_on_the_platform_is_skipped(session, settings, offer):
+    """An empty id widens the query to the whole account's delivery."""
+    from adgenie.core.orchestrator import Orchestrator
+
+    campaign = Campaign(
+        offer_id=offer.id, platform=Platform.META, name="m", external_id="c",
+        status=EntityStatus.ACTIVE,
+    )
+    session.add(campaign)
+    session.flush()
+    session.add(
+        AdGroup(
+            campaign_id=campaign.id, name="draft", external_id=None,
+            status=EntityStatus.ACTIVE,
+        )
+    )
+    session.commit()
+
+    orchestrator = Orchestrator(session, settings=settings)
+    assert orchestrator._evaluate_segments(date(2026, 3, 1), date(2026, 3, 7)) == []
+
+    group = session.execute(select(AdGroup)).scalars().first()
+    with pytest.raises(ValueError, match="never created"):
+        orchestrator.segment_report(group.id, date(2026, 3, 1), date(2026, 3, 7))
+
+
+def test_an_orphaned_ad_group_does_not_crash_segment_analysis(session, settings):
+    from adgenie.core.orchestrator import Orchestrator
+
+    session.add(AdGroup(campaign_id=9999, name="orphan", external_id="a",
+                        status=EntityStatus.ACTIVE))
+    session.commit()
+
+    orchestrator = Orchestrator(session, settings=settings)
+    assert orchestrator._evaluate_segments(date(2026, 3, 1), date(2026, 3, 7)) == []
+
+    group = session.execute(select(AdGroup)).scalars().first()
+    with pytest.raises(ValueError, match="no campaign"):
+        orchestrator.segment_report(group.id, date(2026, 3, 1), date(2026, 3, 7))
