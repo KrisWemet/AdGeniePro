@@ -21,7 +21,32 @@ _SANDBOX_CACHE: dict[tuple[Platform, int], SandboxPlatform] = {}
 # Live clients are cached too: each one owns an httpx connection pool and, for
 # Google, a cached OAuth token. Rebuilding one per request would open a fresh
 # pool that is never closed and re-authenticate on every call.
-_LIVE_CACHE: dict[tuple[Platform, int], AdPlatform] = {}
+_LIVE_CACHE: dict[tuple, AdPlatform] = {}
+
+
+def _live_key(platform: Platform, settings: Settings) -> tuple:
+    """Identify a client by the credentials it would use.
+
+    Keying on the settings object's address would hand back a client built with
+    stale credentials whenever a Settings instance is replaced and a new one
+    happens to land at the same address.
+    """
+    if platform is Platform.META:
+        return (
+            platform,
+            settings.meta_access_token,
+            settings.meta_ad_account_id,
+            settings.meta_api_version,
+            settings.dry_run,
+        )
+    return (
+        platform,
+        settings.google_refresh_token,
+        settings.google_customer_id,
+        settings.google_developer_token,
+        settings.google_api_version,
+        settings.dry_run,
+    )
 
 
 def get_platform(
@@ -36,7 +61,7 @@ def get_platform(
             settings.has_meta if platform is Platform.META else settings.has_google
         )
         if configured:
-            key = (platform, id(settings))
+            key = _live_key(platform, settings)
             if key not in _LIVE_CACHE:
                 if platform is Platform.META:
                     from .meta import MetaAdsClient

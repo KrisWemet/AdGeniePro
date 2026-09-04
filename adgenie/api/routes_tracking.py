@@ -19,6 +19,7 @@ from ..core.tracking import (
     build_final_url,
     record_click,
     record_conversion,
+    secret_is_placeholder,
     verify_postback_secret,
 )
 from ..db import get_session
@@ -97,6 +98,17 @@ def conversion_postback(
     """
     provided = x_postback_secret or secret
     if not verify_postback_secret(provided):
+        if secret_is_placeholder(get_settings().postback_secret):
+            logger.error(
+                "Rejected postback for txn %s: POSTBACK_SECRET is still the "
+                "example value, so no conversion can be accepted.",
+                payload.transaction_id,
+            )
+            raise HTTPException(
+                503,
+                "POSTBACK_SECRET is not configured; conversions cannot be "
+                "accepted until it is set to a real value.",
+            )
         logger.warning("Rejected postback with a bad secret for txn %s", payload.transaction_id)
         raise HTTPException(401, "invalid postback secret")
 

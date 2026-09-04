@@ -268,6 +268,24 @@ def verify_signature(
     return payload
 
 
+# Values shipped in the example configuration. A deployment still using one is
+# not configured, and treating it as valid would let anyone post conversions.
+PLACEHOLDER_SECRETS = frozenset(
+    {
+        "change-me-postback",
+        "change-me-to-something-random",
+        "change-me",
+        "changeme",
+        "secret",
+        "",
+    }
+)
+
+
+def secret_is_placeholder(secret: str | None) -> bool:
+    return (secret or "").strip().lower() in PLACEHOLDER_SECRETS
+
+
 def verify_postback_secret(provided: str | None, settings: Settings | None = None) -> bool:
     """Compare a shared postback secret without leaking timing information.
 
@@ -276,6 +294,11 @@ def verify_postback_secret(provided: str | None, settings: Settings | None = Non
     """
     settings = settings or get_settings()
     if not provided:
+        return False
+    if secret_is_placeholder(settings.postback_secret):
+        # Revenue posted here is what the optimizer spends against, so an
+        # unconfigured secret has to reject everything rather than accept
+        # whatever the example file happens to say.
         return False
     return hmac.compare_digest(
         str(provided).encode("utf-8", "surrogateescape"),
@@ -443,29 +466,41 @@ def record_conversion(
 
     click: Click | None = None
     method = "unmatched"
+    expired = False
     if click_id:
         click = session.execute(
             select(Click).where(Click.click_id == click_id)
         ).scalar_one_or_none()
         if click is not None:
-            method = (
-                "click_id"
-                if attribution_window_ok(click, occurred_at, attribution_days)
-                else "click_id_expired"
-            )
-            if method == "click_id_expired":
+            if attribution_window_ok(click, occurred_at, attribution_days):
+                method = "click_id"
+            else:
+                # The click is known and too old to credit. Falling through to
+                # the sub-id would credit the same creative anyway and quietly
+                # undo the window.
+                method = "click_id_expired"
+                expired = True
                 click = None
 
     ctx = decode_subid(subid) if subid else None
-    if click is None and ctx is not None and ctx.offer_id:
+    if click is None and not expired and ctx is not None and ctx.offer_id:
         method = "subid"
 
     conversion = Conversion(
         click_id=click.click_id if click else click_id,
-        offer_id=(click.offer_id if click else (ctx.offer_id if ctx else None)) or None,
-        campaign_id=click.campaign_id if click else (ctx.campaign_id if ctx else None),
-        ad_group_id=click.ad_group_id if click else (ctx.ad_group_id if ctx else None),
-        creative_id=click.creative_id if click else (ctx.creative_id if ctx else None),
+        offer_id=(
+            click.offer_id if click else (ctx.offer_id if ctx and not expired else None)
+        )
+        or None,
+        campaign_id=(
+            click.campaign_id if click else (ctx.campaign_id if ctx and not expired else None)
+        ),
+        ad_group_id=(
+            click.ad_group_id if click else (ctx.ad_group_id if ctx and not expired else None)
+        ),
+        creative_id=(
+            click.creative_id if click else (ctx.creative_id if ctx and not expired else None)
+        ),
         network=network,
         network_txn_id=network_txn_id,
         revenue_micros=revenue_micros,

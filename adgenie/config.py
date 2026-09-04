@@ -75,6 +75,8 @@ class Settings(BaseSettings):
     # --- affiliate networks ---
     clickbank_api_key: str | None = None
     clickbank_nickname: str | None = None
+    # Deliberately the example value: postbacks are rejected until it is
+    # changed, so an unconfigured deployment cannot be fed forged revenue.
     postback_secret: str = "change-me-postback"
 
     # --- optimizer defaults ---

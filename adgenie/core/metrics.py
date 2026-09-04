@@ -121,15 +121,38 @@ class PerformanceWindow:
         return (self.platform_conversions - self.conversions) / self.platform_conversions
 
     # -- uncertainty -----------------------------------------------------
+    def effective_payout_micros(self) -> int:
+        """What one conversion is worth, preferring what was actually paid.
+
+        The offer's configured payout is an estimate; observed revenue per
+        conversion is the measurement. Falling back to it keeps revenue-share
+        offers, where the configured payout is zero, from being unmodellable.
+        """
+        if self.conversions and self.revenue_micros:
+            return int(self.revenue_micros / self.conversions)
+        return self.offer_payout_micros
+
+    @property
+    def can_model_roas(self) -> bool:
+        """Whether a ROAS credible interval means anything for this entity.
+
+        Without a per-conversion value there is no scale to map the conversion
+        rate onto, and the interval collapses to zero. Reading that as "the
+        upper bound is below breakeven" would kill healthy entities with
+        complete confidence, so the rules that depend on it must be skipped.
+        """
+        return self.effective_payout_micros() > 0
+
     @property
     def breakeven_cvr(self) -> float:
         """The conversion rate at which revenue equals spend.
 
         Below this the ad loses money no matter how good the click volume is.
         """
-        if not self.offer_payout_micros or not self.clicks:
+        payout = self.effective_payout_micros()
+        if not payout or not self.clicks:
             return 0.0
-        return min(1.0, self.cpc_micros / self.offer_payout_micros)
+        return min(1.0, self.cpc_micros / payout)
 
     def cvr_interval(self, level: float | None = None) -> Interval:
         return beta_interval(
@@ -142,7 +165,7 @@ class PerformanceWindow:
 
     def prob_profitable(self, target_roas: float = 1.0) -> float:
         """P(true conversion rate clears the rate needed for `target_roas`)."""
-        if not self.clicks or not self.offer_payout_micros:
+        if not self.clicks or not self.can_model_roas:
             return 0.0
         needed = self.breakeven_cvr * target_roas
         if needed <= 0:
@@ -164,10 +187,10 @@ class PerformanceWindow:
         the uncertainty that matters is entirely in the conversion rate. That
         holds for fixed-payout CPA offers, which is most affiliate inventory.
         """
-        if not self.clicks or not self.spend_micros or not self.offer_payout_micros:
+        if not self.clicks or not self.spend_micros or not self.can_model_roas:
             return Interval(0.0, 0.0, 0.0, level or self.credible_level)
         interval = self.cvr_interval(level)
-        scale = self.clicks * self.offer_payout_micros / self.spend_micros
+        scale = self.clicks * self.effective_payout_micros() / self.spend_micros
         return Interval(
             lower=interval.lower * scale,
             mean=interval.mean * scale,
@@ -200,6 +223,7 @@ class PerformanceWindow:
             "roas_lower": round(roas_ci.lower, 4),
             "roas_upper": round(roas_ci.upper, 4),
             "breakeven_cvr": round(self.breakeven_cvr, 5),
+            "can_model_roas": self.can_model_roas,
             "prob_profitable": round(self.prob_profitable(), 4),
             "platform_conversions": self.platform_conversions,
             "platform_roas": round(self.platform_roas, 4),

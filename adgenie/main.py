@@ -44,6 +44,14 @@ async def lifespan(app: FastAPI):
             "DRY RUN is on: no mutation will be sent to a live ad account. "
             "Set DRY_RUN=false to let the optimizer spend."
         )
+    from .core.tracking import secret_is_placeholder
+
+    if secret_is_placeholder(settings.postback_secret):
+        logger.warning(
+            "POSTBACK_SECRET is still the example value. Conversion postbacks "
+            "will be rejected until it is set, because revenue posted there is "
+            "what the optimizer spends against."
+        )
     if not settings.requires_api_key:
         logger.warning(
             "API_KEY is not set: the /api routes, which launch campaigns and "

@@ -627,7 +627,10 @@ class Orchestrator:
                     platform=platform,
                     code="NOT_FOUND",
                 )
-            delta = target - entity.daily_budget_micros
+            # The baseline is the decision's own `from_micros`, not the ad
+            # group's stored budget: under campaign budget optimisation that is
+            # zero, which would turn a 20% step into the entire target amount.
+            delta = target - int(action.payload["from_micros"])
             campaign_target = max(1, campaign.daily_budget_micros + delta)
             if campaign.max_daily_budget_micros:
                 campaign_target = min(campaign_target, campaign.max_daily_budget_micros)

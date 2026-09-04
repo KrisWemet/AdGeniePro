@@ -168,7 +168,9 @@ https://track.yourdomain.com/postback
 Both GET and POST are accepted, since most networks only support a GET pixel.
 The endpoint is authenticated with a shared secret: it writes the revenue
 numbers the optimizer spends against, so leaving it open is a way to make the
-system scale a losing campaign. Duplicate postbacks are idempotent and refunds
+system scale a losing campaign. Until `POSTBACK_SECRET` is changed from the
+example value the endpoint rejects everything with a 503 and the server warns
+at startup, so an unconfigured deployment cannot be fed forged revenue. Duplicate postbacks are idempotent and refunds
 update the original conversion in place.
 
 `push-conversions` sends network-confirmed sales back to Meta's Conversions API
@@ -292,7 +294,7 @@ adgenie/
   static/            dashboard
   cli.py             command line
   demo.py            end-to-end simulation
-tests/               314 tests
+tests/               323 tests
 legacy/              the original prototype scripts, kept for reference
 ```
 
@@ -322,6 +324,8 @@ specific defect found in review, so a fix that silently reverts fails loudly.
 - The compliance engine is an automated pre-screen and a forcing function for
   better copy. It is not legal advice and does not replace each platform's own
   review.
-- Revenue-share offers are modelled with an average order value. Offers with a
-  wide order-value distribution will have wider real uncertainty than the ROAS
-  interval shows.
+- Revenue-share offers are modelled with an average order value, falling back
+  to observed revenue per conversion. Offers with a wide order-value
+  distribution will have wider real uncertainty than the ROAS interval shows,
+  and an offer with neither a payout nor any revenue yet is reported as
+  unjudgeable rather than guessed at.

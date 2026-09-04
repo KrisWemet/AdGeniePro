@@ -205,7 +205,7 @@ class Optimizer:
         #    gated on the posterior so a cheap offer with few clicks is not
         #    killed prematurely.
         basis = lifetime if lifetime is not None else window
-        if basis.conversions == 0 and basis.offer_payout_micros:
+        if basis.conversions == 0 and basis.can_model_roas:
             spend_multiple = basis.spend_micros / basis.offer_payout_micros
             probability = basis.prob_profitable(p.floor_roas)
             confidence = 1.0 - probability
@@ -225,7 +225,23 @@ class Optimizer:
                     evidence=evidence,
                 )
 
-        # 5. Losing money with enough evidence to be sure.
+        # 5. Every rule below reads a ROAS credible interval, which is
+        #    meaningless without a per-conversion value. Judging on the
+        #    degenerate interval that results would pause healthy entities with
+        #    fabricated confidence, so say so instead.
+        if window.clicks >= p.min_clicks_to_judge and not window.can_model_roas:
+            return self._no_action(
+                window,
+                "no_payout_configured",
+                (
+                    "This offer has no payout and no observed revenue per "
+                    "conversion, so profitability cannot be judged. Set the "
+                    "offer's payout, or its percentage and average order value."
+                ),
+                evidence=evidence,
+            )
+
+        # 6. Losing money with enough evidence to be sure.
         if window.clicks >= p.min_clicks_to_judge:
             roas_ci = window.roas_interval(p.credible_level)
             if window.roas < p.floor_roas and roas_ci.upper < p.floor_roas:
@@ -243,7 +259,7 @@ class Optimizer:
                     evidence=evidence,
                 )
 
-            # 6. Scale. The bar is deliberately high: the lower bound of the
+            # 7. Scale. The bar is deliberately high: the lower bound of the
             #    credible interval must clear breakeven, not just the mean.
             if (
                 window.roas >= p.target_roas
@@ -276,7 +292,7 @@ class Optimizer:
                     evidence=evidence,
                 )
 
-            # 7. Marginal. Profitable but under target: cut spend rather than
+            # 8. Marginal. Profitable but under target: cut spend rather than
             #    kill, because the angle may still be worth keeping alive.
             if p.floor_roas <= window.roas < p.target_roas and roas_ci.upper < p.target_roas:
                 if not has_own_budget:
@@ -304,7 +320,7 @@ class Optimizer:
                     evidence=evidence,
                 )
 
-        # 8. Creative fatigue. Delivery is fine and economics are fine, but the
+        # 9. Creative fatigue. Delivery is fine and economics are fine, but the
         #    audience has seen it too often. Refresh rather than pause. Only a
         #    creative can be regenerated; an ad group is a container.
         already_refreshed = self._recently_refreshed(last_refresh_at, now)

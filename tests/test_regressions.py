@@ -1385,3 +1385,145 @@ def test_shouting_rule_exemptions_can_actually_match():
     assert all(len(t) >= 5 for t in tokens), (
         "an exemption shorter than the rule's own minimum is dead code"
     )
+
+
+# --- fifth review round ----------------------------------------------------
+
+
+def test_google_scale_delta_uses_the_decision_baseline(session, settings, offer):
+    """Under campaign budget optimisation the ad group's stored budget is 0."""
+    campaign = Campaign(
+        offer_id=offer.id, platform=Platform.GOOGLE, name="g", external_id="c",
+        daily_budget_micros=usd_to_micros(100),
+        max_daily_budget_micros=usd_to_micros(500),
+        status=EntityStatus.ACTIVE,
+    )
+    session.add(campaign)
+    session.flush()
+    group = AdGroup(
+        campaign_id=campaign.id, name="g0", external_id="a0",
+        daily_budget_micros=0, status=EntityStatus.ACTIVE,
+    )
+    session.add(group)
+    session.commit()
+
+    orchestrator = Orchestrator(
+        session, settings=settings, platform_clients={Platform.GOOGLE: _NullPlatform()}
+    )
+    action = OptimizationAction(
+        level=EntityLevel.AD_GROUP, entity_id=group.id,
+        action=ActionType.INCREASE_BUDGET, rule="scale_winner", reason="t",
+        payload={"from_micros": usd_to_micros(100), "to_micros": usd_to_micros(120)},
+    )
+    session.add(action)
+    session.flush()
+
+    assert orchestrator.apply_action(action)
+    session.commit()
+    # A 20% step is $20, so the campaign goes to $120, not $220.
+    assert campaign.daily_budget_micros == usd_to_micros(120)
+
+
+def test_an_offer_with_no_payout_is_not_killed_on_a_fabricated_interval():
+    """A degenerate ROAS interval read as 'upper bound below breakeven'."""
+    w = _window(40, 0, 50, budget_usd=25)
+    w.level = EntityLevel.AD_GROUP
+    w.offer_payout_micros = 0
+    w.revenue_micros = 0
+
+    decision = Optimizer(OptimizerPolicy()).evaluate(w)
+    assert decision.action is ActionType.NO_ACTION
+    assert decision.rule == "no_payout_configured"
+
+
+def test_payout_falls_back_to_observed_revenue_per_conversion():
+    """Revenue-share offers configure no fixed payout, but they do pay."""
+    w = _window(400, 10, 200, budget_usd=25)
+    w.offer_payout_micros = 0
+    w.revenue_micros = usd_to_micros(500)
+
+    assert w.can_model_roas
+    assert w.effective_payout_micros() == usd_to_micros(50)
+    decision = Optimizer(OptimizerPolicy()).evaluate(w)
+    assert decision.action is ActionType.INCREASE_BUDGET
+
+
+def test_a_zero_payout_offer_is_not_killed_for_zero_conversions():
+    w = _window(300, 0, 300, budget_usd=25)
+    w.offer_payout_micros = 0
+    decision = Optimizer(OptimizerPolicy()).evaluate(w)
+    assert decision.action is not ActionType.PAUSE
+
+
+def test_an_expired_click_is_not_re_attributed_through_the_subid(session, offer):
+    """The sub-id names the same creative, which would undo the window."""
+    subid = encode_subid(TrackingContext(offer.id, None, None, 3, Platform.META))
+    click, _ = record_click(session, subid, user_agent=BROWSER_UA)
+    click.created_at = datetime(2025, 1, 1)
+    session.commit()
+
+    conversion, method = record_conversion(
+        session,
+        network="cb",
+        network_txn_id="stale-1",
+        click_id=click.click_id,
+        subid=subid,
+        revenue_micros=usd_to_micros(40),
+        attribution_days=30,
+    )
+    session.commit()
+
+    assert method == "click_id_expired"
+    assert conversion.creative_id is None
+
+
+def test_a_fresh_click_still_attributes_through_the_subid(session, offer):
+    subid = encode_subid(TrackingContext(offer.id, None, None, 3, Platform.META))
+    conversion, method = record_conversion(
+        session, network="cb", network_txn_id="fresh-1", subid=subid,
+        revenue_micros=usd_to_micros(40),
+    )
+    session.commit()
+    assert method == "subid"
+    assert conversion.creative_id == 3
+
+
+def test_client_cache_follows_the_credentials_not_the_object(settings):
+    """Keying on id(settings) handed back a client built with stale secrets."""
+    from adgenie.platforms.factory import get_platform, reset_sandboxes
+
+    reset_sandboxes()
+    settings.meta_access_token = "first-token"
+    settings.meta_ad_account_id = "123"
+    first = get_platform(Platform.META, settings)
+
+    rotated = settings.model_copy(update={"meta_access_token": "second-token"})
+    second = get_platform(Platform.META, rotated)
+
+    assert first is not second
+    assert second.settings.meta_access_token == "second-token"
+    reset_sandboxes()
+
+
+def test_the_example_postback_secret_is_never_accepted(settings):
+    """Revenue posted here is what the optimizer spends against."""
+    from adgenie.core.tracking import secret_is_placeholder, verify_postback_secret
+
+    assert secret_is_placeholder("change-me-postback")
+    assert secret_is_placeholder("")
+    assert not secret_is_placeholder("a-real-random-value")
+
+    unconfigured = settings.model_copy(update={"postback_secret": "change-me-postback"})
+    assert not verify_postback_secret("change-me-postback", unconfigured)
+
+
+def test_postback_reports_an_unconfigured_secret_distinctly(api_client, settings):
+    """A 503 says 'not set up' where a 401 would say 'wrong key'."""
+    settings.postback_secret = "change-me-postback"
+    response = api_client.post(
+        "/postback",
+        json={"transaction_id": "t1", "revenue": 40.0},
+        headers={"X-Postback-Secret": "change-me-postback"},
+    )
+    assert response.status_code == 503
+    assert "POSTBACK_SECRET" in response.json()["detail"]
