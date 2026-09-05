@@ -93,6 +93,7 @@ sandbox, and the logs say so explicitly rather than silently doing nothing.
 | `GOOGLE_*` | Google calls go to the simulator |
 | `DRY_RUN` | Defaults to `true`: nothing is sent to a live ad account |
 | `API_KEY` | The `/api` routes are unauthenticated; bind to localhost |
+| `AUDIT_LANDING_PAGES` | Defaults to `true`; destinations are checked before launch |
 
 ### 2. Add an offer
 
@@ -162,6 +163,65 @@ uvicorn adgenie.main:app --reload
 ```
 
 Dashboard at `http://localhost:8000`, API docs at `/docs`.
+
+---
+
+## Landing page auditing
+
+**Both platforms review the destination, not just the ad.** This is where most
+affiliate bans originate, and until now the platform screened ad text and
+imagery while never once looking at the page it was sending traffic to.
+
+```bash
+python -m adgenie.cli landing --offer 1          # audit and record
+python -m adgenie.cli landing --sweep --pause    # re-check everything live
+```
+
+A launch audits the destination before creating anything, so a broken page
+means no campaign rather than paused wreckage in the ad account. Set
+`AUDIT_LANDING_PAGES=false` to turn that off, or pass
+`--skip-landing-check` for one launch.
+
+### The check that matters most
+
+The page is fetched **twice**: once as an ordinary mobile browser, once as each
+platform's reviewing crawler. If the two differ materially, the page is
+cloaking — an instant and usually permanent ban.
+
+This matters more for affiliates than for advertisers generally, because *you
+may not control the page*. A network can cloak on their own initiative without
+telling you, and the first you hear of it is the enforcement email. Finding out
+from this tool is survivable.
+
+Three signatures are caught: materially different content, an error served only
+to the crawler, and the crawler being redirected somewhere the human never
+goes. Normal variation — timestamps, rotating testimonials, visitor counters —
+does not trip it.
+
+### Everything else it checks
+
+| Check | Why |
+|---|---|
+| Reachable, not a 4xx/5xx | Every click is being paid for and wasted |
+| Privacy policy link | Blocking; the most common rejection reason |
+| Terms and contact links | Their absence reads as a throwaway page |
+| HTTPS, and HTTPS forms | Blocking when the page takes card details |
+| Redirect chain length and scheme | Long chains lose visitors and read as cloaking |
+| Meta refresh redirects | A classic cloaking signature |
+| Viewport tag | Most of this traffic is on a phone |
+| Word count | A page that is mostly a button is a bridge page, which Google rejects |
+| FTC disclosure on the page | The ad's disclosure does not cover the destination |
+| Autoplay audio, back-button traps, unsubstantiated press logos | Rejection reasons in their own right |
+| The page's own claims | A guaranteed-cure promise is no safer one click away |
+| Ad-to-page consistency | Google rejects destination mismatch outright |
+
+### Noticing when the page changes
+
+An audit run once at launch answers the wrong question — the page was compliant
+*then*. Networks rotate creatives and advertisers edit copy, so every audit is
+stored with a content hash and a later one that finds different content says
+so. `landing --sweep` re-checks every live destination; `--pause` stops
+spending on the ones that now fail.
 
 ---
 
@@ -517,6 +577,9 @@ whenever the dashboard is served from a known origin.
 | `GET /api/optimizer/rebalance/{ad_group_id}` | Advisory split across creatives |
 | `GET /api/optimizer/rebalance-campaign/{id}` | Applicable split across ad groups |
 | `POST /api/optimizer/push-conversions` | Send sales back to the platforms |
+| `POST /api/landing/audit` | Audit a destination the way the platforms will |
+| `POST /api/landing/sweep` | Re-check every live destination |
+| `GET /api/landing/history` | Past audits, to see when a page changed |
 | `GET /api/research/coverage` | What the Ad Library will actually return |
 | `POST /api/research/scan` | Scan the archive and summarise what is running |
 | `POST /api/research/sweep-retirements` | Re-scan including stopped ads |
@@ -544,6 +607,8 @@ adgenie/
     lag.py           conversion delay curves and maturity weighting
     segments.py      placement and audience waste detection
     ltv.py           what a lead is worth before you know what it was worth
+    landing.py       destination auditing, including cloaking detection
+    destination.py   storing audits so a changed page is noticed
     compliance.py    Meta and Google policy engine
     angles.py        the angle library
     copywriter.py    Claude generation + template fallback + repair loop
@@ -573,7 +638,7 @@ adgenie/
   static/            dashboard
   cli.py             command line
   demo.py            end-to-end simulation
-tests/               523 tests
+tests/               566 tests
 legacy/              the original prototype scripts, kept for reference
 ```
 

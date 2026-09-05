@@ -28,6 +28,10 @@ def settings() -> Settings:
         secret_key="test-key",
         anthropic_api_key=None,
         global_daily_budget_cap_usd=500.0,
+        # Test offers point at domains that do not resolve, and these tests are
+        # about launch mechanics rather than destinations. The landing-page
+        # tests exercise the auditor directly with a mock transport.
+        audit_landing_pages=False,
     )
 
 

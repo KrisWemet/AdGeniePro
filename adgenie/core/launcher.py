@@ -71,6 +71,12 @@ class LaunchPlan:
     # and returns nothing outside the EU and UK.
     research_market: bool = False
     research_term: str = ""
+    # Audit the destination before sending paid traffic to it. None defers to
+    # the deployment's `audit_landing_pages` setting, which defaults to on.
+    check_landing_page: bool | None = None
+    # Launch anyway when the page fails. Off by default, and saying yes means
+    # knowingly pointing paid traffic at a page the platforms will object to.
+    ignore_landing_page_findings: bool = False
     # Generate imagery for each creative. A Meta ad without an image is not an
     # ad; Google search ads carry no imagery and skip this.
     generate_media: bool = False
@@ -87,6 +93,7 @@ class LaunchResult:
     blocked_creative_ids: list[int] = field(default_factory=list)
     media_asset_ids: list[int] = field(default_factory=list)
     market_brief: dict | None = None
+    landing_page: dict | None = None
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     dry_run: bool = True
@@ -102,6 +109,7 @@ class LaunchResult:
             "blocked": len(self.blocked_creative_ids),
             "media_asset_ids": self.media_asset_ids,
             "market_brief": self.market_brief,
+            "landing_page": self.landing_page,
             "warnings": self.warnings,
             "errors": self.errors,
             "dry_run": self.dry_run,
@@ -123,6 +131,7 @@ class CampaignLauncher:
         platform_client: AdPlatform | None = None,
         media_studio=None,
         researcher=None,
+        destination_monitor=None,
     ) -> None:
         self.session = session
         self.settings = settings or get_settings()
@@ -130,6 +139,8 @@ class CampaignLauncher:
         self._platform_client = platform_client
         self._media_studio = media_studio
         self._researcher = researcher
+        self._monitor = destination_monitor
+        self._landing_report: dict | None = None
 
     def _media(self):
         if self._media_studio is None:
@@ -153,6 +164,16 @@ class CampaignLauncher:
         status = "PAUSED" if plan.start_paused else "ACTIVE"
 
         self._media_asset_ids: list[int] = []
+        should_check = (
+            self.settings.audit_landing_pages
+            if plan.check_landing_page is None
+            else plan.check_landing_page
+        )
+        if should_check:
+            blocked = self._check_destination(offer, plan)
+            if blocked is not None:
+                return blocked
+
         market_notes: list[str] = []
         market_brief: dict | None = None
         if plan.research_market:
@@ -206,6 +227,7 @@ class CampaignLauncher:
                         )
 
         result.media_asset_ids = self._media_asset_ids
+        result.landing_page = self._landing_report
         self.session.commit()
         logger.info(
             "Launched campaign %s (%s): %s creatives live, %s blocked",
@@ -430,6 +452,62 @@ class CampaignLauncher:
         return creative
 
     # ------------------------------------------------------------------
+    def _check_destination(self, offer: Offer, plan: LaunchPlan) -> LaunchResult | None:
+        """Audit the page before paying to send anyone to it.
+
+        Returns a failed result when the page should stop the launch, so the
+        campaign is never created. Building the ads first and then discovering
+        the destination is broken leaves paused wreckage in the ad account.
+        """
+        from .destination import DestinationMonitor
+
+        try:
+            monitor = self._monitor or DestinationMonitor(self.session)
+            check = monitor.check_offer(offer)
+        except Exception as exc:
+            # A page that cannot be audited is not a page that should stop a
+            # launch on its own; report it and continue.
+            logger.warning("Landing page audit failed, launching without it: %s", exc)
+            return None
+
+        self.session.commit()
+        report = check.report
+        if check.verdict is not ComplianceVerdict.BLOCK:
+            self._landing_report = report
+            return None
+
+        codes = [
+            f["code"] for f in report.get("findings", []) if f["severity"] == "block"
+        ]
+        if plan.ignore_landing_page_findings:
+            logger.warning(
+                "Launching despite blocking landing page findings: %s",
+                ", ".join(codes),
+            )
+            self._landing_report = report
+            return None
+
+        logger.error(
+            "Refusing to launch: %s has blocking landing page findings (%s)",
+            offer.destination_url,
+            ", ".join(codes),
+        )
+        return LaunchResult(
+            campaign_id=0,
+            campaign_external_id=None,
+            landing_page=report,
+            errors=[
+                "The destination page has blocking policy findings, so no campaign "
+                "was created: "
+                + "; ".join(
+                    f["message"]
+                    for f in report.get("findings", [])
+                    if f["severity"] == "block"
+                )
+            ],
+            dry_run=self.settings.dry_run,
+        )
+
     def _research(self, offer: Offer, plan: LaunchPlan) -> tuple[list[str], dict | None]:
         """Scan the Ad Library for what is still running in this market."""
         try:

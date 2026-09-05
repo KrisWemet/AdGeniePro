@@ -91,6 +91,7 @@ def cmd_launch(args) -> int:
                 keywords=args.keyword or [],
                 geo_targets=args.geo or [],
                 start_paused=not args.start_active,
+                check_landing_page=False if args.skip_landing_check else None,
                 research_market=args.research,
                 research_term=args.research_term,
                 generate_media=args.with_media,
@@ -140,6 +141,74 @@ def cmd_optimize(args) -> int:
         print(f"    rule: {action['rule']}")
         print(f"    {action['reason']}")
     return 0
+
+
+def cmd_landing(args) -> int:
+    init_db()
+    from .core.destination import DestinationMonitor
+    from .core.landing import audit_landing_page
+
+    if args.sweep:
+        with session_scope() as session:
+            monitor = DestinationMonitor(session)
+            summary = monitor.sweep(max_age_hours=args.max_age_hours)
+            print(
+                f"Checked {summary['checked']} destination(s), "
+                f"skipped {summary['skipped']} still fresh."
+            )
+            for entry in summary["changed"]:
+                print(f"  CHANGED  offer {entry['offer_id']}  {entry['name']}")
+            for entry in summary["blocking"]:
+                print(
+                    f"  BLOCKING offer {entry['offer_id']}  {entry['name']}: "
+                    + ", ".join(entry["findings"])
+                )
+            if args.pause and summary["blocking"]:
+                from .core.orchestrator import Orchestrator
+
+                paused = monitor.pause_offenders(
+                    summary, orchestrator=Orchestrator(session)
+                )
+                print(f"  Paused {len(paused)} campaign(s).")
+            if not summary["changed"] and not summary["blocking"]:
+                print("  Nothing changed and nothing blocking.")
+        return 0
+
+    if args.offer:
+        with session_scope() as session:
+            offer = session.get(Offer, args.offer)
+            if offer is None:
+                print(f"offer {args.offer} not found", file=sys.stderr)
+                return 1
+            check = DestinationMonitor(session).check_offer(offer)
+            report = check.report
+            changed = check.content_changed
+    elif args.url:
+        report = audit_landing_page(args.url).as_dict()
+        changed = False
+    else:
+        print("give --offer, --url or --sweep", file=sys.stderr)
+        return 2
+
+    print(f"\n{report['url']}")
+    if report.get("final_url") and report["final_url"] != report["url"]:
+        print(f"  lands on {report['final_url']} after {report['redirect_hops']} hop(s)")
+    print(f"  {report['verdict'].upper()}  score {report['score']}")
+    if changed:
+        print("  The page has changed since the last check.")
+
+    for severity in ("block", "warn", "info"):
+        rows = [f for f in report["findings"] if f["severity"] == severity]
+        if not rows:
+            continue
+        print(f"\n  {severity.upper()}")
+        for finding in rows:
+            print(f"    {finding['code']}: {finding['message']}")
+            if finding.get("suggestion"):
+                print(f"      {finding['suggestion']}")
+    if not report["findings"]:
+        print("  Nothing to flag.")
+    return 0 if report["verdict"] != "block" else 1
 
 
 def cmd_funnel(args) -> int:
@@ -506,6 +575,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     launch.add_argument("--research-term", default="")
     launch.add_argument(
+        "--skip-landing-check", action="store_true",
+        help="do not audit the destination before launching",
+    )
+    launch.add_argument(
         "--with-media", action="store_true", help="generate imagery for each ad"
     )
     launch.set_defaults(func=cmd_launch)
@@ -520,6 +593,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--apply", action="store_true", help="apply decisions instead of proposing them"
     )
     optimize.set_defaults(func=cmd_optimize)
+
+    landing = sub.add_parser(
+        "landing", help="audit the page the ads send people to"
+    )
+    landing.add_argument("--offer", type=int, help="audit and record this offer's page")
+    landing.add_argument("--url", help="audit one URL without storing anything")
+    landing.add_argument(
+        "--sweep", action="store_true", help="re-check every live destination"
+    )
+    landing.add_argument("--max-age-hours", type=int, default=24)
+    landing.add_argument(
+        "--pause", action="store_true",
+        help="with --sweep, pause campaigns whose page now fails",
+    )
+    landing.set_defaults(func=cmd_landing)
 
     funnel = sub.add_parser(
         "funnel", help="define the steps between the click and the money"

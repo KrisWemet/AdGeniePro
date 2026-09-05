@@ -133,6 +133,100 @@ def retired_ads(
 
 
 # --------------------------------------------------------------------------
+# landing pages
+# --------------------------------------------------------------------------
+
+
+@router.post("/landing/audit")
+def audit_landing(
+    url: str | None = Query(default=None),
+    offer_id: int | None = Query(default=None),
+    check_cloaking: bool = Query(default=True),
+    session: Session = Depends(get_session),
+) -> dict:
+    """Check a destination the way the platforms will.
+
+    Pass an offer to audit its destination and record the result, or a bare URL
+    to check one without storing anything.
+    """
+    from ..core.destination import DestinationMonitor
+    from ..core.landing import audit_landing_page
+
+    if offer_id:
+        offer = session.get(Offer, offer_id)
+        if offer is None:
+            raise HTTPException(404, f"offer {offer_id} not found")
+        check = DestinationMonitor(session).check_offer(
+            offer, check_cloaking=check_cloaking
+        )
+        session.commit()
+        return {**check.report, "content_changed": check.content_changed}
+
+    if not url:
+        raise HTTPException(422, "provide either url or offer_id")
+    return audit_landing_page(url, check_cloaking=check_cloaking).as_dict()
+
+
+@router.post("/landing/sweep")
+def sweep_landing_pages(
+    max_age_hours: int = Query(default=24, ge=1, le=720),
+    pause_offenders: bool = Query(default=False),
+    session: Session = Depends(get_session),
+) -> dict:
+    """Re-check every live destination and report what changed.
+
+    The value is in the second check, not the first: a page that was compliant
+    when the ad was approved may not be now.
+    """
+    from ..core.destination import DestinationMonitor
+    from ..core.orchestrator import Orchestrator
+
+    monitor = DestinationMonitor(session)
+    summary = monitor.sweep(max_age_hours=max_age_hours)
+    if pause_offenders and summary["blocking"]:
+        summary["paused_campaigns"] = monitor.pause_offenders(
+            summary, orchestrator=Orchestrator(session, settings=get_settings())
+        )
+    return summary
+
+
+@router.get("/landing/history")
+def landing_history(
+    offer_id: int,
+    limit: int = Query(default=20, le=100),
+    session: Session = Depends(get_session),
+) -> dict:
+    """Past audits of an offer's destination, newest first."""
+    from ..models import LandingPageCheck
+
+    rows = session.execute(
+        select(LandingPageCheck)
+        .where(LandingPageCheck.offer_id == offer_id)
+        .order_by(LandingPageCheck.checked_at.desc())
+        .limit(limit)
+    ).scalars()
+    return {
+        "offer_id": offer_id,
+        "checks": [
+            {
+                "checked_at": row.checked_at.isoformat(),
+                "verdict": row.verdict.value,
+                "score": row.score,
+                "status_code": row.status_code,
+                "redirect_hops": row.redirect_hops,
+                "content_changed": row.content_changed,
+                "blocking": [
+                    f["code"]
+                    for f in row.report.get("findings", [])
+                    if f["severity"] == "block"
+                ],
+            }
+            for row in rows
+        ],
+    }
+
+
+# --------------------------------------------------------------------------
 # media
 # --------------------------------------------------------------------------
 

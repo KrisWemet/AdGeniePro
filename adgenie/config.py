@@ -72,6 +72,15 @@ class Settings(BaseSettings):
     google_conversion_action_id: str | None = None
     google_api_version: str = "v18"
 
+    # --- destination auditing ---
+    # Audit the landing page before a launch sends paid traffic to it. On by
+    # default: the destination is what gets an ad account banned, and the check
+    # costs one request. Turn it off only where the page cannot be reached from
+    # the server, such as an offline test environment.
+    audit_landing_pages: bool = True
+    # Re-audit destinations no more often than this during a sweep.
+    landing_page_recheck_hours: int = 24
+
     # --- media generation (kie.ai) ---
     kie_api_key: str | None = None
     kie_base_url: str = "https://api.kie.ai"

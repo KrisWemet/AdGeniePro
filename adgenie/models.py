@@ -553,6 +553,38 @@ class Lead(Base):
     last_value_at: Mapped[datetime | None] = mapped_column(DateTime)
 
 
+class LandingPageCheck(Base):
+    """A recorded audit of a destination page.
+
+    Stored rather than computed on demand because a landing page is not static.
+    An affiliate network can swap the page after the ad is approved, and the
+    content hash is what turns that into something detectable instead of a
+    surprise enforcement email.
+    """
+
+    __tablename__ = "landing_page_checks"
+    __table_args__ = (Index("ix_lp_url_checked", "url", "checked_at"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    offer_id: Mapped[int | None] = mapped_column(ForeignKey("offers.id"), index=True)
+    creative_id: Mapped[int | None] = mapped_column(ForeignKey("creatives.id"))
+
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    final_url: Mapped[str | None] = mapped_column(Text)
+    status_code: Mapped[int] = mapped_column(Integer, default=0)
+    redirect_hops: Mapped[int] = mapped_column(Integer, default=0)
+
+    verdict: Mapped[ComplianceVerdict] = mapped_column(
+        Enum(ComplianceVerdict), default=ComplianceVerdict.UNREVIEWED
+    )
+    score: Mapped[float] = mapped_column(Float, default=0.0)
+    content_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    # Set when this check found different content than the previous one.
+    content_changed: Mapped[bool] = mapped_column(Boolean, default=False)
+    report: Mapped[dict] = mapped_column(JSON, default=dict)
+    checked_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+
+
 class MediaAsset(Base):
     """An image or video generated for a creative.
 
