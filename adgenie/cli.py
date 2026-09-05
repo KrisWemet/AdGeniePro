@@ -24,7 +24,7 @@ from .core.metrics import default_window, load_performance
 from .core.orchestrator import Orchestrator
 from .db import init_db, session_scope
 from .models import Campaign, Creative, EntityLevel, Offer, PayoutType, Platform
-from .money import fmt_usd, usd_to_micros
+from .money import fmt_usd, micros_to_usd, usd_to_micros
 
 
 def cmd_init(args) -> int:
@@ -346,6 +346,61 @@ def cmd_segments(args) -> int:
     return 0
 
 
+def cmd_portfolio(args) -> int:
+    init_db()
+    from .config import get_settings
+    from .core.orchestrator import Orchestrator
+    from .core.portfolio import PortfolioAllocator
+
+    since, until = default_window(args.days)
+    with session_scope() as session:
+        settings = get_settings()
+        allocator = PortfolioAllocator(session, settings=settings)
+        total = (
+            usd_to_micros(args.budget)
+            if args.budget
+            else allocator.total_budget_micros()
+        )
+        plan = allocator.plan(since, until, total_micros=total)
+
+        print(f"\nDaily budget ${micros_to_usd(plan.total_micros):,.2f}"
+              f"  ({since} to {until})")
+        header = (
+            f"  {'offer':<28}{'verdict':>9}{'now':>10}{'target':>10}"
+            f"{'roas':>16}{'p(best)':>9}"
+        )
+        print(header)
+        print("  " + "-" * (len(header) - 2))
+        for entry in plan.allocations:
+            roas = (
+                f"{entry.roas_lower:.2f}-{entry.roas_upper:.2f}"
+                if entry.roas_upper
+                else "-"
+            )
+            print(
+                f"  {entry.name[:27]:<28}{entry.verdict:>9}"
+                f"{micros_to_usd(entry.current_micros):>10.2f}"
+                f"{micros_to_usd(entry.target_micros):>10.2f}"
+                f"{roas:>16}{entry.prob_best:>9.0%}"
+            )
+        for entry in plan.allocations:
+            if entry.reason and entry.verdict != "fund":
+                print(f"\n  {entry.name[:60]}\n    {entry.reason}")
+        for note in plan.notes:
+            print(f"\n  {note}")
+
+        if args.apply:
+            result = allocator.apply(plan, orchestrator=Orchestrator(session))
+            verb = "Applied" if result["applied"] else "Would apply (dry run)"
+            print(f"\n  {verb} {len(result['changes'])} budget change(s).")
+            for change in result["changes"]:
+                print(
+                    f"    campaign {change['campaign_id']}: "
+                    f"${change['from_usd']:,.2f} -> ${change['to_usd']:,.2f}"
+                )
+    return 0
+
+
 def cmd_report(args) -> int:
     init_db()
     since, until = default_window(args.days)
@@ -631,6 +686,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     segments.add_argument("--days", type=int, default=14)
     segments.set_defaults(func=cmd_segments)
+
+    portfolio = sub.add_parser(
+        "portfolio", help="split the daily budget across offers"
+    )
+    portfolio.add_argument("--days", type=int, default=14)
+    portfolio.add_argument(
+        "--budget", type=float, default=None,
+        help="daily total to allocate; defaults to the global cap",
+    )
+    portfolio.add_argument(
+        "--apply", action="store_true", help="push the targets to the campaigns"
+    )
+    portfolio.set_defaults(func=cmd_portfolio)
 
     report = sub.add_parser("report", help="performance by creative")
     report.add_argument("--days", type=int, default=7)

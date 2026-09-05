@@ -253,6 +253,11 @@ def run(
             "global_daily_budget_cap_usd": max(
                 base.global_daily_budget_cap_usd, budget * 20
             ),
+            # The demo's offer is fictional and its destination does not
+            # resolve, by design: this runs with no network at all. Auditing
+            # it would correctly refuse to launch and the demo would show
+            # nothing. The auditor has its own tests.
+            "audit_landing_pages": False,
         }
     )
     reset_sandboxes()
@@ -280,6 +285,13 @@ def run(
         start_paused=False,
     )
     result = launcher.launch(plan)
+    if not result.ok:
+        # campaign_id 0 is the sentinel for a launch that never happened.
+        # Printing it as though something launched sends the reader looking
+        # for delivery data that was never going to exist.
+        raise RuntimeError(
+            "the demo could not launch: " + "; ".join(result.errors or ["unknown"])
+        )
     if verbose:
         print(f"Launched campaign {result.campaign_id}: "
               f"{len(result.creative_ids)} creatives live, "

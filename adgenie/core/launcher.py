@@ -98,6 +98,16 @@ class LaunchResult:
     errors: list[str] = field(default_factory=list)
     dry_run: bool = True
 
+    @property
+    def ok(self) -> bool:
+        """Whether a campaign was actually created.
+
+        A refused launch returns campaign_id 0 rather than raising, so the
+        caller can see why. Reading the result without checking this is how a
+        refusal gets reported as a successful launch of nothing.
+        """
+        return self.campaign_id > 0
+
     def as_dict(self) -> dict:
         return {
             "campaign_id": self.campaign_id,
@@ -113,6 +123,7 @@ class LaunchResult:
             "warnings": self.warnings,
             "errors": self.errors,
             "dry_run": self.dry_run,
+            "ok": self.ok,
         }
 
 

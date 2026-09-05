@@ -190,6 +190,49 @@ def rebalance_campaign(
     )
 
 
+@router.get("/optimizer/portfolio")
+def portfolio_plan(
+    days: int = Query(default=14, ge=1, le=90),
+    budget_usd: float | None = Query(default=None, gt=0),
+    session: Session = Depends(get_session),
+) -> dict:
+    """How the daily budget should divide across offers.
+
+    The rebalance endpoints optimize inside one campaign. This one decides
+    which offers deserve the money at all, which is the larger half of the
+    problem and the one nothing else here answers.
+    """
+    from ..core.portfolio import PortfolioAllocator
+
+    since, until = default_window(days)
+    allocator = PortfolioAllocator(session, settings=get_settings())
+    total = int(budget_usd * 1_000_000) if budget_usd else None
+    return allocator.plan(since, until, total_micros=total).as_dict()
+
+
+@router.post("/optimizer/portfolio/apply")
+def apply_portfolio_plan(
+    days: int = Query(default=14, ge=1, le=90),
+    budget_usd: float | None = Query(default=None, gt=0),
+    session: Session = Depends(get_session),
+) -> dict:
+    """Push a fresh portfolio plan onto the campaigns.
+
+    Honours DRY_RUN, and says in the response whether it acted.
+    """
+    from ..core.portfolio import PortfolioAllocator
+
+    since, until = default_window(days)
+    settings = get_settings()
+    allocator = PortfolioAllocator(session, settings=settings)
+    total = int(budget_usd * 1_000_000) if budget_usd else None
+    plan = allocator.plan(since, until, total_micros=total)
+    result = allocator.apply(
+        plan, orchestrator=Orchestrator(session, settings=settings)
+    )
+    return {**plan.as_dict(), "apply": result}
+
+
 @router.get("/optimizer/segments/{ad_group_id}")
 def segment_report(
     ad_group_id: int,

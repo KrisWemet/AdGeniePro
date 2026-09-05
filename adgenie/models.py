@@ -128,6 +128,11 @@ class FunnelStepKind(str, enum.Enum):
 
 
 class EntityLevel(str, enum.Enum):
+    # OFFER sits above the platform hierarchy: the platforms have no such
+    # object, and no metric snapshot is ever written at this level. It exists
+    # because budget is allocated across offers, and a window aggregated over
+    # an offer's campaigns should be able to say honestly what it is.
+    OFFER = "offer"
     CAMPAIGN = "campaign"
     AD_GROUP = "ad_group"
     CREATIVE = "creative"

@@ -27,6 +27,7 @@ from ..models import (
     ConversionStatus,
     Creative,
     EntityLevel,
+    EntityStatus,
     Lead,
     MetricSnapshot,
     Offer,
@@ -291,6 +292,28 @@ class PerformanceWindow:
             level=interval.level,
         )
 
+    def pipeline_roas_interval(self, level: float | None = None) -> Interval:
+        """The ROAS interval with lead value counted in.
+
+        Judging a lead-magnet campaign on `roas_interval` alone reads the
+        money sitting in the list as zero, and an offer whose leads are worth
+        most of what the spend bought looks like a confident loser. The lead
+        term is added as a constant rather than sampled: its uncertainty is
+        already priced in by `lead_value_per_lead_micros` being the *lower*
+        bound of the fitted value, so widening the interval again here would
+        be discounting it twice.
+        """
+        interval = self.roas_interval(level)
+        if not self.spend_micros or not self.outstanding_lead_value_micros:
+            return interval
+        shift = self.outstanding_lead_value_micros / self.spend_micros
+        return Interval(
+            lower=interval.lower + shift,
+            mean=interval.mean + shift,
+            upper=interval.upper + shift,
+            level=interval.level,
+        )
+
     # -- serialization ---------------------------------------------------
     def as_dict(self) -> dict:
         roas_ci = self.roas_interval()
@@ -346,18 +369,21 @@ class PerformanceWindow:
 # --------------------------------------------------------------------------
 
 _CONVERSION_FK = {
+    EntityLevel.OFFER: Conversion.offer_id,
     EntityLevel.CAMPAIGN: Conversion.campaign_id,
     EntityLevel.AD_GROUP: Conversion.ad_group_id,
     EntityLevel.CREATIVE: Conversion.creative_id,
 }
 
 _LEAD_FK = {
+    EntityLevel.OFFER: Lead.offer_id,
     EntityLevel.CAMPAIGN: Lead.campaign_id,
     EntityLevel.AD_GROUP: Lead.ad_group_id,
     EntityLevel.CREATIVE: Lead.creative_id,
 }
 
 _CLICK_FK = {
+    EntityLevel.OFFER: Click.offer_id,
     EntityLevel.CAMPAIGN: Click.campaign_id,
     EntityLevel.AD_GROUP: Click.ad_group_id,
     EntityLevel.CREATIVE: Click.creative_id,
@@ -375,6 +401,15 @@ def _descendant_creative_ids(
                 select(Creative.id).where(Creative.ad_group_id == entity_id)
             ).scalars()
         )
+    if level is EntityLevel.OFFER:
+        return list(
+            session.execute(
+                select(Creative.id)
+                .join(AdGroup, Creative.ad_group_id == AdGroup.id)
+                .join(Campaign, AdGroup.campaign_id == Campaign.id)
+                .where(Campaign.offer_id == entity_id)
+            ).scalars()
+        )
     return list(
         session.execute(
             select(Creative.id)
@@ -385,6 +420,8 @@ def _descendant_creative_ids(
 
 
 def _offer_for(session: Session, level: EntityLevel, entity_id: int) -> Offer | None:
+    if level is EntityLevel.OFFER:
+        return session.get(Offer, entity_id)
     campaign_id: int | None = None
     if level is EntityLevel.CAMPAIGN:
         campaign_id = entity_id
@@ -400,6 +437,16 @@ def _offer_for(session: Session, level: EntityLevel, entity_id: int) -> Offer | 
 
 
 def _budget_for(session: Session, level: EntityLevel, entity_id: int) -> int:
+    if level is EntityLevel.OFFER:
+        # What the offer's live campaigns commit between them.
+        return sum(
+            session.execute(
+                select(Campaign.daily_budget_micros).where(
+                    Campaign.offer_id == entity_id,
+                    Campaign.status == EntityStatus.ACTIVE,
+                )
+            ).scalars()
+        )
     if level is EntityLevel.CAMPAIGN:
         campaign = session.get(Campaign, entity_id)
         return campaign.daily_budget_micros if campaign else 0
@@ -413,6 +460,69 @@ def _budget_for(session: Session, level: EntityLevel, entity_id: int) -> int:
         return campaign.daily_budget_micros if campaign else 0
     creative = session.get(Creative, entity_id)
     return _budget_for(session, EntityLevel.AD_GROUP, creative.ad_group_id) if creative else 0
+
+
+@dataclass
+class _DayRow:
+    """One day of delivery, whatever level it was aggregated from."""
+
+    day: date
+    impressions: int = 0
+    clicks: int = 0
+    spend_micros: int = 0
+    platform_conversions: float = 0.0
+    platform_conversion_value_micros: int = 0
+    frequency: float = 0.0
+
+
+def _daily_delivery(
+    session: Session, level: EntityLevel, entity_id: int, since: date, until: date
+) -> list[_DayRow]:
+    """Delivery per day for one entity.
+
+    The platforms have no offer object, so no snapshot is ever written at that
+    level. An offer's delivery is its campaigns' delivery summed *per day* —
+    not concatenated. Concatenating would put several rows on the same date
+    and hand the lag model a day it thinks it has seen more than once, which
+    quietly distorts the maturity of everything downstream.
+    """
+    if level is EntityLevel.OFFER:
+        query = (
+            select(MetricSnapshot)
+            .join(Campaign, MetricSnapshot.entity_id == Campaign.id)
+            .where(
+                MetricSnapshot.level == EntityLevel.CAMPAIGN,
+                Campaign.offer_id == entity_id,
+                MetricSnapshot.day >= since,
+                MetricSnapshot.day <= until,
+            )
+            .order_by(MetricSnapshot.day)
+        )
+    else:
+        query = (
+            select(MetricSnapshot)
+            .where(
+                MetricSnapshot.level == level,
+                MetricSnapshot.entity_id == entity_id,
+                MetricSnapshot.day >= since,
+                MetricSnapshot.day <= until,
+            )
+            .order_by(MetricSnapshot.day)
+        )
+
+    by_day: dict[date, _DayRow] = {}
+    for row in session.execute(query).scalars():
+        day = by_day.setdefault(row.day, _DayRow(day=row.day))
+        day.impressions += row.impressions
+        day.clicks += row.clicks
+        day.spend_micros += row.spend_micros
+        day.platform_conversions += row.platform_conversions
+        day.platform_conversion_value_micros += row.platform_conversion_value_micros
+        # Frequency is impressions per person, so it does not add up across
+        # campaigns that reached different people. The highest one is the
+        # honest read of whether any audience is saturated.
+        day.frequency = max(day.frequency, row.frequency)
+    return [by_day[day] for day in sorted(by_day)]
 
 
 def load_performance(
@@ -440,19 +550,7 @@ def load_performance(
         credible_level=credible_level,
     )
 
-    rows = list(
-        session.execute(
-            select(MetricSnapshot)
-            .where(
-                MetricSnapshot.level == level,
-                MetricSnapshot.entity_id == entity_id,
-                MetricSnapshot.day >= since,
-                MetricSnapshot.day <= until,
-            )
-            .order_by(MetricSnapshot.day)
-        ).scalars()
-    )
-    for row in rows:
+    for row in _daily_delivery(session, level, entity_id, since, until):
         window.impressions += row.impressions
         window.clicks += row.clicks
         window.spend_micros += row.spend_micros

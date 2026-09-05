@@ -707,6 +707,13 @@ class Orchestrator:
     def _platform_of(self, level: EntityLevel, entity) -> Platform:
         if level is EntityLevel.CAMPAIGN:
             return entity.platform
+        if level is EntityLevel.OFFER:
+            # An offer can run on both platforms at once, so there is no single
+            # answer. Anything acting on an offer has to act on its campaigns.
+            raise PlatformError(
+                "an offer has no single platform; act on its campaigns",
+                code="INVALID_LEVEL",
+            )
         if level is EntityLevel.AD_GROUP:
             campaign = self.session.get(Campaign, entity.campaign_id)
         else:

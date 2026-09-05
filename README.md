@@ -154,6 +154,7 @@ python -m adgenie.cli sync              # pull delivery from the platforms
 python -m adgenie.cli optimize          # propose changes, change nothing
 python -m adgenie.cli optimize --apply  # act (requires DRY_RUN=false)
 python -m adgenie.cli report            # performance by creative
+python -m adgenie.cli portfolio         # split the budget across offers
 ```
 
 ### 7. Or run the server
@@ -484,6 +485,78 @@ rejected at apply time. Age, gender and region are reported but never
 auto-excluded: those are targeting changes with consequences a human should
 weigh.
 
+### Which offers deserve the money
+
+Everything above optimizes *within* an offer: which creative, which ad set,
+which placement. That is the smaller half of the problem. Accounts usually
+fail because most of the daily budget sat on an offer that was never going to
+pay while the one that would have paid was starved into statistical silence.
+
+```bash
+python -m adgenie.cli portfolio --days 14           # what it would do
+python -m adgenie.cli portfolio --days 14 --apply   # do it
+```
+
+```
+  offer                         verdict       now    target            roas  p(best)
+  ----------------------------------------------------------------------------------
+  CalmLeaf Sleep Support           fund     98.43    147.64       1.83-2.71     100%
+```
+
+It differs from the creative-level split in four ways that each cost money if
+you get them wrong.
+
+**Return per dollar, not per click.** Ranking by revenue per click is only
+correct when clicks cost the same everywhere, and across offers they never do.
+An offer converting at 3% on $2.00 clicks loses money; one converting at 1% on
+$0.40 clicks makes it. A per-click ranking picks the loser.
+
+**A loser gets zero, not a floor.** The creative-level allocator gives every
+candidate a minimum share so exploration never stops, which is right for
+creatives inside an offer that already works. Across offers it is a permanent
+leak. An offer whose *upper* credible bound is below breakeven is not
+uncertain, and funding it forever is a subscription, not a test. An offer that
+is merely losing the ranking keeps its floor — that is a different thing, and
+pausing a working second earner over a ranking throws away an asset.
+
+**Exploration is concentrated, not spread.** Funding eight untested offers at
+$5/day buys eight windows too small to conclude anything from; a month later
+there are still eight unproven offers and the money is gone. An unproven
+offer's budget is sized from what a verdict actually costs — enough clicks
+that five conversions would be expected at its own breakeven rate — and only
+as many offers run as can be funded at that level. A useful thing falls out of
+the arithmetic: at breakeven you spend the payout per conversion, so **deciding
+an offer costs about five times its payout regardless of what its clicks
+cost.** Cheap traffic makes a test slower, not cheaper.
+
+**No offer holds more than 40% of the portfolio.** This one is not statistical.
+Affiliate offers get pulled, capped, or have their payout cut overnight by
+someone who does not tell you first, and a portfolio with 90% on one offer goes
+to zero revenue that morning. The cap relaxes when there is nowhere else for
+the money to go: with a single live offer, holding back 60% of the budget does
+not diversify anything, it just leaves money earning nothing. It can never bind
+harder than an even split, so it starts to bite exactly when diversification
+becomes possible.
+
+Budgets glide rather than jump — at most 50% a day in either direction — because
+a large change re-enters the platform learning phase, and a better allocation
+reached in one leap can deliver worse than the one it replaced. The exception
+is an offer being retired: a learning phase only costs you if you intend to
+keep spending. Where the glide and the daily cap collide, the glide gives way.
+
+An offer with plenty of traffic but an unfinished conversion window is
+**held at its current budget**, not re-sized. Its numbers are incomplete, not
+bad, and treating them as bad is the censoring mistake the lag model exists to
+prevent. The hold sits after the retire test, not before: an offer losing money
+even on the optimistic reading of partial data is not waiting for good news.
+Exploration is likewise capped at 30% of the portfolio — testing is how
+tomorrow's winner is found, but not at today's expense.
+
+A funnel offer is judged on its pipeline, not on completed sales. Otherwise a
+lead magnet with most of its value still sitting in the list reads as a
+confident loser and gets retired on day one — the exact failure the lead-value
+model exists to prevent.
+
 ### Conversion lag
 
 A click does not convert instantly. A third convert in-session, most within a
@@ -580,6 +653,8 @@ whenever the dashboard is served from a known origin.
 | `GET /api/optimizer/segments/{ad_group_id}` | Where an ad group's budget actually goes |
 | `GET /api/optimizer/rebalance/{ad_group_id}` | Advisory split across creatives |
 | `GET /api/optimizer/rebalance-campaign/{id}` | Applicable split across ad groups |
+| `GET /api/optimizer/portfolio` | How the daily budget should divide across offers |
+| `POST /api/optimizer/portfolio/apply` | Push that split onto the campaigns |
 | `POST /api/optimizer/push-conversions` | Send sales back to the platforms |
 | `POST /api/landing/audit` | Audit a destination the way the platforms will |
 | `POST /api/landing/sweep` | Re-check every live destination |
@@ -619,6 +694,7 @@ adgenie/
     tracking.py      click tracking and conversion attribution
     metrics.py       joins platform delivery with network revenue
     optimizer.py     the decision rules
+    portfolio.py     which offers deserve the budget at all
     launcher.py      offer to structured test
     orchestrator.py  the control loop
   platforms/
