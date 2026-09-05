@@ -297,6 +297,9 @@ Evaluated in order; the first match wins.
 | `cooldown` | Acted on this entity within the cooldown window | Hold |
 | `learning` | Not enough spend or clicks to say anything | Hold |
 | `awaiting_conversions` | Too little of the conversion window has elapsed | Hold |
+| `funnel_learning` | Too few leads to price against their value | Hold |
+| `funnel_unprofitable` | Leads cost more than they are conservatively worth | Pause |
+| `funnel_scale` | Leads are cheap even on the pessimistic value | Raise budget |
 | `zero_conversion_kill` | Lifetime spend past N× payout, no conversions, and breakeven is implausible | Pause |
 | `unprofitable_kill` | ROAS and its upper credible bound both below breakeven | Pause |
 | `scale_winner` | ROAS above target **and** the lower bound clears breakeven | Raise budget |
@@ -311,6 +314,53 @@ individual ad, so at creative level a winner is held (its gain is realised by
 funding the parent ad set and by the budget split across its siblings) and the
 usable actions are pause, resume and creative refresh. Budget changes apply to
 ad sets and campaigns.
+
+### Funnels and lead value
+
+Sending traffic straight to an affiliate page monetises a click once. A lead
+magnet monetises it repeatedly — and gives you a destination you control, which
+is the single biggest reduction in ban risk available, since Meta reviews the
+page, not just the ad.
+
+The catch is measurement. Take 1,000 clicks at $0.80:
+
+| | Direct | Through a funnel |
+|---|---|---|
+| Day one | 2% × $40 = **$800** | 30% opt in, 5% tripwire = **$255** |
+| Over a month | — | ~8% of 300 leads take the offer = **$960** |
+| You keep | nothing | 300 leads, promotable for months |
+
+The funnel earns more from the same traffic, but on day one it looks like a
+0.32 return. An optimizer reading realised revenue kills the campaign that was
+working — the same censoring problem as conversion lag, an order of magnitude
+worse.
+
+So a funnel campaign is judged on **pipeline value**: realised revenue plus the
+conservative worth of the leads it bought. That worth is measured, not assumed:
+
+- Only cohorts older than a week count toward it, since a lead captured
+  yesterday has not finished earning and averaging it in understates every
+  lead. Younger cohorts are projected up their maturity curve instead.
+- The estimate is shrunk toward the funnel's own economics while the sample is
+  thin, so five lucky leads cannot carry a large number. With no prior supplied
+  the sample stands on its own — shrinking toward an unstated zero would bias
+  the optimizer toward killing every funnel.
+- Lead value is heavily skewed, so the interval is built to respect a long
+  right tail rather than assuming symmetry.
+- **Spending decisions use the lower bound**, never the mean. A list scaled on
+  an optimistic lead value is a list funded by a forecast.
+
+```bash
+python -m adgenie.cli funnel --offer 1 \
+  --step optin:optin --step tripwire:tripwire:17 --step core:core:40
+```
+
+Only a salted hash of each address is stored. The address belongs in your email
+platform; an ad optimizer needs only to tell one lead from another.
+
+A note on tripwires: their job is not profit, it is to make the list
+self-funding. If a tripwire covers ad spend, your leads are free and everything
+after is margin — so judging one on its own ROAS misreads what it is for.
 
 ### Segment analysis
 
@@ -443,6 +493,11 @@ whenever the dashboard is served from a known origin.
 | `POST /api/optimizer/run` | Evaluate and decide |
 | `GET /api/optimizer/actions` | Review proposals |
 | `POST /api/optimizer/actions/{id}/approve` | Approve a held proposal |
+| `PUT /api/offers/{offer_id}/funnel` | Define the steps between click and money |
+| `GET /api/offers/{offer_id}/lead-value` | What this offer's leads have been worth |
+| `POST /api/funnel/optin` | Record a lead (authenticated) |
+| `POST /api/funnel/event` | Record a completed funnel step (authenticated) |
+| `GET /api/funnel/leads` | Leads and their attribution |
 | `GET /api/optimizer/segments/{ad_group_id}` | Where an ad group's budget actually goes |
 | `GET /api/optimizer/rebalance/{ad_group_id}` | Advisory split across creatives |
 | `GET /api/optimizer/rebalance-campaign/{id}` | Applicable split across ad groups |
@@ -473,6 +528,7 @@ adgenie/
     stats.py         Beta-Binomial helpers, no numpy or scipy
     lag.py           conversion delay curves and maturity weighting
     segments.py      placement and audience waste detection
+    ltv.py           what a lead is worth before you know what it was worth
     compliance.py    Meta and Google policy engine
     angles.py        the angle library
     copywriter.py    Claude generation + template fallback + repair loop
@@ -502,7 +558,7 @@ adgenie/
   static/            dashboard
   cli.py             command line
   demo.py            end-to-end simulation
-tests/               480 tests
+tests/               511 tests
 legacy/              the original prototype scripts, kept for reference
 ```
 

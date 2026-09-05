@@ -27,6 +27,7 @@ from ..models import (
     ConversionStatus,
     Creative,
     EntityLevel,
+    Lead,
     MetricSnapshot,
     Offer,
 )
@@ -75,6 +76,12 @@ class PerformanceWindow:
     maturity: float = 1.0
     effective_clicks: float = 0.0
     lag_median_hours: float | None = None
+    # Funnel: leads earned, and what they are conservatively worth. Kept apart
+    # from realised revenue because one is money received and the other is a
+    # forecast, and conflating them is how a list gets scaled before it pays.
+    leads: int = 0
+    lead_value_micros: int = 0
+    lead_value_per_lead_micros: int = 0
     daily: list[dict] = field(default_factory=list)
 
     # -- rates -----------------------------------------------------------
@@ -138,7 +145,30 @@ class PerformanceWindow:
 
     @property
     def roas(self) -> float:
+        """Realised revenue over spend. Money received, nothing forecast."""
         return safe_div(self.revenue_micros, self.spend_micros)
+
+    @property
+    def pipeline_revenue_micros(self) -> int:
+        """Realised revenue plus the conservative value of leads earned.
+
+        For a funnel this is the number that reflects what the spend bought.
+        Judging a lead-generation campaign on realised revenue alone reports a
+        near-zero return on day one and retires the campaign that was working.
+        """
+        return self.revenue_micros + self.lead_value_micros
+
+    @property
+    def pipeline_roas(self) -> float:
+        return safe_div(self.pipeline_revenue_micros, self.spend_micros)
+
+    @property
+    def cost_per_lead_micros(self) -> float:
+        return safe_div(self.spend_micros, self.leads)
+
+    @property
+    def has_funnel_value(self) -> bool:
+        return self.leads > 0 and self.lead_value_per_lead_micros > 0
 
     @property
     def profit_micros(self) -> int:
@@ -267,6 +297,11 @@ class PerformanceWindow:
             "cpa_usd": round(micros_to_usd(int(self.cpa_micros)), 2),
             "epc_usd": round(micros_to_usd(int(self.epc_micros)), 4),
             "roas": round(self.roas, 4),
+            "leads": self.leads,
+            "cost_per_lead_usd": round(micros_to_usd(int(self.cost_per_lead_micros)), 2),
+            "lead_value_usd": micros_to_usd(self.lead_value_micros),
+            "value_per_lead_usd": micros_to_usd(self.lead_value_per_lead_micros),
+            "pipeline_roas": round(self.pipeline_roas, 4),
             "roas_lower": round(roas_ci.lower, 4),
             "roas_upper": round(roas_ci.upper, 4),
             "breakeven_cvr": round(self.breakeven_cvr, 5),
@@ -294,6 +329,12 @@ _CONVERSION_FK = {
     EntityLevel.CAMPAIGN: Conversion.campaign_id,
     EntityLevel.AD_GROUP: Conversion.ad_group_id,
     EntityLevel.CREATIVE: Conversion.creative_id,
+}
+
+_LEAD_FK = {
+    EntityLevel.CAMPAIGN: Lead.campaign_id,
+    EntityLevel.AD_GROUP: Lead.ad_group_id,
+    EntityLevel.CREATIVE: Lead.creative_id,
 }
 
 _CLICK_FK = {
@@ -364,6 +405,7 @@ def load_performance(
     count_pending_as_revenue: bool = False,
     lag_model: LagModel | None = None,
     as_of: datetime | None = None,
+    lead_value: "LeadValueModel | None" = None,
 ) -> PerformanceWindow:
     """Aggregate delivery and revenue for one entity over a date window.
 
@@ -436,9 +478,31 @@ def load_performance(
         elif status is ConversionStatus.REVERSED:
             window.reversed_conversions += count
 
+    # Leads earned in the window, and what they are conservatively worth.
+    lead_fk = _LEAD_FK[level]
+    window.leads = int(
+        session.execute(
+            select(func.count(Lead.id)).where(
+                lead_fk == entity_id,
+                Lead.created_at >= start_dt.replace(tzinfo=None),
+                Lead.created_at <= end_dt.replace(tzinfo=None),
+            )
+        ).scalar_one()
+        or 0
+    )
+
     offer = _offer_for(session, level, entity_id)
     if offer is not None:
         window.offer_payout_micros = offer.expected_value_micros()
+        if window.leads and offer.has_funnel:
+            if lead_value is None:
+                from .ltv import fit_lead_value, offer_prior_micros
+
+                lead_value = fit_lead_value(
+                    session, offer.id, prior_micros=offer_prior_micros(session, offer.id)
+                )
+            window.lead_value_per_lead_micros = lead_value.lower_micros
+            window.lead_value_micros = lead_value.value_of(window.leads)
     window.daily_budget_micros = _budget_for(session, level, entity_id)
 
     # Discount recent clicks by how little of their conversion window has run.

@@ -117,6 +117,16 @@ class MediaStatus(str, enum.Enum):
     REJECTED = "rejected"  # blocked by the image policy pre-screen
 
 
+class FunnelStepKind(str, enum.Enum):
+    """What a step does, which decides how its value is counted."""
+
+    OPTIN = "optin"  # captures a lead; no revenue of its own
+    TRIPWIRE = "tripwire"  # low-ticket sale, usually to cover ad spend
+    CORE = "core"  # the main affiliate offer or product
+    UPSELL = "upsell"  # after the core sale
+    OTHER = "other"
+
+
 class EntityLevel(str, enum.Enum):
     CAMPAIGN = "campaign"
     AD_GROUP = "ad_group"
@@ -161,6 +171,10 @@ class Offer(Base):
     proof_points: Mapped[list] = mapped_column(JSON, default=list)
     landing_page_copy: Mapped[str] = mapped_column(Text, default="")
 
+    # How long a lead keeps producing revenue. Beyond this the optimizer stops
+    # crediting a creative for leads it earned.
+    lead_value_horizon_days: Mapped[int] = mapped_column(Integer, default=60)
+
     # Compliance context.
     geo_targets: Mapped[list] = mapped_column(JSON, default=lambda: ["US"])
     banned_claims: Mapped[list] = mapped_column(JSON, default=list)
@@ -178,6 +192,13 @@ class Offer(Base):
     campaigns: Mapped[list["Campaign"]] = relationship(
         back_populates="offer", cascade="all, delete-orphan"
     )
+    funnel_steps: Mapped[list["FunnelStep"]] = relationship(
+        cascade="all, delete-orphan", order_by="FunnelStep.position"
+    )
+
+    @property
+    def has_funnel(self) -> bool:
+        return any(step.is_active for step in self.funnel_steps)
 
     def expected_value_micros(self) -> int:
         """Net expected revenue per approved conversion after reversals."""
@@ -405,6 +426,9 @@ class Conversion(Base):
         Enum(ConversionStatus), default=ConversionStatus.PENDING
     )
     event_name: Mapped[str] = mapped_column(String(80), default="sale")
+    # Which funnel step produced this, when the offer runs one.
+    step_key: Mapped[str | None] = mapped_column(String(60), index=True)
+    lead_id: Mapped[int | None] = mapped_column(ForeignKey("leads.id"), index=True)
     # Whether this conversion has been echoed back to Meta CAPI / Google offline.
     uploaded_to_platform: Mapped[bool] = mapped_column(Boolean, default=False)
     raw: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -458,6 +482,75 @@ class OptimizerRun(Base):
     actions_applied: Mapped[int] = mapped_column(Integer, default=0)
     summary: Mapped[dict] = mapped_column(JSON, default=dict)
     error: Mapped[str | None] = mapped_column(Text)
+
+
+class FunnelStep(Base):
+    """One stage between the ad click and the money.
+
+    Sending traffic straight to an affiliate page monetises a click once. A
+    funnel monetises it repeatedly, but moves most of the revenue weeks into
+    the future, which is why every step's value has to be tracked separately
+    rather than collapsed into one conversion event.
+    """
+
+    __tablename__ = "funnel_steps"
+    __table_args__ = (UniqueConstraint("offer_id", "key", name="uq_funnel_step"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    offer_id: Mapped[int] = mapped_column(ForeignKey("offers.id"), index=True)
+    key: Mapped[str] = mapped_column(String(60), nullable=False)
+    name: Mapped[str] = mapped_column(String(160), default="")
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    kind: Mapped[FunnelStepKind] = mapped_column(
+        Enum(FunnelStepKind), default=FunnelStepKind.OTHER
+    )
+
+    # What one completion of this step is worth to you, net.
+    value_micros: Mapped[int] = mapped_column(BigInteger, default=0)
+    # Where the visitor goes at this step, if this platform hosts it.
+    url: Mapped[str | None] = mapped_column(Text)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    @property
+    def captures_lead(self) -> bool:
+        return self.kind is FunnelStepKind.OPTIN
+
+
+class Lead(Base):
+    """Someone who gave you their address, and the click that earned them.
+
+    A lead is an asset with a value that is unknown on the day it is created
+    and only becomes clear over weeks. `ltv.py` estimates that value so the
+    optimizer can price a lead instead of waiting a month to learn what it
+    was worth.
+    """
+
+    __tablename__ = "leads"
+    __table_args__ = (
+        UniqueConstraint("offer_id", "email_hash", name="uq_lead_email"),
+        Index("ix_lead_creative_created", "creative_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    offer_id: Mapped[int | None] = mapped_column(ForeignKey("offers.id"), index=True)
+    click_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    campaign_id: Mapped[int | None] = mapped_column(ForeignKey("campaigns.id"))
+    ad_group_id: Mapped[int | None] = mapped_column(ForeignKey("ad_groups.id"))
+    creative_id: Mapped[int | None] = mapped_column(
+        ForeignKey("creatives.id"), index=True
+    )
+
+    # Only a hash is stored. The address itself belongs in the email platform,
+    # not in an ad optimizer's database.
+    email_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_step: Mapped[str] = mapped_column(String(60), default="optin")
+    # Revenue this lead has actually produced so far, across every step.
+    realised_value_micros: Mapped[int] = mapped_column(BigInteger, default=0)
+    is_unsubscribed: Mapped[bool] = mapped_column(Boolean, default=False)
+    extra: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    last_value_at: Mapped[datetime | None] = mapped_column(DateTime)
 
 
 class MediaAsset(Base):

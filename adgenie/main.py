@@ -19,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from . import __version__
 from .api import (
     routes_campaigns,
+    routes_funnel,
     routes_offers,
     routes_optimizer,
     routes_research,
@@ -130,6 +131,7 @@ app.include_router(routes_offers.router, prefix="/api", dependencies=_guard)
 app.include_router(routes_campaigns.router, prefix="/api", dependencies=_guard)
 app.include_router(routes_optimizer.router, prefix="/api", dependencies=_guard)
 app.include_router(routes_research.router, prefix="/api", dependencies=_guard)
+app.include_router(routes_funnel.router, prefix="/api", dependencies=_guard)
 app.include_router(routes_tracking.router)
 
 

@@ -37,12 +37,17 @@ from ..models import (
     Conversion,
     ConversionStatus,
     Creative,
+    FunnelStep,
+    Lead,
     Offer,
     Platform,
 )
 
 __all__ = [
     "TrackingContext",
+    "hash_email",
+    "record_lead",
+    "record_funnel_event",
     "new_click_id",
     "encode_subid",
     "decode_subid",
@@ -409,6 +414,144 @@ def attribution_window_ok(
     if occurred_at.tzinfo is None:
         occurred_at = occurred_at.replace(tzinfo=timezone.utc)
     return created <= occurred_at + timedelta(minutes=5) <= created + timedelta(days=days)
+
+
+def hash_email(email: str, salt: str | None = None) -> str:
+    """Identify a lead without storing their address.
+
+    The address belongs in the email platform. An ad optimizer needs only to
+    tell one lead from another, which a salted hash does, and holding less
+    means a breach here leaks nothing worth having.
+    """
+    salt = salt or get_settings().secret_key
+    normalised = (email or "").strip().lower()
+    return hashlib.sha256(f"{salt}:{normalised}".encode()).hexdigest()
+
+
+def record_lead(
+    session: Session,
+    *,
+    offer_id: int,
+    email: str | None = None,
+    email_hash: str | None = None,
+    click_id: str | None = None,
+    subid: str | None = None,
+    source_step: str = "optin",
+    extra: dict | None = None,
+    attribution_days: int = DEFAULT_ATTRIBUTION_DAYS,
+) -> tuple["Lead", str]:
+    """Attribute an opt-in back to the ad that earned it.
+
+    Returns the lead and how it was matched, so the share of unattributed
+    leads stays visible rather than being quietly absorbed.
+    """
+    if not (email or email_hash):
+        raise ValueError("record_lead needs an email or an email_hash")
+    digest = email_hash or hash_email(email or "")
+
+    existing = session.execute(
+        select(Lead).where(Lead.offer_id == offer_id, Lead.email_hash == digest)
+    ).scalar_one_or_none()
+    if existing is not None:
+        # The same person opting in twice is one lead, not two.
+        return existing, "duplicate"
+
+    click: Click | None = None
+    method = "unmatched"
+    if click_id:
+        click = session.execute(
+            select(Click).where(Click.click_id == click_id)
+        ).scalar_one_or_none()
+        if click is not None:
+            if attribution_window_ok(click, datetime.now(timezone.utc), attribution_days):
+                method = "click_id"
+            else:
+                method = "click_id_expired"
+                click = None
+
+    ctx = decode_subid(subid) if subid else None
+    if click is None and ctx is not None and ctx.offer_id and method == "unmatched":
+        method = "subid"
+
+    lead = Lead(
+        offer_id=offer_id,
+        click_id=click.click_id if click else click_id,
+        campaign_id=click.campaign_id if click else (ctx.campaign_id if ctx else None),
+        ad_group_id=click.ad_group_id if click else (ctx.ad_group_id if ctx else None),
+        creative_id=click.creative_id if click else (ctx.creative_id if ctx else None),
+        email_hash=digest,
+        source_step=source_step,
+        extra={**(extra or {}), "attribution_method": method},
+    )
+    session.add(lead)
+    session.flush()
+    return lead, method
+
+
+def record_funnel_event(
+    session: Session,
+    *,
+    offer_id: int,
+    step_key: str,
+    network_txn_id: str,
+    click_id: str | None = None,
+    subid: str | None = None,
+    email: str | None = None,
+    revenue_micros: int | None = None,
+    status: ConversionStatus = ConversionStatus.APPROVED,
+    occurred_at: datetime | None = None,
+    raw: dict | None = None,
+) -> tuple["Conversion", str]:
+    """Record a completed funnel step and credit it to the originating click.
+
+    Every step is a conversion with a step key and its own value, so an opt-in,
+    a tripwire sale and the eventual affiliate commission all attribute back to
+    the same ad without being confused for one another.
+    """
+    step = session.execute(
+        select(FunnelStep).where(
+            FunnelStep.offer_id == offer_id, FunnelStep.key == step_key
+        )
+    ).scalar_one_or_none()
+    if step is None:
+        raise ValueError(f"offer {offer_id} has no funnel step '{step_key}'")
+
+    lead: Lead | None = None
+    if email:
+        lead, _ = record_lead(
+            session,
+            offer_id=offer_id,
+            email=email,
+            click_id=click_id,
+            subid=subid,
+            source_step=step_key,
+        )
+    elif click_id:
+        lead = session.execute(
+            select(Lead).where(Lead.click_id == click_id, Lead.offer_id == offer_id)
+        ).scalar_one_or_none()
+
+    value = step.value_micros if revenue_micros is None else revenue_micros
+    conversion, method = record_conversion(
+        session,
+        network="funnel",
+        network_txn_id=network_txn_id,
+        click_id=click_id,
+        subid=subid,
+        revenue_micros=value,
+        status=status,
+        event_name=step.kind.value,
+        occurred_at=occurred_at,
+        raw={**(raw or {}), "step": step_key},
+    )
+    conversion.step_key = step_key
+    if lead is not None:
+        conversion.lead_id = lead.id
+        if status is ConversionStatus.APPROVED:
+            lead.realised_value_micros += value
+            lead.last_value_at = conversion.occurred_at
+    session.flush()
+    return conversion, method
 
 
 def record_conversion(

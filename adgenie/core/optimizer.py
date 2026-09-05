@@ -83,6 +83,9 @@ class OptimizerPolicy:
     # deliberate, because a wrong kill loses a winner and a slow scale only
     # loses a little upside.
     scale_maturity_floor: float = 0.60
+    # A funnel is judged on leads rather than on sales, so it needs its own
+    # evidence bar before its economics mean anything.
+    min_leads_to_judge: int = 25
     # Meta-specific: audience saturation.
     frequency_ceiling: float = 3.2
     # A creative whose CTR has decayed this far from its own opening week.
@@ -221,7 +224,14 @@ class Optimizer:
                 evidence=evidence,
             )
 
-        # 5. Zero-conversion kill. The classic affiliate money pit: an ad that
+        # 5. A funnel campaign is judged on pipeline value, not on the money
+        #    that has landed. Leads are the product being bought here, and
+        #    reading a lead-generation campaign's day-one revenue as its return
+        #    retires the campaign that was working.
+        if window.has_funnel_value:
+            return self._evaluate_funnel(window, evidence, has_own_budget)
+
+        # 6. Zero-conversion kill. The classic affiliate money pit: an ad that
         #    gets clicks and never converts. Judged on lifetime evidence so a
         #    rolling window cannot keep resetting the case against it, and
         #    gated on the posterior so a cheap offer with few clicks is not
@@ -248,7 +258,7 @@ class Optimizer:
                     evidence=evidence,
                 )
 
-        # 6. Every rule below reads a ROAS credible interval, which is
+        # 7. Every rule below reads a ROAS credible interval, which is
         #    meaningless without a per-conversion value. Judging on the
         #    degenerate interval that results would pause healthy entities with
         #    fabricated confidence, so say so instead.
@@ -264,7 +274,7 @@ class Optimizer:
                 evidence=evidence,
             )
 
-        # 7. Losing money with enough evidence to be sure.
+        # 8. Losing money with enough evidence to be sure.
         if window.clicks >= p.min_clicks_to_judge:
             roas_ci = window.roas_interval(p.credible_level)
             # Both kill rules answer to the same bar: the chance this is
@@ -324,7 +334,7 @@ class Optimizer:
                     evidence=evidence,
                 )
 
-            # 8. Scale. The bar is deliberately high: the lower bound of the
+            # 9. Scale. The bar is deliberately high: the lower bound of the
             #    credible interval must clear breakeven, not just the mean.
             # Note which ROAS this reads: the *observed* one. Projected ROAS is
             # reported as evidence but never funded against, because scaling on
@@ -363,7 +373,7 @@ class Optimizer:
                     evidence=evidence,
                 )
 
-            # 9. Marginal. Profitable but under target: cut spend rather than
+            # 10. Marginal. Profitable but under target: cut spend rather than
             #    kill, because the angle may still be worth keeping alive.
             if p.floor_roas <= window.roas < p.target_roas and roas_ci.upper < p.target_roas:
                 if not has_own_budget:
@@ -391,7 +401,7 @@ class Optimizer:
                     evidence=evidence,
                 )
 
-        # 10. Creative fatigue. Delivery is fine and economics are fine, but the
+        # 11. Creative fatigue. Delivery is fine and economics are fine, but the
         #    audience has seen it too often. Refresh rather than pause. Only a
         #    creative can be regenerated; an ad group is a container.
         already_refreshed = self._recently_refreshed(last_refresh_at, now)
@@ -445,6 +455,74 @@ class Optimizer:
             (
                 f"ROAS {window.roas:.2f} is within tolerance and the evidence is "
                 "not yet strong enough to move budget."
+            ),
+            evidence=evidence,
+        )
+
+    def _evaluate_funnel(
+        self, window: PerformanceWindow, evidence: dict, has_own_budget: bool
+    ) -> Decision:
+        """Judge a lead-generation campaign on what its leads are worth.
+
+        The lead value used here is the *lower* bound of the measured estimate,
+        so a campaign only scales when it clears target even on the pessimistic
+        reading. Scaling on the mean would fund a list that has not yet shown
+        it pays.
+        """
+        p = self.policy
+        pipeline = window.pipeline_roas
+        cost_per_lead = micros_to_usd(int(window.cost_per_lead_micros))
+        value_per_lead = micros_to_usd(window.lead_value_per_lead_micros)
+
+        if window.leads < p.min_leads_to_judge:
+            return self._no_action(
+                window,
+                "funnel_learning",
+                (
+                    f"{window.leads} leads at {cost_per_lead:.2f} USD each; too "
+                    f"few to price against a {value_per_lead:.2f} USD lead value."
+                ),
+                evidence=evidence,
+            )
+
+        if pipeline < p.floor_roas:
+            return Decision(
+                level=window.level,
+                entity_id=window.entity_id,
+                action=ActionType.PAUSE,
+                rule="funnel_unprofitable",
+                reason=(
+                    f"Leads cost {cost_per_lead:.2f} USD against a conservative "
+                    f"lead value of {value_per_lead:.2f} USD. Counting realised "
+                    f"revenue and lead value together the return is "
+                    f"{pipeline:.2f}, below breakeven."
+                ),
+                confidence=round(p.credible_level, 4),
+                evidence=evidence,
+            )
+
+        if pipeline >= p.target_roas and has_own_budget:
+            return self._budget_decision(
+                window,
+                direction=1,
+                rule="funnel_scale",
+                reason=(
+                    f"{window.leads} leads at {cost_per_lead:.2f} USD each against "
+                    f"a conservative {value_per_lead:.2f} USD each. Return of "
+                    f"{pipeline:.2f} clears the {p.target_roas:.2f} target even on "
+                    "the pessimistic lead value."
+                ),
+                confidence=round(p.credible_level, 4),
+                evidence=evidence,
+            )
+
+        return self._no_action(
+            window,
+            "funnel_hold",
+            (
+                f"Leads cost {cost_per_lead:.2f} USD against {value_per_lead:.2f} "
+                f"USD of conservative value, a {pipeline:.2f} return. Profitable "
+                "but short of target."
             ),
             evidence=evidence,
         )

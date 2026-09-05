@@ -142,6 +142,81 @@ def cmd_optimize(args) -> int:
     return 0
 
 
+def cmd_funnel(args) -> int:
+    init_db()
+    from .core.ltv import fit_lead_value, offer_prior_micros
+    from .models import FunnelStep, FunnelStepKind
+
+    with session_scope() as session:
+        offer = session.get(Offer, args.offer)
+        if offer is None:
+            print(f"offer {args.offer} not found", file=sys.stderr)
+            return 1
+
+        if args.step:
+            for existing in list(offer.funnel_steps):
+                session.delete(existing)
+            session.flush()
+            for index, raw in enumerate(args.step):
+                parts = raw.split(":")
+                if len(parts) < 2:
+                    print(
+                        f"--step needs 'key:kind[:value]', got '{raw}'", file=sys.stderr
+                    )
+                    return 2
+                key, kind = parts[0], parts[1]
+                value = float(parts[2]) if len(parts) > 2 else 0.0
+                try:
+                    step_kind = FunnelStepKind(kind)
+                except ValueError:
+                    print(
+                        f"unknown step kind '{kind}'; expected one of "
+                        + ", ".join(k.value for k in FunnelStepKind),
+                        file=sys.stderr,
+                    )
+                    return 2
+                session.add(
+                    FunnelStep(
+                        offer_id=offer.id, key=key,
+                        name=key.replace("_", " ").title(), kind=step_kind,
+                        position=index, value_micros=usd_to_micros(value),
+                    )
+                )
+            session.flush()
+            session.refresh(offer)
+
+        if not offer.funnel_steps:
+            print(f"{offer.name} sends traffic straight to the offer (no funnel).")
+            return 0
+
+        print(f"\n{offer.name}")
+        for step in offer.funnel_steps:
+            lead = " captures lead" if step.captures_lead else ""
+            print(
+                f"  {step.position}. {step.key:<14}{step.kind.value:<10}"
+                f"{fmt_usd(step.value_micros):>10}{lead}"
+            )
+
+        model = fit_lead_value(
+            session, offer.id, prior_micros=offer_prior_micros(session, offer.id)
+        )
+        print(
+            f"\n  Value per lead: {fmt_usd(model.mean_micros)} "
+            f"({fmt_usd(model.lower_micros)} to {fmt_usd(model.upper_micros)})"
+        )
+        if model.fitted:
+            print(
+                f"  Measured from {model.mature_sample_size} leads old enough to "
+                "have finished earning."
+            )
+        else:
+            print(
+                f"  Assumed from the step values; only {model.mature_sample_size} "
+                "mature leads so far. The optimizer spends against the lower bound."
+            )
+    return 0
+
+
 def cmd_segments(args) -> int:
     init_db()
     from .core.orchestrator import Orchestrator
@@ -430,6 +505,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--apply", action="store_true", help="apply decisions instead of proposing them"
     )
     optimize.set_defaults(func=cmd_optimize)
+
+    funnel = sub.add_parser(
+        "funnel", help="define the steps between the click and the money"
+    )
+    funnel.add_argument("--offer", type=int, required=True)
+    funnel.add_argument(
+        "--step", action="append",
+        help="repeatable, 'key:kind[:value]' e.g. optin:optin or tripwire:tripwire:17",
+    )
+    funnel.set_defaults(func=cmd_funnel)
 
     segments = sub.add_parser(
         "segments", help="find placements or audiences that are wasting budget"
