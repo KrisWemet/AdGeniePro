@@ -166,10 +166,12 @@ def cmd_landing(args) -> int:
             if args.pause and summary["blocking"]:
                 from .core.orchestrator import Orchestrator
 
-                paused = monitor.pause_offenders(
+                result = monitor.pause_offenders(
                     summary, orchestrator=Orchestrator(session)
                 )
-                print(f"  Paused {len(paused)} campaign(s).")
+                count = len(result["campaign_ids"])
+                verb = "Paused" if result["applied"] else "Would pause (dry run)"
+                print(f"  {verb} {count} campaign(s).")
             if not summary["changed"] and not summary["blocking"]:
                 print("  Nothing changed and nothing blocking.")
         return 0

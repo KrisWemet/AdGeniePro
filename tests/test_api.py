@@ -39,6 +39,9 @@ def test_health_reports_configuration_honestly(api_client):
     assert body["dry_run"] is False
     assert body["copywriter"] == "template"
     assert body["platforms"]["meta"]["simulated"] is True
+    # Health has to report the setting, not a hardcoded hope. An operator who
+    # turned auditing off needs to see that from here.
+    assert body["landing_page_audit"] == "disabled"
 
 
 def test_dashboard_is_served(api_client):

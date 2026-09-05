@@ -159,7 +159,9 @@ def health() -> dict:
         "copywriter": "claude" if settings.has_copywriter_llm else "template",
         "media": "kie" if settings.has_media_generation else "sandbox",
         "ad_library": "connected" if settings.has_ad_library else "unavailable",
-        "landing_page_audit": "enabled",
+        "landing_page_audit": (
+            "enabled" if settings.audit_landing_pages else "disabled"
+        ),
         "authenticated": settings.requires_api_key,
         "global_daily_budget_cap_usd": settings.global_daily_budget_cap_usd,
         "platforms": platforms,

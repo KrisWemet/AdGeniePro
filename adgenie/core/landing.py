@@ -42,9 +42,14 @@ __all__ = [
     "BROWSER_AGENT",
 ]
 
+# Deliberately a desktop agent. Both reviewing crawlers present as desktop, and
+# a site that legitimately serves a different mobile experience would otherwise
+# read as cloaking against a mobile baseline — a false accusation that blocks a
+# launch. Mobile readiness is judged from the markup instead, which does not
+# depend on the agent.
 BROWSER_AGENT = (
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 "
-    "(KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
 # The user agents each platform reviews with. A page that behaves differently
@@ -53,6 +58,34 @@ CRAWLER_AGENTS: dict[str, str] = {
     "meta": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
     "google": "AdsBot-Google (+http://www.google.com/adsbot.html)",
 }
+
+# Rules about what an ad may *claim*, which apply just as much to the page
+# behind it. An allowlist rather than a denylist: a new formatting rule added
+# to the ad engine must not silently start refusing launches over page markup.
+PAGE_APPLICABLE_CODES = frozenset(
+    {
+        "PERSONAL_ATTRIBUTE_DIRECT",
+        "PERSONAL_ATTRIBUTE_OTHER_PEOPLE",
+        "GUARANTEED_OUTCOME",
+        "MIRACLE_CURE",
+        "OVERNIGHT_RESULTS",
+        "SPECIFIC_WEIGHT_LOSS",
+        "BEFORE_AFTER",
+        "BODY_SHAMING",
+        "INCOME_CLAIM",
+        "INVESTMENT_RETURN",
+        "FAKE_UI",
+        "FALSE_URGENCY",
+        "PROHIBITED_CONTENT",
+        "CRYPTO_RESTRICTED",
+        "SUPPLEMENT_DISEASE_CLAIM",
+        "THIRD_PARTY_BRAND",
+        "PLATFORM_IMPERSONATION",
+        "ADVERTISER_BANNED_CLAIM",
+        "MISSING_REQUIRED_DISCLOSURE",
+        "REGULATED_VERTICAL",
+    }
+)
 
 MAX_BYTES = 5 * 1024 * 1024
 MAX_REDIRECTS = 10
@@ -148,9 +181,19 @@ class LandingPageFetcher:
     def __init__(self, client: httpx.Client | None = None, timeout: float = 20.0) -> None:
         # Redirects are followed by hand so the chain can be recorded: the
         # number of hops and whether any of them leave HTTPS both matter.
-        self._client = client or httpx.Client(
-            timeout=timeout, follow_redirects=False
-        )
+        self._owns_client = client is None
+        self._client = client or httpx.Client(timeout=timeout, follow_redirects=False)
+
+    def close(self) -> None:
+        """Release the connection pool, if this fetcher opened one."""
+        if self._owns_client:
+            self._client.close()
+
+    def __enter__(self) -> "LandingPageFetcher":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
 
     def fetch(self, url: str, user_agent: str = BROWSER_AGENT, label: str = "browser") -> PageSnapshot:
         snapshot = PageSnapshot(url=url, fetched_as=label)
@@ -161,7 +204,10 @@ class LandingPageFetcher:
             "Accept-Language": "en-US,en;q=0.9",
         }
 
-        for _ in range(MAX_REDIRECTS):
+        # One iteration per request, so the budget is redirects plus the final
+        # response. Using MAX_REDIRECTS alone would reject a chain of exactly
+        # MAX_REDIRECTS that resolves perfectly well.
+        for _ in range(MAX_REDIRECTS + 1):
             try:
                 response = self._client.get(current, headers=headers)
             except httpx.HTTPError as exc:
@@ -264,26 +310,38 @@ _DISCLOSURE_RE = re.compile(
 _SENSITIVE_INPUTS = ("card", "cardnumber", "cc-number", "cvv", "cvc", "ssn", "password")
 
 # Markers of a page trying to force the visitor's hand rather than persuade.
-_DARK_PATTERNS: tuple[tuple[str, str, str], ...] = (
+# Each carries its own severity, because these are not one kind of problem.
+# BLOCK is for what the markup proves; WARN is for what the markup can only
+# hint at, and a hint must not be able to refuse a launch on its own.
+_DARK_PATTERNS: tuple[tuple[str, str, Severity, str], ...] = (
     (
         r"<audio\b[^>]*autoplay|<video\b[^>]*autoplay(?![^>]*muted)",
         "AUTOPLAY_MEDIA",
+        Severity.WARN,
         "Audio that plays on load is a rejection reason and drives people off.",
     ),
     (
         r"onbeforeunload\s*=|history\.pushState\([^)]*\);\s*window\.onpopstate",
         "BACK_BUTTON_TRAP",
+        Severity.BLOCK,
         "Interfering with the back button is prohibited on both platforms.",
     ),
     (
         r"\b(setInterval|setTimeout)\b[^;]{0,80}\bcountdown\b|"
         r"\bcountdown\b[^;]{0,60}\blocalStorage\b",
-        "RESETTING_COUNTDOWN",
-        "A countdown that restarts for each visitor is a false scarcity claim.",
+        "SCRIPTED_COUNTDOWN",
+        # A warning, not a block. A countdown to a genuine deadline is ordinary
+        # and legal, and the markup cannot tell the two apart. Refusing the
+        # launch would be punishing an honest page for a suspicion.
+        Severity.WARN,
+        "A scripted countdown was found. Whether it restarts per visitor cannot "
+        "be seen from the markup, but if it does it is a false scarcity claim "
+        "and a rejection reason. Confirm it counts to a real deadline.",
     ),
     (
         r"\b(as seen on|featured in)\b[^<]{0,60}\b(cnn|fox|nbc|abc|forbes|shark tank)\b",
         "UNSUBSTANTIATED_ENDORSEMENT",
+        Severity.BLOCK,
         "Press logos need a real citation; both platforms treat this as "
         "misrepresentation.",
     ),
@@ -453,13 +511,13 @@ def _quality_findings(snapshot: PageSnapshot) -> list[Finding]:
                 ),
             )
         )
-    for pattern, code, fix in _DARK_PATTERNS:
+    for pattern, code, severity, fix in _DARK_PATTERNS:
         match = re.search(pattern, snapshot.html, re.IGNORECASE)
         if match:
             out.append(
                 Finding(
                     code=code,
-                    severity=Severity.BLOCK if code != "AUTOPLAY_MEDIA" else Severity.WARN,
+                    severity=severity,
                     message=fix.split(".")[0] + ".",
                     policy_ref="Meta: Deceptive Content / Google: Misleading Ad Design",
                     field_name="landing_page",
@@ -629,20 +687,43 @@ def audit_landing_page(
     text_engine: ComplianceEngine | None = None,
 ) -> LandingPageAudit:
     """Fetch the destination and check what the platforms will check."""
+    owned = fetcher is None
     fetcher = fetcher or LandingPageFetcher()
+    try:
+        return _run_audit(
+            url, fetcher, ad_texts, platforms, check_cloaking, offer, text_engine
+        )
+    finally:
+        if owned:
+            fetcher.close()
+
+
+def _run_audit(
+    url: str,
+    fetcher: LandingPageFetcher,
+    ad_texts: list[str] | None,
+    platforms: tuple[Platform, ...],
+    check_cloaking: bool,
+    offer,
+    text_engine: ComplianceEngine | None,
+) -> LandingPageAudit:
     audit = LandingPageAudit(url=url)
 
     browser = fetcher.fetch(url, BROWSER_AGENT, "browser")
     audit.snapshot = browser
-    audit.content_hash = browser.content_hash
 
     findings = _availability_findings(browser)
     if findings:
-        # Nothing else can be assessed on a page that did not load.
+        # Nothing else can be assessed on a page that did not load, and it has
+        # no content hash worth keeping: storing the hash of an empty body
+        # would make the next successful audit report a change that never
+        # happened, on the one signal this module exists to raise.
         audit.findings = findings
         audit.verdict = ComplianceVerdict.BLOCK
         audit.score = 0.0
         return audit
+
+    audit.content_hash = browser.content_hash
 
     findings += _link_findings(browser)
     findings += _security_findings(browser)
@@ -651,8 +732,11 @@ def audit_landing_page(
     if ad_texts:
         findings += _consistency_findings(browser, ad_texts)
 
-    # The page's own text is held to the same claim rules as the ad. A "lose 30
-    # pounds guaranteed" promise is no safer for being one click further away.
+    # The page's own text is held to the same *claim* rules as the ad. A "lose
+    # 30 pounds guaranteed" promise is no safer for being one click further
+    # away. Formatting and rendering rules deliberately do not transfer: an
+    # emoji is a problem in a Google search ad and unremarkable on a web page,
+    # and applying that rule here would refuse a launch over a smiley.
     engine = text_engine or ComplianceEngine()
     for platform in platforms:
         report = engine.review(
@@ -662,8 +746,8 @@ def audit_landing_page(
             requires_disclosure=False,
         )
         for finding in report.findings:
-            if finding.code in {"TOO_FEW_ASSETS", "OVER_CHAR_LIMIT", "SOFT_TRUNCATION"}:
-                continue  # ad-format rules, meaningless for a web page
+            if finding.code not in PAGE_APPLICABLE_CODES:
+                continue
             findings.append(
                 Finding(
                     code=f"PAGE_{finding.code}",

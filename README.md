@@ -223,6 +223,10 @@ stored with a content hash and a later one that finds different content says
 so. `landing --sweep` re-checks every live destination; `--pause` stops
 spending on the ones that now fail.
 
+`--pause` honours `DRY_RUN` like every other mutation here: under a dry run it
+reports the campaigns it *would* stop and touches neither the platform nor the
+database. Set `DRY_RUN=false` when you actually want a sweep to act.
+
 ---
 
 ## Competitor research: what it can and cannot tell you

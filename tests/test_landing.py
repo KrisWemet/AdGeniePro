@@ -5,6 +5,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from adgenie.core.compliance import Severity
 from adgenie.core.destination import DestinationMonitor
 from adgenie.core.landing import (
     BROWSER_AGENT,
@@ -349,6 +350,33 @@ def test_dark_patterns_are_flagged(markup, code):
     assert code in codes(audit)
 
 
+def test_a_countdown_warns_but_does_not_refuse_the_launch():
+    """A timer to a real deadline is ordinary, and the markup cannot tell.
+
+    Blocking on a suspicion the page may well not deserve is worse than
+    saying so and letting the operator look.
+    """
+    markup = "<script>setInterval(function(){ tick(countdown) }, 1000)</script>"
+    audit = audit_landing_page(
+        "https://lp.test/x",
+        fetcher=fetcher_for(serve(CLEAN_PAGE.replace("</body>", markup + "</body>"))),
+    )
+    assert "SCRIPTED_COUNTDOWN" in codes(audit)
+    finding = next(f for f in audit.findings if f.code == "SCRIPTED_COUNTDOWN")
+    assert finding.severity is Severity.WARN
+    assert audit.verdict is not ComplianceVerdict.BLOCK
+
+
+def test_a_back_button_trap_still_blocks():
+    """The counterweight: what the markup proves is a block, not a warning."""
+    markup = "<script>window.onbeforeunload = function(){}</script>"
+    audit = audit_landing_page(
+        "https://lp.test/x",
+        fetcher=fetcher_for(serve(CLEAN_PAGE.replace("</body>", markup + "</body>"))),
+    )
+    assert audit.verdict is ComplianceVerdict.BLOCK
+
+
 def test_page_text_is_held_to_the_same_claim_rules_as_the_ad():
     """A guaranteed-cure promise is no safer one click away from the ad."""
     page = CLEAN_PAGE.replace(BODY, BODY + " Guaranteed results, this miracle cure works.")
@@ -478,7 +506,7 @@ def test_a_sweep_reports_a_destination_that_now_fails(session, offer, settings):
     assert summary["blocking"][0]["offer_id"] == offer.id
 
 
-def test_offenders_can_be_paused(session, offer, settings):
+def _blocking_campaign(session, offer):
     from adgenie.models import Campaign
 
     campaign = Campaign(
@@ -487,14 +515,88 @@ def test_offenders_can_be_paused(session, offer, settings):
     )
     session.add(campaign)
     session.commit()
+    return campaign
 
-    monitor = DestinationMonitor(session, fetcher=fetcher_for(serve("", 410)))
+
+def test_offenders_can_be_paused(session, offer, settings):
+    campaign = _blocking_campaign(session, offer)
+
+    monitor = DestinationMonitor(
+        session, fetcher=fetcher_for(serve("", 410)), settings=settings
+    )
     summary = monitor.sweep()
-    paused = monitor.pause_offenders(summary)
+    result = monitor.pause_offenders(summary)
 
-    assert campaign.id in paused
+    assert result["applied"] is True
+    assert campaign.id in result["campaign_ids"]
     assert campaign.status is EntityStatus.PAUSED
     assert "landing page" in campaign.last_error
+
+
+def test_a_dry_run_sweep_pauses_nothing(session, offer, settings):
+    """A sweep against live credentials must not stop production by accident."""
+    campaign = _blocking_campaign(session, offer)
+    dry = settings.model_copy(update={"dry_run": True})
+
+    monitor = DestinationMonitor(
+        session, fetcher=fetcher_for(serve("", 410)), settings=dry
+    )
+    summary = monitor.sweep()
+
+    class Exploding:
+        def client(self, platform):  # pragma: no cover - must never be called
+            raise AssertionError("a dry run reached the platform")
+
+    result = monitor.pause_offenders(summary, orchestrator=Exploding())
+
+    assert result["applied"] is False
+    # It still says which campaigns it would have stopped.
+    assert campaign.id in result["campaign_ids"]
+    assert campaign.status is EntityStatus.ACTIVE
+    assert campaign.last_error is None
+
+
+def test_pause_offenders_defaults_to_the_safe_side(session, offer):
+    """No settings passed means the ambient ones, which default to a dry run."""
+    campaign = _blocking_campaign(session, offer)
+    monitor = DestinationMonitor(session, fetcher=fetcher_for(serve("", 410)))
+    assert monitor.settings.dry_run is True
+
+    result = monitor.pause_offenders(monitor.sweep())
+
+    assert result["applied"] is False
+    assert campaign.status is EntityStatus.ACTIVE
+
+
+def test_a_sweep_survives_a_timezone_aware_stored_check(session, offer, settings):
+    """The stored timestamp may be aware or naive depending on the session.
+
+    `checked_at` is a naive column with a timezone-aware default, so whether a
+    row reads back aware depends on whether it is still in the identity map.
+    Comparing the two directly raises TypeError and takes the sweep with it.
+    """
+    from datetime import datetime, timezone
+
+    from adgenie.models import Campaign
+
+    session.add(
+        Campaign(
+            offer_id=offer.id, platform=Platform.META, name="c",
+            external_id="c1", status=EntityStatus.ACTIVE,
+        )
+    )
+    session.commit()
+
+    monitor = DestinationMonitor(
+        session, fetcher=fetcher_for(serve(CLEAN_PAGE)), settings=settings
+    )
+    check = monitor.check_offer(offer)
+    check.checked_at = datetime.now(timezone.utc)
+    session.commit()
+
+    summary = monitor.sweep(max_age_hours=24)
+    assert summary["skipped"] == 1
+    assert summary["checked"] == 0
 
 
 # --- refusing to launch ----------------------------------------------------

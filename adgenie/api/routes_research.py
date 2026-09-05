@@ -181,11 +181,15 @@ def sweep_landing_pages(
     from ..core.destination import DestinationMonitor
     from ..core.orchestrator import Orchestrator
 
-    monitor = DestinationMonitor(session)
+    settings = get_settings()
+    monitor = DestinationMonitor(session, settings=settings)
     summary = monitor.sweep(max_age_hours=max_age_hours)
     if pause_offenders and summary["blocking"]:
-        summary["paused_campaigns"] = monitor.pause_offenders(
-            summary, orchestrator=Orchestrator(session, settings=get_settings())
+        # Reports {"applied": ..., "campaign_ids": [...]}. Under DRY_RUN
+        # nothing is paused and `applied` says so, rather than the caller
+        # having to infer it from an empty list.
+        summary["pause"] = monitor.pause_offenders(
+            summary, orchestrator=Orchestrator(session, settings=settings)
         )
     return summary
 

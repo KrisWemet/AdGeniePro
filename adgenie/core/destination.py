@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from ..config import Settings, get_settings
 from ..models import (
     AdGroup,
     Campaign,
@@ -32,14 +33,29 @@ logger = logging.getLogger(__name__)
 __all__ = ["DestinationMonitor"]
 
 
+def _naive_utc(moment: datetime) -> datetime:
+    """Put a stored timestamp on one clock before comparing it.
+
+    `checked_at` is a naive column filled by a timezone-aware default, so the
+    very same row reads back aware while it is still in the identity map and
+    naive once it has been reloaded. Comparing the two raises. Normalising is
+    cheaper than depending on which side of a commit the caller is on.
+    """
+    if moment.tzinfo is None:
+        return moment
+    return moment.astimezone(timezone.utc).replace(tzinfo=None)
+
+
 class DestinationMonitor:
     def __init__(
         self,
         session: Session,
         fetcher: LandingPageFetcher | None = None,
+        settings: Settings | None = None,
     ) -> None:
         self.session = session
         self.fetcher = fetcher or LandingPageFetcher()
+        self.settings = settings or get_settings()
 
     # ------------------------------------------------------------------
     def check_offer(
@@ -106,7 +122,7 @@ class DestinationMonitor:
 
         for offer in offers:
             last = self._latest(offer.id)
-            if last is not None and last.checked_at > cutoff:
+            if last is not None and _naive_utc(last.checked_at) > cutoff:
                 summary["skipped"] += 1
                 continue
 
@@ -137,13 +153,21 @@ class DestinationMonitor:
             )
         return summary
 
-    def pause_offenders(self, summary: dict, orchestrator=None) -> list[int]:
+    def pause_offenders(
+        self, summary: dict, orchestrator=None, apply: bool | None = None
+    ) -> dict:
         """Stop spending on offers whose destination now fails.
 
         Deliberately separate from `sweep`: noticing and acting are different
         decisions, and an operator may want the first without the second.
+
+        Honours DRY_RUN like every other mutation in the project. Under a dry
+        run this reports the campaigns it would stop and touches nothing —
+        not the platform, not the database. A sweep run against live
+        credentials must not be able to pause production by accident.
         """
-        paused: list[int] = []
+        apply = (not self.settings.dry_run) if apply is None else apply
+        affected: list[int] = []
         for entry in summary.get("blocking", []):
             campaigns = list(
                 self.session.execute(
@@ -154,6 +178,9 @@ class DestinationMonitor:
                 ).scalars()
             )
             for campaign in campaigns:
+                if not apply:
+                    affected.append(campaign.id)
+                    continue
                 if orchestrator is not None and campaign.external_id:
                     try:
                         orchestrator.client(campaign.platform).set_status(
@@ -170,9 +197,18 @@ class DestinationMonitor:
                 campaign.last_error = (
                     "Paused: the landing page now has a blocking policy problem."
                 )
-                paused.append(campaign.id)
-        self.session.commit()
-        return paused
+                affected.append(campaign.id)
+
+        if apply:
+            self.session.commit()
+        elif affected:
+            logger.warning(
+                "Dry run: would pause %s campaign(s) over blocking landing "
+                "pages: %s",
+                len(affected),
+                ", ".join(str(cid) for cid in affected),
+            )
+        return {"applied": apply, "campaign_ids": affected}
 
     # ------------------------------------------------------------------
     def _latest(self, offer_id: int) -> LandingPageCheck | None:
