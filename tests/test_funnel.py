@@ -379,11 +379,23 @@ def test_cheap_leads_are_scaled():
     assert decision.rule == "funnel_scale"
 
 
-def test_too_few_leads_to_price(): 
+def test_a_handful_of_leads_does_not_shield_a_losing_campaign():
+    """Too few leads to price means the ordinary safety rules still apply.
+
+    Otherwise a trickle of opt-ins would keep a campaign with no conversions
+    and mounting spend alive forever.
+    """
     window = _funnel_window(200, leads=8, value_per_lead=2.0, spend=160)
     decision = Optimizer(OptimizerPolicy()).evaluate(window, lifetime=window)
-    assert decision.action is ActionType.NO_ACTION
-    assert decision.rule == "funnel_learning"
+    assert decision.action is ActionType.PAUSE
+    assert decision.rule == "zero_conversion_kill"
+
+
+def test_a_funnel_producing_leads_well_is_judged_as_a_funnel():
+    """The same spend, but opting in at a healthy rate, is priced not killed."""
+    window = _funnel_window(200, leads=60, value_per_lead=2.0, spend=160)
+    decision = Optimizer(OptimizerPolicy()).evaluate(window, lifetime=window)
+    assert decision.rule.startswith("funnel_")
 
 
 def test_a_direct_offer_is_unaffected_by_any_of_this():

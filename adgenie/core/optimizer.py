@@ -228,7 +228,11 @@ class Optimizer:
         #    that has landed. Leads are the product being bought here, and
         #    reading a lead-generation campaign's day-one revenue as its return
         #    retires the campaign that was working.
-        if window.has_funnel_value:
+        # Only once there are enough leads to price. Below that the funnel
+        # path would return NO_ACTION and shield the entity from every kill
+        # rule below, so a handful of leads could keep a campaign with no
+        # conversions and thousands in spend alive indefinitely.
+        if window.has_funnel_value and window.leads >= p.min_leads_to_judge:
             return self._evaluate_funnel(window, evidence, has_own_budget)
 
         # 6. Zero-conversion kill. The classic affiliate money pit: an ad that
@@ -473,17 +477,6 @@ class Optimizer:
         pipeline = window.pipeline_roas
         cost_per_lead = micros_to_usd(int(window.cost_per_lead_micros))
         value_per_lead = micros_to_usd(window.lead_value_per_lead_micros)
-
-        if window.leads < p.min_leads_to_judge:
-            return self._no_action(
-                window,
-                "funnel_learning",
-                (
-                    f"{window.leads} leads at {cost_per_lead:.2f} USD each; too "
-                    f"few to price against a {value_per_lead:.2f} USD lead value."
-                ),
-                evidence=evidence,
-            )
 
         if pipeline < p.floor_roas:
             return Decision(

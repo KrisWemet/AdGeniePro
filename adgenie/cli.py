@@ -154,27 +154,42 @@ def cmd_funnel(args) -> int:
             return 1
 
         if args.step:
-            for existing in list(offer.funnel_steps):
-                session.delete(existing)
-            session.flush()
-            for index, raw in enumerate(args.step):
+            # Parse everything before deleting anything. This replaces the whole
+            # funnel, so failing halfway would leave it truncated and the error
+            # message would be the only sign.
+            parsed: list[tuple[str, FunnelStepKind, float]] = []
+            for raw in args.step:
                 parts = raw.split(":")
                 if len(parts) < 2:
                     print(
                         f"--step needs 'key:kind[:value]', got '{raw}'", file=sys.stderr
                     )
                     return 2
-                key, kind = parts[0], parts[1]
-                value = float(parts[2]) if len(parts) > 2 else 0.0
                 try:
-                    step_kind = FunnelStepKind(kind)
+                    step_kind = FunnelStepKind(parts[1])
                 except ValueError:
                     print(
-                        f"unknown step kind '{kind}'; expected one of "
+                        f"unknown step kind '{parts[1]}'; expected one of "
                         + ", ".join(k.value for k in FunnelStepKind),
                         file=sys.stderr,
                     )
                     return 2
+                try:
+                    value = float(parts[2]) if len(parts) > 2 else 0.0
+                except ValueError:
+                    print(f"step value must be a number, got '{parts[2]}'", file=sys.stderr)
+                    return 2
+                parsed.append((parts[0], step_kind, value))
+
+            keys = [key for key, _, _ in parsed]
+            if len(keys) != len(set(keys)):
+                print("step keys must be unique within a funnel", file=sys.stderr)
+                return 2
+
+            for existing in list(offer.funnel_steps):
+                session.delete(existing)
+            session.flush()
+            for index, (key, step_kind, value) in enumerate(parsed):
                 session.add(
                     FunnelStep(
                         offer_id=offer.id, key=key,

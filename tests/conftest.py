@@ -82,6 +82,7 @@ def api_client(engine, settings, monkeypatch):
         "adgenie.api.routes_campaigns",
         "adgenie.api.routes_optimizer",
         "adgenie.api.routes_tracking",
+        "adgenie.api.routes_funnel",
         "adgenie.core.tracking",
         "adgenie.api.security",
     ):

@@ -8,6 +8,7 @@ one that was never made.
 from __future__ import annotations
 
 import json
+import os
 from datetime import date, datetime, time, timedelta, timezone
 
 import httpx
@@ -2027,3 +2028,265 @@ def test_an_orphaned_ad_group_does_not_crash_segment_analysis(session, settings)
     group = session.execute(select(AdGroup)).scalars().first()
     with pytest.raises(ValueError, match="no campaign"):
         orchestrator.segment_report(group.id, date(2026, 3, 1), date(2026, 3, 7))
+
+
+# --- eighth review round: funnels ------------------------------------------
+
+
+@pytest.fixture
+def funnel(session, offer):
+    from adgenie.models import FunnelStep, FunnelStepKind
+
+    for index, (key, kind, value) in enumerate(
+        [
+            ("optin", FunnelStepKind.OPTIN, 0),
+            ("tripwire", FunnelStepKind.TRIPWIRE, 17),
+            ("core", FunnelStepKind.CORE, 40),
+        ]
+    ):
+        session.add(
+            FunnelStep(
+                offer_id=offer.id, key=key, name=key, kind=kind,
+                position=index, value_micros=usd_to_micros(value),
+            )
+        )
+    session.commit()
+    session.refresh(offer)
+    return offer
+
+
+def test_a_resent_funnel_postback_does_not_re_credit_the_lead(session, funnel):
+    """Three identical postbacks credited $51 instead of $17, inflating value."""
+    from adgenie.core.tracking import record_funnel_event
+    from adgenie.models import Lead
+
+    for _ in range(3):
+        record_funnel_event(
+            session, offer_id=funnel.id, step_key="tripwire",
+            network_txn_id="same-txn", email="a@b.test",
+        )
+    session.commit()
+
+    lead = session.query(Lead).one()
+    assert lead.realised_value_micros == usd_to_micros(17)
+
+
+def test_a_reversed_funnel_step_debits_the_lead(session, funnel):
+    from adgenie.core.ltv import realised_value
+    from adgenie.core.tracking import record_funnel_event
+    from adgenie.models import ConversionStatus, Lead
+
+    record_funnel_event(
+        session, offer_id=funnel.id, step_key="core",
+        network_txn_id="t1", email="a@b.test",
+    )
+    session.commit()
+    record_funnel_event(
+        session, offer_id=funnel.id, step_key="core", network_txn_id="t1",
+        email="a@b.test", status=ConversionStatus.REVERSED,
+    )
+    session.commit()
+
+    lead = session.query(Lead).one()
+    assert lead.realised_value_micros == realised_value(session, lead.id) == 0
+
+
+def test_pipeline_value_does_not_count_lead_revenue_twice():
+    """Lead value is built from revenue already inside `revenue_micros`."""
+    from adgenie.core.metrics import PerformanceWindow
+
+    window = PerformanceWindow(EntityLevel.CREATIVE, 1, date(2026, 3, 1), date(2026, 3, 7))
+    window.spend_micros = usd_to_micros(800)
+    window.clicks = 1000
+    window.leads = 300
+    window.lead_value_per_lead_micros = usd_to_micros(2.10)
+    window.lead_value_micros = usd_to_micros(630)
+    window.revenue_micros = usd_to_micros(255)
+    window.lead_revenue_micros = usd_to_micros(255)
+
+    # $255 collected plus $375 still expected, not $255 plus the whole $630.
+    assert window.outstanding_lead_value_micros == usd_to_micros(375)
+    assert window.pipeline_revenue_micros == usd_to_micros(630)
+    assert window.pipeline_roas == pytest.approx(0.7875)
+
+
+def test_leads_that_have_over_earned_do_not_subtract_from_pipeline():
+    from adgenie.core.metrics import PerformanceWindow
+
+    window = PerformanceWindow(EntityLevel.CREATIVE, 1, date(2026, 3, 1), date(2026, 3, 7))
+    window.spend_micros = usd_to_micros(100)
+    window.leads = 10
+    window.lead_value_per_lead_micros = usd_to_micros(1)
+    window.lead_value_micros = usd_to_micros(10)
+    window.revenue_micros = usd_to_micros(500)
+    window.lead_revenue_micros = usd_to_micros(500)
+    assert window.outstanding_lead_value_micros == 0
+    assert window.pipeline_revenue_micros == usd_to_micros(500)
+
+
+def test_a_few_leads_cannot_disarm_the_kill_rules():
+    """Ten leads used to return NO_ACTION on $5000 of spend and no sales."""
+    from adgenie.core.metrics import PerformanceWindow
+    from adgenie.core.optimizer import Optimizer, OptimizerPolicy
+
+    window = PerformanceWindow(EntityLevel.CREATIVE, 1, date(2026, 3, 1), date(2026, 3, 7))
+    window.clicks = 3000
+    window.impressions = 200_000
+    window.spend_micros = usd_to_micros(5000)
+    window.offer_payout_micros = usd_to_micros(40)
+    window.daily_budget_micros = usd_to_micros(200)
+    window.maturity = 1.0
+    window.effective_clicks = 3000
+    window.leads = 10
+    window.lead_value_per_lead_micros = usd_to_micros(2)
+    window.lead_value_micros = usd_to_micros(20)
+
+    decision = Optimizer(OptimizerPolicy()).evaluate(window, lifetime=window)
+    assert decision.action is ActionType.PAUSE
+
+
+def test_a_brand_new_funnel_is_not_valued_at_zero(session, funnel):
+    """Valuing young leads at zero switches the funnel rules off entirely."""
+    from adgenie.core.ltv import fit_lead_value, offer_prior_micros
+    from adgenie.models import Lead
+
+    now = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    for i in range(50):
+        session.add(
+            Lead(
+                offer_id=funnel.id, creative_id=1, email_hash=f"h{i}",
+                created_at=(now - timedelta(days=2)).replace(tzinfo=None),
+                realised_value_micros=0,
+            )
+        )
+    session.commit()
+
+    prior = offer_prior_micros(session, funnel.id)
+    model = fit_lead_value(session, funnel.id, prior_micros=prior, as_of=now)
+    assert prior > 0
+    assert model.mean_micros > 0
+    assert model.lower_micros > 0, "a zero lower bound disables the funnel rules"
+
+
+def test_an_expired_click_does_not_credit_a_lead_through_the_subid(session, funnel):
+    from adgenie.core.tracking import (
+        TrackingContext,
+        encode_subid,
+        record_click,
+        record_lead,
+    )
+
+    subid = encode_subid(TrackingContext(funnel.id, None, None, 5, Platform.META))
+    click, _ = record_click(session, subid, user_agent=BROWSER_UA)
+    click.created_at = datetime(2025, 1, 1)
+    session.commit()
+
+    lead, method = record_lead(
+        session, offer_id=funnel.id, email="a@b.test",
+        click_id=click.click_id, subid=subid, attribution_days=30,
+    )
+    session.commit()
+    assert method == "click_id_expired"
+    assert lead.creative_id is None
+
+
+def test_a_subid_lead_resolves_its_campaign_and_ad_group(session, settings, funnel, sandbox_meta):
+    """Without the parents, a lead vanishes above creative level."""
+    from adgenie.core.launcher import CampaignLauncher, LaunchPlan
+    from adgenie.core.tracking import TrackingContext, encode_subid, record_lead
+
+    launched = CampaignLauncher(
+        session, settings=settings, platform_client=sandbox_meta
+    ).launch(
+        LaunchPlan(
+            offer_id=funnel.id, platform=Platform.META,
+            daily_budget_usd=20.0, angle_count=1, start_paused=False,
+        )
+    )
+    creative_id = launched.creative_ids[0]
+    subid = encode_subid(
+        TrackingContext(funnel.id, None, None, creative_id, Platform.META)
+    )
+
+    lead, method = record_lead(
+        session, offer_id=funnel.id, email="a@b.test", subid=subid
+    )
+    session.commit()
+
+    assert method == "subid"
+    assert lead.creative_id == creative_id
+    assert lead.ad_group_id is not None
+    assert lead.campaign_id == launched.campaign_id
+
+
+def test_a_bad_step_does_not_truncate_the_existing_funnel(session, funnel, tmp_path):
+    """The CLI deleted every step, then failed validation and committed."""
+    import subprocess
+    import sys as _sys
+
+    database = f"sqlite:///{tmp_path / 'cli.db'}"
+    env = {**os.environ, "DATABASE_URL": database}
+
+    subprocess.run(
+        [_sys.executable, "-m", "adgenie.cli", "offer-add", "--name", "X",
+         "--url", "https://o.test/lp", "--payout", "40"],
+        env=env, capture_output=True, check=True,
+    )
+    subprocess.run(
+        [_sys.executable, "-m", "adgenie.cli", "funnel", "--offer", "1",
+         "--step", "optin:optin", "--step", "core:core:40"],
+        env=env, capture_output=True, check=True,
+    )
+    failed = subprocess.run(
+        [_sys.executable, "-m", "adgenie.cli", "funnel", "--offer", "1",
+         "--step", "optin:optin", "--step", "broken"],
+        env=env, capture_output=True,
+    )
+    assert failed.returncode == 2
+
+    survived = subprocess.run(
+        [_sys.executable, "-m", "adgenie.cli", "funnel", "--offer", "1"],
+        env=env, capture_output=True, text=True,
+    )
+    assert "core" in survived.stdout, "the funnel was left truncated by a failed edit"
+
+
+def test_an_explicit_first_position_is_honoured(api_client, settings):
+    """`position or index` silently renumbered a step placed at 0."""
+    offer = api_client.post(
+        "/api/offers",
+        json={"name": "O", "destination_url": "https://o.test/lp", "payout_usd": 40},
+    ).json()
+    body = api_client.put(
+        f"/api/offers/{offer['id']}/funnel",
+        json=[
+            {"key": "core", "kind": "core", "position": 1, "value_usd": 40},
+            {"key": "optin", "kind": "optin", "position": 0},
+        ],
+    ).json()
+    positions = {s["key"]: s["position"] for s in body["steps"]}
+    assert positions["optin"] == 0
+    assert positions["core"] == 1
+
+
+def test_a_landing_page_needs_only_the_postback_secret(api_client, settings):
+    """A landing page cannot hold the operator's admin key."""
+    settings.api_key = "admin-only"
+    offer_id = 1
+
+    unauthenticated = api_client.post(
+        "/api/funnel/optin",
+        json={"offer_id": offer_id, "email": "a@b.test"},
+    )
+    assert unauthenticated.status_code == 401
+
+    with_secret = api_client.post(
+        "/api/funnel/optin",
+        json={"offer_id": offer_id, "email": "a@b.test"},
+        headers={"X-Postback-Secret": settings.postback_secret},
+    )
+    # 404 for a missing offer is fine; what matters is that auth was accepted.
+    assert with_secret.status_code != 401
+
+    # The configuration surface still requires the admin key.
+    assert api_client.get("/api/funnel/leads").status_code == 401

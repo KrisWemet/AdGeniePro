@@ -328,6 +328,7 @@ The catch is measurement. Take 1,000 clicks at $0.80:
 |---|---|---|
 | Day one | 2% × $40 = **$800** | 30% opt in, 5% tripwire = **$255** |
 | Over a month | — | ~8% of 300 leads take the offer = **$960** |
+| Total from the same clicks | $800 | **$1,215**, about $4 a lead |
 | You keep | nothing | 300 leads, promotable for months |
 
 The funnel earns more from the same traffic, but on day one it looks like a
@@ -335,8 +336,14 @@ The funnel earns more from the same traffic, but on day one it looks like a
 working — the same censoring problem as conversion lag, an order of magnitude
 worse.
 
-So a funnel campaign is judged on **pipeline value**: realised revenue plus the
-conservative worth of the leads it bought. That worth is measured, not assumed:
+So a funnel campaign is judged on **pipeline value**: realised revenue plus
+what its leads are *still* expected to pay. Note "still": the measured lead
+value is built from revenue leads have already produced, and that revenue is
+also in the realised figure, so only the remainder counts as pipeline. Adding
+the whole lead value on top would count the same money twice and push a
+break-even campaign over the scaling threshold.
+
+That worth is measured, not assumed:
 
 - Only cohorts older than a week count toward it, since a lead captured
   yesterday has not finished earning and averaging it in understates every
@@ -349,6 +356,9 @@ conservative worth of the leads it bought. That worth is measured, not assumed:
   right tail rather than assuming symmetry.
 - **Spending decisions use the lower bound**, never the mean. A list scaled on
   an optimistic lead value is a list funded by a forecast.
+- A trickle of opt-ins does not switch the safety rules off. Below the minimum
+  needed to price a lead, the ordinary kill rules still apply, so a campaign
+  cannot buy immunity with ten leads and no sales.
 
 ```bash
 python -m adgenie.cli funnel --offer 1 \
@@ -357,6 +367,11 @@ python -m adgenie.cli funnel --offer 1 \
 
 Only a salted hash of each address is stored. The address belongs in your email
 platform; an ad optimizer needs only to tell one lead from another.
+
+The opt-in and event endpoints authenticate with the **postback secret**, not
+the admin API key, since a landing page or an email webhook cannot hold your
+operator credentials. Funnel configuration and lead reporting stay behind the
+admin key.
 
 A note on tripwires: their job is not profit, it is to make the list
 self-funding. If a tripwire covers ad spend, your leads are free and everything
@@ -495,8 +510,8 @@ whenever the dashboard is served from a known origin.
 | `POST /api/optimizer/actions/{id}/approve` | Approve a held proposal |
 | `PUT /api/offers/{offer_id}/funnel` | Define the steps between click and money |
 | `GET /api/offers/{offer_id}/lead-value` | What this offer's leads have been worth |
-| `POST /api/funnel/optin` | Record a lead (authenticated) |
-| `POST /api/funnel/event` | Record a completed funnel step (authenticated) |
+| `POST /api/funnel/optin` | Record a lead (postback secret) |
+| `POST /api/funnel/event` | Record a completed funnel step (postback secret) |
 | `GET /api/funnel/leads` | Leads and their attribution |
 | `GET /api/optimizer/segments/{ad_group_id}` | Where an ad group's budget actually goes |
 | `GET /api/optimizer/rebalance/{ad_group_id}` | Advisory split across creatives |
@@ -558,7 +573,7 @@ adgenie/
   static/            dashboard
   cli.py             command line
   demo.py            end-to-end simulation
-tests/               511 tests
+tests/               523 tests
 legacy/              the original prototype scripts, kept for reference
 ```
 

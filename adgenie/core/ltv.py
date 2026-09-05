@@ -166,17 +166,32 @@ def fit_lead_value(
 
     if not mature:
         # Every lead is too young to have earned. Correct the young cohort for
-        # how little of its window has run rather than reporting near-zero.
+        # how little of its window has run, then blend with the prior: a brand
+        # new funnel whose leads have produced literally nothing yet would
+        # otherwise be valued at zero, which switches the funnel rules off and
+        # lands the campaign back on day-one revenue — the exact failure this
+        # module exists to prevent.
         observed = sum(lead.realised_value_micros for lead in leads)
         average_age = sum(
             (as_of - _aware(lead.created_at)).days for lead in leads
         ) / len(leads)
         maturity = max(0.05, model.maturity(average_age))
-        projected = int(observed / maturity / len(leads))
-        model.mean_micros = projected
+        projected = observed / maturity / len(leads)
+
+        # Same rule as the mature branch: with no prior stated there is
+        # nothing to shrink toward, and defaulting to zero would understate
+        # every young funnel.
+        if prior_micros is None:
+            prior, weight = projected, 1.0
+        else:
+            prior = prior_micros
+            weight = len(leads) / (len(leads) + _SHRINKAGE_LEADS)
+        blended = weight * projected + (1 - weight) * prior
+
+        model.mean_micros = int(blended)
         # Wide by construction: this is an extrapolation, not a measurement.
-        model.lower_micros = int(projected * 0.35)
-        model.upper_micros = int(projected * 2.0)
+        model.lower_micros = int(max(blended * 0.35, prior * 0.5))
+        model.upper_micros = int(max(blended * 2.0, prior))
         return model
 
     values = sorted(lead.realised_value_micros for lead in mature)

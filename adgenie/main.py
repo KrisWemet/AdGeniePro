@@ -132,6 +132,9 @@ app.include_router(routes_campaigns.router, prefix="/api", dependencies=_guard)
 app.include_router(routes_optimizer.router, prefix="/api", dependencies=_guard)
 app.include_router(routes_research.router, prefix="/api", dependencies=_guard)
 app.include_router(routes_funnel.router, prefix="/api", dependencies=_guard)
+# Lead capture and funnel events carry their own shared-secret auth, because a
+# landing page or an email webhook cannot hold the operator's admin key.
+app.include_router(routes_funnel.public_router, prefix="/api")
 app.include_router(routes_tracking.router)
 
 

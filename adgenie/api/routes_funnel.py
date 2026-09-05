@@ -21,14 +21,22 @@ from ..db import get_session
 from ..models import ConversionStatus, FunnelStep, FunnelStepKind, Lead, Offer
 from ..money import micros_to_usd, usd_to_micros
 
+# Configuration and reporting: operator surface, guarded like the rest of /api.
 router = APIRouter(tags=["funnel"])
+
+# Event intake: reached by a landing page or an email platform's webhook, which
+# cannot hold the operator's admin key. Authenticated with the postback secret
+# instead, exactly like the conversion postback.
+public_router = APIRouter(tags=["funnel"])
 
 
 class FunnelStepIn(BaseModel):
     key: str = Field(min_length=1, max_length=60)
     name: str = ""
     kind: FunnelStepKind = FunnelStepKind.OTHER
-    position: int = 0
+    # None means "place it where it appears in the list". An explicit 0 is a
+    # real choice and must survive; `or` would treat both the same.
+    position: int | None = None
     value_usd: float = Field(default=0.0, ge=0)
     url: str | None = None
 
@@ -103,7 +111,7 @@ def set_funnel(
                 key=payload.key,
                 name=payload.name or payload.key.replace("_", " ").title(),
                 kind=payload.kind,
-                position=payload.position or index,
+                position=index if payload.position is None else payload.position,
                 value_micros=usd_to_micros(payload.value_usd),
                 url=payload.url,
             )
@@ -163,7 +171,7 @@ def lead_value(
     }
 
 
-@router.post("/funnel/optin")
+@public_router.post("/funnel/optin")
 def capture_lead(
     payload: OptInIn,
     session: Session = Depends(get_session),
@@ -195,7 +203,7 @@ def capture_lead(
     }
 
 
-@router.post("/funnel/event")
+@public_router.post("/funnel/event")
 def funnel_event(
     payload: FunnelEventIn,
     session: Session = Depends(get_session),

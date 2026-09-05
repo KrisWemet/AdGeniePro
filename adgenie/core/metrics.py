@@ -82,6 +82,10 @@ class PerformanceWindow:
     leads: int = 0
     lead_value_micros: int = 0
     lead_value_per_lead_micros: int = 0
+    # Revenue in this window that came from leads. Already inside
+    # `revenue_micros`, tracked separately so the pipeline figure can avoid
+    # counting it a second time.
+    lead_revenue_micros: int = 0
     daily: list[dict] = field(default_factory=list)
 
     # -- rates -----------------------------------------------------------
@@ -149,14 +153,26 @@ class PerformanceWindow:
         return safe_div(self.revenue_micros, self.spend_micros)
 
     @property
+    def outstanding_lead_value_micros(self) -> int:
+        """What the leads are still expected to pay, over what they already have.
+
+        The measured value per lead is built from revenue leads have *already*
+        produced, and that same revenue is inside `revenue_micros`. Adding the
+        two would count it twice and inflate the return, so only the remainder
+        counts as pipeline.
+        """
+        expected = self.lead_value_micros
+        return max(0, expected - self.lead_revenue_micros)
+
+    @property
     def pipeline_revenue_micros(self) -> int:
-        """Realised revenue plus the conservative value of leads earned.
+        """Realised revenue plus what the leads are still expected to pay.
 
         For a funnel this is the number that reflects what the spend bought.
         Judging a lead-generation campaign on realised revenue alone reports a
         near-zero return on day one and retires the campaign that was working.
         """
-        return self.revenue_micros + self.lead_value_micros
+        return self.revenue_micros + self.outstanding_lead_value_micros
 
     @property
     def pipeline_roas(self) -> float:
@@ -300,6 +316,10 @@ class PerformanceWindow:
             "leads": self.leads,
             "cost_per_lead_usd": round(micros_to_usd(int(self.cost_per_lead_micros)), 2),
             "lead_value_usd": micros_to_usd(self.lead_value_micros),
+            "lead_revenue_usd": micros_to_usd(self.lead_revenue_micros),
+            "outstanding_lead_value_usd": micros_to_usd(
+                self.outstanding_lead_value_micros
+            ),
             "value_per_lead_usd": micros_to_usd(self.lead_value_per_lead_micros),
             "pipeline_roas": round(self.pipeline_roas, 4),
             "roas_lower": round(roas_ci.lower, 4),
@@ -486,6 +506,21 @@ def load_performance(
                 lead_fk == entity_id,
                 Lead.created_at >= start_dt.replace(tzinfo=None),
                 Lead.created_at <= end_dt.replace(tzinfo=None),
+            )
+        ).scalar_one()
+        or 0
+    )
+
+    # Revenue attributable to leads, so the pipeline figure does not count it
+    # twice once the lead value is added.
+    window.lead_revenue_micros = int(
+        session.execute(
+            select(func.coalesce(func.sum(Conversion.revenue_micros), 0)).where(
+                fk == entity_id,
+                Conversion.lead_id.is_not(None),
+                Conversion.status == ConversionStatus.APPROVED,
+                Conversion.occurred_at >= start_dt.replace(tzinfo=None),
+                Conversion.occurred_at <= end_dt.replace(tzinfo=None),
             )
         ).scalar_one()
         or 0

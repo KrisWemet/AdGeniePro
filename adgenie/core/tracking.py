@@ -428,6 +428,13 @@ def hash_email(email: str, salt: str | None = None) -> str:
     return hashlib.sha256(f"{salt}:{normalised}".encode()).hexdigest()
 
 
+def _lead_realised_value(session: Session, lead_id: int) -> int:
+    """Deferred import shim so tracking does not import ltv at module load."""
+    from .ltv import realised_value as _realised
+
+    return _realised(session, lead_id)
+
+
 def record_lead(
     session: Session,
     *,
@@ -458,6 +465,7 @@ def record_lead(
 
     click: Click | None = None
     method = "unmatched"
+    expired = False
     if click_id:
         click = session.execute(
             select(Click).where(Click.click_id == click_id)
@@ -466,19 +474,37 @@ def record_lead(
             if attribution_window_ok(click, datetime.now(timezone.utc), attribution_days):
                 method = "click_id"
             else:
+                # Known but too old to credit. Falling through to the sub-id
+                # would name the same creative and quietly undo the window.
                 method = "click_id_expired"
+                expired = True
                 click = None
 
-    ctx = decode_subid(subid) if subid else None
+    ctx = decode_subid(subid) if (subid and not expired) else None
     if click is None and ctx is not None and ctx.offer_id and method == "unmatched":
         method = "subid"
+
+    campaign_id = click.campaign_id if click else (ctx.campaign_id if ctx else None)
+    ad_group_id = click.ad_group_id if click else (ctx.ad_group_id if ctx else None)
+    creative_id = click.creative_id if click else (ctx.creative_id if ctx else None)
+
+    # A sub-id carries only the creative, so walk up to fill in its parents.
+    # Without this a lead counts at creative level and vanishes at ad group and
+    # campaign level, where the funnel rules would never see it.
+    if creative_id and not (campaign_id and ad_group_id):
+        creative = session.get(Creative, creative_id)
+        if creative is not None:
+            ad_group_id = ad_group_id or creative.ad_group_id
+            group = session.get(AdGroup, creative.ad_group_id)
+            if group is not None:
+                campaign_id = campaign_id or group.campaign_id
 
     lead = Lead(
         offer_id=offer_id,
         click_id=click.click_id if click else click_id,
-        campaign_id=click.campaign_id if click else (ctx.campaign_id if ctx else None),
-        ad_group_id=click.ad_group_id if click else (ctx.ad_group_id if ctx else None),
-        creative_id=click.creative_id if click else (ctx.creative_id if ctx else None),
+        campaign_id=campaign_id,
+        ad_group_id=ad_group_id,
+        creative_id=creative_id,
         email_hash=digest,
         source_step=source_step,
         extra={**(extra or {}), "attribution_method": method},
@@ -547,8 +573,13 @@ def record_funnel_event(
     conversion.step_key = step_key
     if lead is not None:
         conversion.lead_id = lead.id
+        session.flush()
+        # Recompute from the conversions rather than adding to a running
+        # total. A network re-sending the same postback would otherwise credit
+        # the lead twice, inflating its measured value and talking the
+        # optimizer into scaling; a reversal would never debit it at all.
+        lead.realised_value_micros = _lead_realised_value(session, lead.id)
         if status is ConversionStatus.APPROVED:
-            lead.realised_value_micros += value
             lead.last_value_at = conversion.occurred_at
     session.flush()
     return conversion, method
