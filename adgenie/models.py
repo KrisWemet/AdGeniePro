@@ -686,6 +686,52 @@ class CompetitorAd(Base):
     )
 
 
+class PlatformAsset(Base):
+    """One generated file, as it exists inside one ad account.
+
+    Keyed by account as well as platform, deliberately: an image hash belongs
+    to the ad account it was uploaded into, and the same file in a second
+    account is a second upload with a different handle. Storing one handle per
+    file would hand account A's hash to account B, where it does not resolve.
+
+    Content-addressed on the same hash the media store uses, so regenerating
+    identical bytes costs nothing and an already-uploaded asset is never sent
+    twice.
+    """
+
+    __tablename__ = "platform_assets"
+    __table_args__ = (
+        UniqueConstraint(
+            "platform", "account_id", "content_hash", name="uq_platform_asset"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    media_asset_id: Mapped[int | None] = mapped_column(
+        ForeignKey("media_assets.id"), index=True
+    )
+    platform: Mapped[Platform] = mapped_column(Enum(Platform), nullable=False)
+    # act_<id> on Meta, the customer id on Google.
+    account_id: Mapped[str] = mapped_column(String(80), default="")
+    content_hash: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+
+    kind: Mapped[MediaKind] = mapped_column(Enum(MediaKind), default=MediaKind.IMAGE)
+    # The image hash, video id or asset resource name. Opaque above the adapter.
+    handle: Mapped[str] = mapped_column(String(255), default="")
+    # A video is uploaded before it is usable. False means the file arrived but
+    # the platform is still transcoding, which is not a failure.
+    ready: Mapped[bool] = mapped_column(Boolean, default=True)
+    thumbnail_url: Mapped[str | None] = mapped_column(Text)
+    thumbnail_handle: Mapped[str | None] = mapped_column(String(255))
+    width: Mapped[int] = mapped_column(Integer, default=0)
+    height: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utcnow, onupdate=utcnow
+    )
+
+
 class AuditLog(Base):
     """Append-only record of every mutation sent to an ad platform."""
 

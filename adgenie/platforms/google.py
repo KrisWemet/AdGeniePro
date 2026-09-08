@@ -32,6 +32,8 @@ from .base import (
     CampaignSpec,
     CreativeSpec,
     InsightRow,
+    MediaHandle,
+    MediaUpload,
     PlatformError,
 )
 
@@ -281,6 +283,30 @@ class GoogleAdsClient(AdPlatform):
                 f"customers/{self.customer_id}/adGroupCriteria:mutate",
                 {"operations": operations},
             )
+
+    @property
+    def account_key(self) -> str:
+        return self.customer_id
+
+    def upload_media(self, upload: MediaUpload) -> MediaHandle:
+        """Refused, and deliberately.
+
+        The only ad this adapter builds is a responsive search ad, which is
+        text: headlines, descriptions and a URL, with no slot for an image or a
+        video. Accepting the file and uploading it as an account asset would
+        succeed, cost a call, and produce something no ad here references — the
+        operator would see media "attached" and wonder why the ads look the
+        same. Image ads on Google mean Demand Gen, Display or Performance Max,
+        which are different campaign types this adapter does not create.
+        """
+        raise PlatformError(
+            "Google responsive search ads carry no imagery, and this adapter "
+            "builds no other format, so there is nothing for an uploaded asset "
+            "to attach to. Generate media for Meta, or add a Demand Gen or "
+            "Display campaign type first.",
+            platform=self.platform,
+            code="UNSUPPORTED",
+        )
 
     def create_creative(self, spec: CreativeSpec) -> str:
         if len(spec.headlines) < 3:

@@ -96,6 +96,11 @@ class MediaStudio:
 
         # Only a URL the platform can fetch belongs here. A local path would be
         # handed to Meta as if it were an image source, and rejected.
+        #
+        # This is the fallback path, not the main one. Media reaches an ad by
+        # being uploaded into the ad account, which needs nothing but the file
+        # on disk; a public URL matters only where a platform fetches by URL
+        # instead. So its absence is worth noting once, not warning about.
         fetchable = [
             a.public_url for a in assets
             if a.status is MediaStatus.READY and a.public_url
@@ -103,10 +108,10 @@ class MediaStudio:
         if fetchable:
             creative.media_urls = fetchable
         elif any(a.status is MediaStatus.READY for a in assets):
-            logger.warning(
-                "Generated %s asset(s) for creative %s but MEDIA_PUBLIC_BASE_URL "
-                "is not set, so there is no address a platform can fetch them "
-                "from. The files are on disk; set it to attach them to a live ad.",
+            logger.debug(
+                "Generated %s asset(s) for creative %s with no "
+                "MEDIA_PUBLIC_BASE_URL set. They will be uploaded to the ad "
+                "account from disk, which is the durable route anyway.",
                 sum(1 for a in assets if a.status is MediaStatus.READY),
                 creative.id,
             )

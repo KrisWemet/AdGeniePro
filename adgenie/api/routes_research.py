@@ -317,6 +317,48 @@ def generate_media(
     }
 
 
+@router.post("/media/upload/{creative_id}")
+def upload_media(creative_id: int, session: Session = Depends(get_session)) -> dict:
+    """Put a creative's generated files into the live ad account.
+
+    Generation leaves a file on disk. An ad needs a reference the platform will
+    still resolve in six weeks, and that means the ad account owning the asset
+    rather than fetching it from a URL that expires.
+    """
+    from ..core.orchestrator import Orchestrator
+    from ..media.uploader import MediaUploader
+    from ..models import AdGroup, Campaign
+
+    creative = session.get(Creative, creative_id)
+    if creative is None:
+        raise HTTPException(404, f"creative {creative_id} not found")
+    group = session.get(AdGroup, creative.ad_group_id)
+    campaign = session.get(Campaign, group.campaign_id) if group else None
+    if campaign is None:
+        raise HTTPException(409, "creative has no campaign, so no ad account")
+
+    settings = get_settings()
+    client = Orchestrator(session, settings=settings).client(campaign.platform)
+    handles = MediaUploader(session, settings=settings).handles_for_creative(
+        creative, client
+    )
+    session.commit()
+    return {
+        "creative_id": creative_id,
+        "platform": campaign.platform.value,
+        "account": client.account_key,
+        "uploaded": [
+            {
+                "kind": h.kind,
+                "handle": h.handle,
+                "ready": h.ready,
+                "thumbnail_url": h.thumbnail_url or None,
+            }
+            for h in handles
+        ],
+    }
+
+
 @router.get("/media/assets")
 def list_assets(
     creative_id: int | None = None,

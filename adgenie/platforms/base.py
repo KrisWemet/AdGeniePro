@@ -38,6 +38,46 @@ class PlatformError(RuntimeError):
         self.payload = payload or {}
 
 
+@dataclass(frozen=True)
+class MediaUpload:
+    """A local file on its way into an ad account.
+
+    The path is deliberately local. A generated asset reaches the platform by
+    being uploaded to the ad account, not by being linked to: a provider result
+    URL expires within about a day, and an ad still pointing at one after that
+    is an ad with a broken image that keeps spending.
+    """
+
+    path: str
+    content_type: str
+    kind: str = "image"  # "image" or "video"
+    name: str = ""
+    content_hash: str = ""
+
+
+@dataclass
+class MediaHandle:
+    """What the platform gave back, in the platform's own terms.
+
+    Meta returns an image hash or a video id; Google returns an asset resource
+    name. Callers above this interface only ever pass it back, never read it.
+    """
+
+    kind: str
+    handle: str
+    # A video is not usable the instant it is uploaded, and a video creative
+    # needs a thumbnail. Both are filled once the platform has finished.
+    ready: bool = True
+    thumbnail_url: str = ""
+    thumbnail_handle: str = ""
+    width: int = 0
+    height: int = 0
+
+    @property
+    def is_video(self) -> bool:
+        return self.kind == "video"
+
+
 @dataclass
 class CampaignSpec:
     name: str
@@ -71,7 +111,11 @@ class CreativeSpec:
     descriptions: list[str] = field(default_factory=list)
     primary_texts: list[str] = field(default_factory=list)
     call_to_action: str = "LEARN_MORE"
+    # A URL the platform can fetch. Kept for the case where imagery is hosted
+    # somewhere public already; `media` is the path for anything this project
+    # generated, and takes precedence where both are set.
     media_urls: list[str] = field(default_factory=list)
+    media: list[MediaHandle] = field(default_factory=list)
     display_url_path: list[str] = field(default_factory=list)
     status: str = "PAUSED"
     extra: dict = field(default_factory=dict)
@@ -150,6 +194,36 @@ class AdPlatform(abc.ABC):
     @abc.abstractmethod
     def create_creative(self, spec: CreativeSpec) -> str:
         """Return the platform's ad id."""
+
+    @property
+    def account_key(self) -> str:
+        """Which ad account this client is pointed at.
+
+        An uploaded asset's handle belongs to one account, so anything caching
+        handles has to key on this as well as the platform.
+        """
+        return ""
+
+    def refresh_media(self, handle: MediaHandle) -> MediaHandle:
+        """Re-check an upload that was not usable yet.
+
+        Only videos need this, and only for the minutes they spend transcoding.
+        The default is right for anything that is ready the moment it lands.
+        """
+        return handle
+
+    def upload_media(self, upload: MediaUpload) -> MediaHandle:
+        """Put a local file into the ad account and return its handle.
+
+        Optional, and refusing is a real answer: a platform whose only ad
+        format here is text has nowhere to put an image, and saying so beats
+        accepting the file and silently dropping it.
+        """
+        raise PlatformError(
+            f"{self.platform.value} does not accept media uploads here",
+            platform=self.platform,
+            code="UNSUPPORTED",
+        )
 
     # -- mutation --
     @abc.abstractmethod

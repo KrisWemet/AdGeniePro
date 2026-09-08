@@ -20,6 +20,7 @@ import math
 import random
 from dataclasses import dataclass, field
 from datetime import date, timedelta
+from pathlib import Path
 
 from ..models import Platform
 from .base import (
@@ -29,6 +30,8 @@ from .base import (
     CampaignSpec,
     CreativeSpec,
     InsightRow,
+    MediaHandle,
+    MediaUpload,
     PlatformError,
 )
 
@@ -74,14 +77,22 @@ class SandboxPlatform(AdPlatform):
         seed: int = 1337,
         market: MarketModel | None = None,
         fail_on: set[str] | None = None,
+        account: str | None = None,
     ) -> None:
         self.platform = platform
+        # Which ad account this client stands in for. Uploaded media belongs to
+        # one account, so simulating two means being able to name them apart.
+        self.account = account or f"sandbox-{platform.value}"
         self.seed = seed
         self.market = market or MarketModel()
         self.entities: dict[str, SandboxEntity] = {}
         self.insights: dict[tuple[str, date], InsightRow] = {}
         self.calls: list[tuple[str, dict]] = []
         self.uploaded_conversions: list[dict] = []
+        self.media: dict[str, MediaUpload] = {}
+        # Set to make uploaded video come back still transcoding, which is the
+        # state a real one is in for the first minutes of its life.
+        self.video_processing_delay = False
         # Operation names that should raise, for exercising error handling.
         self.fail_on = fail_on or set()
         self._counter = 0
@@ -187,6 +198,53 @@ class SandboxPlatform(AdPlatform):
         )
         self.calls.append(("create_ad_group", {"id": eid, "name": spec.name}))
         return eid
+
+    @property
+    def account_key(self) -> str:
+        return self.account
+
+    def refresh_media(self, handle: MediaHandle) -> MediaHandle:
+        if handle.ready or not handle.is_video:
+            return handle
+        if not self.video_processing_delay:
+            handle.ready = True
+            handle.thumbnail_url = f"https://sandbox.test/thumb/{handle.handle[:16]}.jpg"
+        return handle
+
+    def upload_media(self, upload: MediaUpload) -> MediaHandle:
+        """Mirror the real adapters, refusals included.
+
+        Google is refused here for the same reason the live adapter refuses:
+        the only format it builds is text. A simulator that quietly accepted
+        the file would hide that from every test that runs through it.
+        """
+        self._guard("upload_media")
+        if self.platform is Platform.GOOGLE:
+            raise PlatformError(
+                "Google responsive search ads carry no imagery",
+                platform=self.platform,
+                code="UNSUPPORTED",
+            )
+        path = Path(upload.path)
+        if not path.is_file():
+            raise PlatformError(
+                f"no file to upload at {path}",
+                platform=self.platform,
+                code="NO_FILE",
+            )
+        digest = upload.content_hash or hashlib.sha256(path.read_bytes()).hexdigest()
+        handle = MediaHandle(kind=upload.kind, handle=digest[:32])
+        if upload.kind == "video":
+            # Real videos transcode, and the caller has to cope with one that
+            # is not usable yet. `video_processing_delay` lets a test ask for
+            # that case on purpose.
+            handle.ready = not self.video_processing_delay
+            handle.thumbnail_url = (
+                f"https://sandbox.test/thumb/{digest[:16]}.jpg" if handle.ready else ""
+            )
+        self.media[handle.handle] = upload
+        self.calls.append(("upload_media", {"kind": upload.kind, "name": upload.name}))
+        return handle
 
     def create_creative(self, spec: CreativeSpec) -> str:
         self._guard("create_creative")

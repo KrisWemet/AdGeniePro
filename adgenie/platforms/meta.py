@@ -14,10 +14,12 @@ optimizes toward landing-page views it can see rather than sales it cannot.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
 from datetime import date
+from pathlib import Path
 from urllib.parse import parse_qsl, urlparse
 
 import httpx
@@ -32,6 +34,8 @@ from .base import (
     CampaignSpec,
     CreativeSpec,
     InsightRow,
+    MediaHandle,
+    MediaUpload,
     PlatformError,
 )
 
@@ -44,6 +48,17 @@ GRAPH_BASE = "https://graph.facebook.com"
 RETRYABLE_CODES = {1, 2, 4, 17, 32, 341, 368, 613}
 
 LEVEL_TO_META = {"campaign": "campaign", "ad_group": "adset", "creative": "ad"}
+
+# A freshly uploaded video is not usable yet. Meta transcodes it, and an ad
+# created against one that is still processing is rejected, so the upload is
+# not finished until Meta says it is.
+VIDEO_READY_TIMEOUT_SECONDS = 300
+VIDEO_POLL_SECONDS = 5
+
+# Meta's own ceilings, checked here so an oversized file fails locally with a
+# useful message rather than after uploading for a minute.
+MAX_IMAGE_BYTES = 30 * 1024 * 1024
+MAX_VIDEO_BYTES = 4 * 1024 * 1024 * 1024
 
 
 
@@ -75,7 +90,13 @@ class MetaAdsClient(AdPlatform):
         return f"{GRAPH_BASE}/{self.api_version}/{path.lstrip('/')}"
 
     def _request(
-        self, method: str, path: str, *, data: dict | None = None, params: dict | None = None
+        self,
+        method: str,
+        path: str,
+        *,
+        data: dict | None = None,
+        params: dict | None = None,
+        files: dict | None = None,
     ) -> dict:
         payload = dict(data or {})
         query = dict(params or {})
@@ -90,7 +111,11 @@ class MetaAdsClient(AdPlatform):
         for attempt in range(4):
             try:
                 response = self._client.request(
-                    method, self._url(path), data=payload or None, params=query
+                    method,
+                    self._url(path),
+                    data=payload or None,
+                    params=query,
+                    files=files or None,
                 )
             except httpx.HTTPError as exc:
                 last_error = PlatformError(
@@ -192,38 +217,98 @@ class MetaAdsClient(AdPlatform):
                 code="NO_PAGE",
             )
 
-        link_data: dict = {
-            "link": spec.final_url,
-            "message": spec.primary_texts[0] if spec.primary_texts else "",
-            "name": spec.headlines[0] if spec.headlines else "",
-            "description": spec.descriptions[0] if spec.descriptions else "",
-            "call_to_action": {
-                "type": spec.call_to_action,
-                "value": {"link": spec.final_url},
-            },
+        images = [m for m in spec.media if m.kind == "image" and m.handle]
+        videos = [m for m in spec.media if m.is_video and m.handle]
+        unready = [m for m in videos if not m.ready]
+        if unready:
+            raise PlatformError(
+                f"video {unready[0].handle} is uploaded but still processing; "
+                "an ad built on it now would be rejected. Retry once Meta has "
+                "finished with it.",
+                platform=self.platform,
+                code="VIDEO_NOT_READY",
+            )
+
+        call_to_action = {
+            "type": spec.call_to_action,
+            "value": {"link": spec.final_url},
         }
-        if spec.media_urls:
-            link_data["picture"] = spec.media_urls[0]
-        if spec.extra.get("image_hash"):
-            link_data["image_hash"] = spec.extra["image_hash"]
+        message = spec.primary_texts[0] if spec.primary_texts else ""
+
+        if videos:
+            # A video ad is a different object, not a link ad with a video on
+            # it: `video_data` rather than `link_data`, and Meta requires a
+            # still image for the pre-roll frame.
+            video = videos[0]
+            story_field = "video_data"
+            story_body: dict = {
+                "video_id": video.handle,
+                "message": message,
+                "title": spec.headlines[0] if spec.headlines else "",
+                "link_description": spec.descriptions[0] if spec.descriptions else "",
+                "call_to_action": call_to_action,
+            }
+            if video.thumbnail_handle:
+                story_body["image_hash"] = video.thumbnail_handle
+            elif video.thumbnail_url:
+                story_body["image_url"] = video.thumbnail_url
+            elif images:
+                story_body["image_hash"] = images[0].handle
+            else:
+                raise PlatformError(
+                    "a video ad needs a thumbnail and none is available. Meta "
+                    "generates one during transcoding; if it did not, supply an "
+                    "image alongside the video.",
+                    platform=self.platform,
+                    code="NO_VIDEO_THUMBNAIL",
+                )
+        else:
+            story_field = "link_data"
+            story_body = {
+                "link": spec.final_url,
+                "message": message,
+                "name": spec.headlines[0] if spec.headlines else "",
+                "description": spec.descriptions[0] if spec.descriptions else "",
+                "call_to_action": call_to_action,
+            }
+            # An uploaded hash beats a URL: the ad account owns the image, so
+            # the reference cannot rot. `picture` is the fallback for imagery
+            # that already lives somewhere public and permanent.
+            if images:
+                story_body["image_hash"] = images[0].handle
+            elif spec.extra.get("image_hash"):
+                story_body["image_hash"] = spec.extra["image_hash"]
+            elif spec.media_urls:
+                story_body["picture"] = spec.media_urls[0]
 
         creative_data = {
             "name": spec.name,
             "object_story_spec": json.dumps(
-                {"page_id": page_id, "link_data": link_data}
+                {"page_id": page_id, story_field: story_body}
             ),
         }
         # Hand Meta the extra variants so it can run its own asset-level test.
         if len(spec.headlines) > 1 or len(spec.primary_texts) > 1:
-            creative_data["asset_feed_spec"] = json.dumps(
-                {
-                    "titles": [{"text": h} for h in spec.headlines[:5]],
-                    "bodies": [{"text": p} for p in spec.primary_texts[:5]],
-                    "descriptions": [{"text": d} for d in spec.descriptions[:5]],
-                    "link_urls": [{"website_url": spec.final_url}],
-                    "call_to_action_types": [spec.call_to_action],
-                }
-            )
+            feed: dict = {
+                "titles": [{"text": h} for h in spec.headlines[:5]],
+                "bodies": [{"text": p} for p in spec.primary_texts[:5]],
+                "descriptions": [{"text": d} for d in spec.descriptions[:5]],
+                "link_urls": [{"website_url": spec.final_url}],
+                "call_to_action_types": [spec.call_to_action],
+            }
+            # The asset feed takes hashes and ids, never URLs, so only uploaded
+            # media can take part in Meta's own asset-level test.
+            if images:
+                feed["images"] = [{"hash": m.handle} for m in images[:10]]
+            if videos:
+                feed["videos"] = [
+                    {
+                        "video_id": m.handle,
+                        **({"thumbnail_url": m.thumbnail_url} if m.thumbnail_url else {}),
+                    }
+                    for m in videos[:10]
+                ]
+            creative_data["asset_feed_spec"] = json.dumps(feed)
         creative = self._request(
             "POST", f"act_{self.account_id}/adcreatives", data=creative_data
         )
@@ -239,6 +324,162 @@ class MetaAdsClient(AdPlatform):
             },
         )
         return str(ad["id"])
+
+    # -- media -----------------------------------------------------------
+    @property
+    def account_key(self) -> str:
+        return f"act_{self.account_id}"
+
+    def refresh_media(self, handle: MediaHandle) -> MediaHandle:
+        if handle.ready or not handle.is_video or self.dry_run:
+            return handle
+        handle.ready = self._wait_for_video(handle.handle)
+        if handle.ready and not handle.thumbnail_url:
+            handle.thumbnail_url = self._video_thumbnail(handle.handle)
+        return handle
+
+    def upload_media(self, upload: MediaUpload) -> MediaHandle:
+        """Put a local file into the ad account.
+
+        An ad has to reference imagery the ad account owns. Handing Meta a URL
+        works only for as long as that URL does, which for a generated asset is
+        about a day — after that the ad is still running and still spending,
+        with a broken image. Uploading makes the ad account the owner and the
+        reference permanent.
+        """
+        path = Path(upload.path)
+        if not path.is_file():
+            raise PlatformError(
+                f"no file to upload at {path}",
+                platform=self.platform,
+                code="NO_FILE",
+            )
+        name = upload.name or path.name
+        size = path.stat().st_size
+        ceiling = MAX_VIDEO_BYTES if upload.kind == "video" else MAX_IMAGE_BYTES
+        if size > ceiling:
+            raise PlatformError(
+                f"{path.name} is {size / 1024 / 1024:.0f} MB, over Meta's "
+                f"{ceiling // 1024 // 1024} MB limit for a {upload.kind}.",
+                platform=self.platform,
+                code="TOO_LARGE",
+            )
+
+        if self.dry_run:
+            # `_request` fakes POSTs but the GETs that follow an upload are
+            # real, so the whole sequence is simulated here instead. A dry run
+            # that failed to "upload" would make every dry-run launch report
+            # media it could not attach.
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            logger.info("[dry-run] meta upload %s %s", upload.kind, name)
+            return MediaHandle(
+                kind=upload.kind,
+                handle=f"dryrun_{digest[:24]}",
+                ready=True,
+                thumbnail_url=(
+                    f"https://dryrun.invalid/{digest[:16]}.jpg"
+                    if upload.kind == "video"
+                    else ""
+                ),
+            )
+
+        if upload.kind == "video":
+            return self._upload_video(path, name, upload.content_type)
+        return self._upload_image(path, name, upload.content_type)
+
+    def _upload_image(self, path: Path, name: str, content_type: str) -> MediaHandle:
+        # Read into memory rather than streaming a handle: `_request` retries,
+        # and a file object replayed after the first attempt is already at EOF,
+        # which uploads nothing and succeeds. The size guard above bounds this.
+        body = self._request(
+            "POST",
+            f"act_{self.account_id}/adimages",
+            files={"filename": (name, path.read_bytes(), content_type)},
+        )
+        # Meta keys the response by the filename it was given, and that name is
+        # not always echoed back verbatim, so take whichever single entry came
+        # back rather than looking it up by the name we sent.
+        images = body.get("images") or {}
+        entry = images.get(name)
+        if entry is None and len(images) == 1:
+            # Exactly one image went up, so the single entry is unambiguously
+            # it. Only fall back when there is nothing to confuse it with.
+            entry = next(iter(images.values()))
+        if entry is None and body.get("hash"):
+            entry = body
+        if not entry or not entry.get("hash"):
+            raise PlatformError(
+                f"Meta accepted the image but returned no hash: {_preview(body)}",
+                platform=self.platform,
+                code="NO_IMAGE_HASH",
+                payload=body,
+            )
+        return MediaHandle(
+            kind="image",
+            handle=str(entry["hash"]),
+            width=int(entry.get("width") or 0),
+            height=int(entry.get("height") or 0),
+        )
+
+    def _upload_video(self, path: Path, name: str, content_type: str) -> MediaHandle:
+        body = self._request(
+            "POST",
+            f"act_{self.account_id}/advideos",
+            data={"name": name},
+            files={"source": (name, path.read_bytes(), content_type)},
+        )
+        video_id = str(body.get("id") or "")
+        if not video_id:
+            raise PlatformError(
+                f"Meta accepted the video but returned no id: {_preview(body)}",
+                platform=self.platform,
+                code="NO_VIDEO_ID",
+                payload=body,
+            )
+        handle = MediaHandle(kind="video", handle=video_id, ready=self.dry_run)
+        if not self.dry_run:
+            handle.ready = self._wait_for_video(video_id)
+            if handle.ready:
+                handle.thumbnail_url = self._video_thumbnail(video_id)
+        return handle
+
+    def _wait_for_video(self, video_id: str) -> bool:
+        """Block until Meta has finished transcoding, or give up saying so."""
+        deadline = time.monotonic() + VIDEO_READY_TIMEOUT_SECONDS
+        while True:
+            body = self._request("GET", video_id, params={"fields": "status"})
+            phase = ((body.get("status") or {}).get("video_status") or "").lower()
+            if phase == "ready":
+                return True
+            if phase == "error":
+                raise PlatformError(
+                    f"Meta could not process video {video_id}: {_preview(body)}",
+                    platform=self.platform,
+                    code="VIDEO_PROCESSING_FAILED",
+                    payload=body,
+                )
+            if time.monotonic() >= deadline:
+                # Not an error: it may well finish later. The caller needs to
+                # know it cannot build an ad on it *yet*, which is different
+                # from the upload having failed.
+                logger.warning(
+                    "Video %s is still processing after %ss; it is uploaded but "
+                    "not usable yet.",
+                    video_id,
+                    VIDEO_READY_TIMEOUT_SECONDS,
+                )
+                return False
+            time.sleep(VIDEO_POLL_SECONDS)
+
+    def _video_thumbnail(self, video_id: str) -> str:
+        """A video creative needs a still. Meta generates them during
+        transcoding, so prefer its preferred one over inventing our own."""
+        body = self._request("GET", f"{video_id}/thumbnails")
+        frames = body.get("data") or []
+        if not frames:
+            return ""
+        preferred = next((f for f in frames if f.get("is_preferred")), frames[0])
+        return str(preferred.get("uri") or "")
 
     # -- mutation --------------------------------------------------------
     def set_status(self, level: str, external_id: str, active: bool) -> None:

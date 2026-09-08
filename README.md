@@ -304,10 +304,47 @@ One asset per placement, at the size the placement serves: Meta feed 4:5,
 square 1:1, story 9:16, Google Demand Gen 1.91:1, 1:1 and 4:5. Text-only
 formats generate nothing.
 
-To attach imagery to a *live* ad, set `MEDIA_PUBLIC_BASE_URL` — the platforms
-fetch the image over HTTP, they do not read your disk. Without it the files are
-still generated and stored, but nothing is attached to the ad and the server
-says so rather than handing Meta a filesystem path.
+### Getting it onto the ad
+
+Generation produces a file. An ad needs a reference the platform will still
+resolve in six weeks, and those are not the same thing — the gap between them
+is where a campaign serves a broken image while continuing to spend.
+
+So the file is **uploaded into the ad account**, which then owns it:
+
+```bash
+python -m adgenie.cli media --creative 3 --upload
+```
+
+```
+  Uploaded to meta account act_123456:
+    image   9f2c1b7ae4d8...                          ready
+```
+
+Meta takes an image through `/adimages` and hands back a hash; a video goes to
+`/advideos` and comes back as an id. Uploads are content-addressed and keyed by
+**ad account as well as platform**, because an image hash belongs to the account
+it was uploaded into — handing account A's hash to account B produces an ad
+referencing something that does not exist there. The same file going to the
+same account a second time costs nothing.
+
+Three things about video are not optional and are easy to get wrong. A video is
+not usable the moment it uploads — Meta transcodes it, and an ad built against
+one still processing is rejected, so the upload is not finished until Meta says
+it is. A video ad is a different object, `video_data` rather than `link_data`
+with a video attached. And it needs a still for the pre-roll frame; Meta
+generates candidates during transcoding and marks one preferred, which is the
+one used. If none exists, the ad is refused rather than built broken.
+
+`MEDIA_PUBLIC_BASE_URL` is now optional. It only matters if you also want the
+assets reachable over HTTP; the upload path needs nothing but the local file.
+
+**Google is refused, deliberately.** The only format this adapter builds is a
+responsive search ad, which is text. Uploading an image as an account asset
+would succeed, cost a call, and produce something no ad here references — the
+operator would see media "attached" and wonder why the ads look the same. Image
+ads on Google mean Demand Gen, Display or Performance Max, which are campaign
+types this adapter does not create yet.
 
 Generation is also suppressed under `DRY_RUN`, which falls back to the sandbox.
 A mode whose purpose is to have no side effects should not have billing as its
@@ -754,6 +791,7 @@ whenever the dashboard is served from a known origin.
 | `GET /api/media/placements` | Placement sizes per platform |
 | `POST /api/media/preview-prompt` | Build and screen a prompt, generating nothing |
 | `POST /api/media/generate/{creative_id}` | Generate the imagery a creative needs |
+| `POST /api/media/upload/{creative_id}` | Put its files into the live ad account |
 | `GET /api/media/assets` | Generated assets |
 | `GET /api/audit` | Every mutation ever sent to an ad account |
 | `GET /r` | Click redirect (public) |
@@ -796,6 +834,7 @@ adgenie/
     prompts.py       prompt building and pre-generation screening
     kie.py           kie.ai async job client
     store.py         download before the URL expires
+    uploader.py      into the ad account, so the reference cannot rot
     sandbox.py       real PNGs at the right size, no key needed
     studio.py        plan, screen, generate, persist
   research/

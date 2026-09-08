@@ -598,7 +598,41 @@ def cmd_media(args) -> int:
                 f"  {asset.status.value:<10}{(asset.extra or {}).get('placement',''):<18}"
                 f"{asset.aspect_ratio:<7}{location}"
             )
+        if args.upload:
+            print()
+            return _upload_media(session, settings, creative)
         return 0 if any(a.status.value == "ready" for a in assets) else 1
+
+
+def _upload_media(session, settings, creative) -> int:
+    """Push this creative's generated files into the live ad account.
+
+    Worth running on its own: it is the first thing in the media pipeline that
+    talks to a real ad platform, so it is where credentials, permissions and
+    file formats get their first honest test.
+    """
+    from .media.uploader import MediaUploader
+    from .platforms.factory import get_platform
+    from .models import AdGroup, Campaign
+
+    group = session.get(AdGroup, creative.ad_group_id)
+    campaign = session.get(Campaign, group.campaign_id) if group else None
+    if campaign is None:
+        print("creative has no campaign, so no ad account to upload to", file=sys.stderr)
+        return 1
+
+    client = get_platform(campaign.platform, settings)
+    handles = MediaUploader(session, settings=settings).handles_for_creative(
+        creative, client
+    )
+    if not handles:
+        print("  Nothing uploaded. Check the log above for why.")
+        return 1
+    print(f"  Uploaded to {campaign.platform.value} account {client.account_key}:")
+    for handle in handles:
+        state = "ready" if handle.ready else "still processing"
+        print(f"    {handle.kind:<6}{handle.handle:<40}{state}")
+    return 0
 
 
 def cmd_demo(args) -> int:
@@ -667,6 +701,10 @@ def build_parser() -> argparse.ArgumentParser:
     media.add_argument("--creative", type=int, required=True)
     media.add_argument("--kind", default="image", choices=["image", "video"])
     media.add_argument("--placement", action="append", help="repeatable")
+    media.add_argument(
+        "--upload", action="store_true",
+        help="also push the files into the live ad account and print the handles",
+    )
     media.set_defaults(func=cmd_media)
 
     launch = sub.add_parser("launch", help="build and launch a structured test")

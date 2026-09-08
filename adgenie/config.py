@@ -91,6 +91,9 @@ class Settings(BaseSettings):
     # Generated asset URLs expire within about a day, so they are downloaded
     # and kept locally as soon as a task finishes.
     media_storage_dir: str = "./media"
+    # Optional. Media reaches an ad by being uploaded into the ad account from
+    # this local copy; a public address is only needed where a platform fetches
+    # imagery by URL rather than owning it.
     media_public_base_url: str | None = None
 
     # --- competitor research (Meta Ad Library) ---

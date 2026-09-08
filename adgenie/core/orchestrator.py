@@ -969,6 +969,7 @@ class Orchestrator:
                 descriptions=child.descriptions,
                 primary_texts=child.primary_texts,
                 call_to_action=child.call_to_action,
+                media=self._media_handles(child, campaign.platform),
                 status="PAUSED",
             )
             try:
@@ -1144,6 +1145,24 @@ class Orchestrator:
                 "introduced": introduced,
             },
         }
+
+    def _media_handles(self, creative: Creative, platform: Platform) -> list:
+        """Any imagery this creative already has, as the platform knows it.
+
+        A bred variant inherits no media of its own, so this is usually empty
+        and the ad is text plus whatever the ad set carries. When media has
+        been generated for it, uploading is idempotent and costs nothing the
+        second time.
+        """
+        from ..media.uploader import MediaUploader
+
+        try:
+            return MediaUploader(
+                self.session, settings=self.settings
+            ).handles_for_creative(creative, self.client(platform))
+        except Exception as exc:
+            logger.error("Media upload failed for creative %s: %s", creative.id, exc)
+            return []
 
     def _exclude_segment(
         self, platform: Platform, action: OptimizationAction, entity: AdGroup

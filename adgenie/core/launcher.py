@@ -435,6 +435,10 @@ class CampaignLauncher:
                 self._attach_media(creative, plan, campaign.platform, ad_format)
             )
 
+        # Uploaded into the ad account rather than linked to. A generated file
+        # lives behind a URL that expires; the ad has to outlast it.
+        media = self._upload_media(creative, client)
+
         spec = CreativeSpec(
             ad_group_external_id=group.external_id or "",
             name=creative.name,
@@ -445,6 +449,7 @@ class CampaignLauncher:
             call_to_action=creative.call_to_action,
             display_url_path=creative.display_url_path,
             media_urls=creative.media_urls,
+            media=media,
             status=status,
         )
         try:
@@ -562,6 +567,22 @@ class CampaignLauncher:
         ids = [a.id for a in assets]
         creative.generator_meta = {**creative.generator_meta, "media_asset_ids": ids}
         return ids
+
+    def _upload_media(self, creative: Creative, client) -> list:
+        """Put this creative's generated files into the ad account.
+
+        Never fatal. An ad with no image still runs; a launch that died trying
+        to attach one does not.
+        """
+        from ..media.uploader import MediaUploader
+
+        try:
+            return MediaUploader(
+                self.session, settings=self.settings
+            ).handles_for_creative(creative, client)
+        except Exception as exc:
+            logger.error("Media upload failed for %s: %s", creative.name, exc)
+            return []
 
     def _audit(
         self, platform: Platform, operation: str, target: str, request: dict, entity
