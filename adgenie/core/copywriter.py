@@ -72,6 +72,11 @@ class CopyBrief:
     market_notes: list[str] = field(default_factory=list)
     # Findings from a previous failed attempt, fed back on regeneration.
     repair_notes: list[str] = field(default_factory=list)
+    # Which execution of this angle is being written. Several executions of one
+    # argument is a normal thing to ask for — it is how an angle gets tested
+    # rather than one ad. Without this the deterministic generator returns the
+    # same copy every time and the "test" is one ad running three times.
+    variant_index: int = 0
 
     def mechanism(self) -> str:
         if self.key_benefits:
@@ -173,10 +178,24 @@ class TemplateCopywriter:
     def __init__(self, rng: random.Random | None = None) -> None:
         self.rng = rng or random.Random()
 
+    @staticmethod
+    def _rotate(options: list, index: int) -> list:
+        """Start the same pool at a different place for each execution.
+
+        The pools are ordered best-first, so rotating rather than shuffling
+        keeps every execution drawing from the same quality of material while
+        making them genuinely different ads.
+        """
+        if not options:
+            return options
+        offset = index % len(options)
+        return options[offset:] + options[:offset]
+
     def generate(self, brief: CopyBrief) -> CreativeDraft:
         angle = brief.angle or angles_for(brief.platform.value, 1)[0]
         spec = get_spec(brief.platform, brief.ad_format)
         subs = self._substitutions(brief, angle)
+        nth = brief.variant_index
 
         headline_spec = spec.fields["headlines"]
         headlines: list[str] = []
@@ -197,7 +216,7 @@ class TemplateCopywriter:
             "Ships In Two Days",
             "Questions Answered Here",
         ]
-        for pattern in pool:
+        for pattern in self._rotate(pool, nth):
             text = truncate_to_spec(self._fill(pattern, subs), headline_spec.max_chars)
             if text and text.lower() not in {h.lower() for h in headlines}:
                 headlines.append(text)
@@ -218,7 +237,7 @@ class TemplateCopywriter:
                 ),
                 self._fill("{proof} Learn what is included. #ad", subs),
             ]
-            for cand in candidates:
+            for cand in self._rotate(candidates, nth):
                 text = truncate_to_spec(cand, desc_spec.max_chars)
                 if text and text.lower() not in {d.lower() for d in descriptions}:
                     descriptions.append(text)
@@ -230,7 +249,7 @@ class TemplateCopywriter:
         if primary_spec:
             body = self._fill(angle.body_pattern, subs)
             disclosure = " #ad"
-            for variant in (
+            for variant in self._rotate([
                 body,
                 self._fill(
                     "{product_name} {mechanism}. {benefit_line} {proof} "
@@ -242,7 +261,7 @@ class TemplateCopywriter:
                     "Everything else is on the page.",
                     subs,
                 ),
-            ):
+            ], nth):
                 text = truncate_to_spec(
                     variant + disclosure, primary_spec.max_chars
                 )
@@ -487,6 +506,17 @@ class LLMCopywriter:
             )
         parts += ["", "## Rules", *[f"- {r}" for r in rules]]
 
+        if brief.variant_index:
+            parts += [
+                "",
+                "## This is another execution of the same angle",
+                f"You have already written {brief.variant_index} ad(s) for this "
+                "argument. Make this one materially different — a different "
+                "opening, a different concrete detail, a different rhythm. "
+                "Rewording the same sentence produces ads that fatigue "
+                "together and teaches nothing about the argument.",
+            ]
+
         if brief.repair_notes:
             parts += [
                 "",
@@ -565,21 +595,39 @@ class CopyStudio:
         return draft
 
     def write_variants(
-        self, brief: CopyBrief, count: int = 3, offer=None
+        self, brief: CopyBrief, count: int = 3, offer=None, same_angle: bool = False
     ) -> list[CreativeDraft]:
-        """One draft per angle, so a test explores arguments rather than synonyms."""
-        # Start with the angles that suit this platform's intent, then fall back
-        # to the rest of the library, then repeat from the top. A caller asking
-        # for ten variants gets ten, rather than silently fewer.
-        preferred = angles_for(brief.platform.value)
-        remaining = [a for a in ANGLES if a not in preferred]
-        ordered = preferred + remaining
-        pool = [ordered[i % len(ordered)] for i in range(count)]
+        """Several drafts from one brief.
+
+        By default, one draft per angle, so a test explores arguments rather
+        than synonyms. With `same_angle`, `count` fresh *executions of one
+        argument* instead — new headlines and hooks for an argument already
+        chosen. Which one a caller wants is not inferable from the brief:
+        refreshing a worn-out ad wants a spread of arguments, and introducing
+        a specific angle wants several attempts at that one.
+        """
+        if same_angle:
+            pool = [brief.angle or angles_for(brief.platform.value, 1)[0]] * count
+        else:
+            # Start with the angles that suit this platform's intent, then fall
+            # back to the rest of the library, then repeat from the top. A
+            # caller asking for ten variants gets ten, not silently fewer.
+            preferred = angles_for(brief.platform.value)
+            remaining = [a for a in ANGLES if a not in preferred]
+            ordered = preferred + remaining
+            pool = [ordered[i % len(ordered)] for i in range(count)]
 
         drafts: list[CreativeDraft] = []
-        for angle in pool:
+        for index, angle in enumerate(pool):
             variant = CopyBrief(
-                **{**brief.__dict__, "angle": angle, "repair_notes": []}
+                **{
+                    **brief.__dict__,
+                    "angle": angle,
+                    "repair_notes": [],
+                    # Only meaningful when the angle repeats; harmless when it
+                    # does not, since a different angle already differs.
+                    "variant_index": index if same_angle else 0,
+                }
             )
             drafts.append(self.write(variant, offer=offer))
         return drafts

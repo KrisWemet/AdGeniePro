@@ -346,6 +346,58 @@ def cmd_segments(args) -> int:
     return 0
 
 
+def cmd_rotate(args) -> int:
+    init_db()
+    from .core.orchestrator import Orchestrator
+    from .models import Offer as OfferModel
+
+    with session_scope() as session:
+        offers = (
+            [session.get(OfferModel, args.offer)]
+            if args.offer
+            else list(session.query(OfferModel).all())
+        )
+        for offer in [o for o in offers if o is not None]:
+            orchestrator = Orchestrator(session)
+            plan = (
+                orchestrator.apply_rotation(offer.id)
+                if args.apply
+                else orchestrator.rotate_offer(offer.id)
+            )
+            if not plan["angles"] and not args.offer:
+                continue
+
+            print(f"\n{offer.name}")
+            header = (
+                f"  {'angle':<24}{'verdict':>9}{'ads':>5}{'clicks':>8}"
+                f"{'cvr':>8}{'roas':>7}{'decay':>7}"
+            )
+            print(header)
+            print("  " + "-" * (len(header) - 2))
+            for angle in plan["angles"]:
+                print(
+                    f"  {angle['name'][:23]:<24}{angle['verdict']:>9}"
+                    f"{angle['executions']:>5}{angle['clicks']:>8}"
+                    f"{angle['cvr']:>8.2%}{angle['roas']:>7.2f}"
+                    f"{angle['decay']:>7.0%}"
+                )
+            for angle in plan["angles"]:
+                if angle["verdict"] in ("retire", "rest", "hold"):
+                    print(f"\n  {angle['name']}\n    {angle['reason']}")
+            print(f"\n  {plan['recommendation']}")
+
+            applied = plan.get("apply")
+            if applied:
+                verb = "Paused" if applied["applied"] else "Would pause (dry run)"
+                print(f"\n  {verb} {len(applied['paused_creative_ids'])} ad(s).")
+                for entry in applied["introduced"]:
+                    print(
+                        f"    staged {len(entry['created_creative_ids'])} ad(s) "
+                        f"for {entry['angle']} in ad group {entry['ad_group_id']}"
+                    )
+    return 0
+
+
 def cmd_portfolio(args) -> int:
     init_db()
     from .config import get_settings
@@ -686,6 +738,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     segments.add_argument("--days", type=int, default=14)
     segments.set_defaults(func=cmd_segments)
+
+    rotate = sub.add_parser(
+        "rotate", help="decide which angles to keep, rest, retire or introduce"
+    )
+    rotate.add_argument("--offer", type=int, default=None)
+    rotate.add_argument(
+        "--apply", action="store_true",
+        help="stop spent angles and stage the next ones",
+    )
+    rotate.set_defaults(func=cmd_rotate)
 
     portfolio = sub.add_parser(
         "portfolio", help="split the daily budget across offers"

@@ -190,6 +190,23 @@ def rebalance_campaign(
     )
 
 
+@router.get("/optimizer/rotation/{offer_id}")
+def rotation_plan(offer_id: int, session: Session = Depends(get_session)) -> dict:
+    """Which of an offer's arguments are working, worn out, or wrong.
+
+    The optimizer breeds variants of a fatigued ad, and those inherit its
+    angle. This says when the argument itself is the problem, and when an
+    angle is merely tired and should come back later rather than be dropped.
+    """
+    return Orchestrator(session, settings=get_settings()).rotate_offer(offer_id)
+
+
+@router.post("/optimizer/rotation/{offer_id}/apply")
+def apply_rotation(offer_id: int, session: Session = Depends(get_session)) -> dict:
+    """Stop spent angles and stage ads for the next ones. Honours DRY_RUN."""
+    return Orchestrator(session, settings=get_settings()).apply_rotation(offer_id)
+
+
 @router.get("/optimizer/portfolio")
 def portfolio_plan(
     days: int = Query(default=14, ge=1, le=90),

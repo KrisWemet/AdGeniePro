@@ -865,23 +865,77 @@ class Orchestrator:
             angle_key=entity.angle or None,
             keyword=(group.keywords[0] if group.keywords else ""),
         )
+        # A spread of arguments, deliberately, rather than more of the
+        # parent's. The audience is tired of this ad; offering them the same
+        # case again in new words is the weakest of the available refreshes.
+        # The parent's angle is not lost — it is in the lineage.
         drafts = self.studio.write_variants(brief, count=count, offer=offer)
+        created = self._materialise_drafts(
+            drafts,
+            group=group,
+            campaign=campaign,
+            offer=offer,
+            name_for=lambda i: f"{entity.name} > gen{entity.generation + 1}.{i + 1}",
+            parent=entity,
+        )
 
+        if not created:
+            raise PlatformError(
+                "no usable variants were produced",
+                platform=campaign.platform,
+                code="NO_VARIANTS",
+            )
+        action.payload = {**action.payload, "created_creative_ids": created}
+
+    def _materialise_drafts(
+        self,
+        drafts,
+        group: AdGroup,
+        campaign: Campaign,
+        offer: Offer,
+        name_for,
+        parent: Creative | None = None,
+    ) -> list[int]:
+        """Turn copy drafts into paused ads on the platform.
+
+        Shared by breeding a variant and introducing a fresh angle: both need a
+        row, a tracking URL and a paused ad on the platform, and the only thing
+        that differs is where the copy came from.
+        """
         created: list[int] = []
+        seen: set[tuple] = set()
         for index, draft in enumerate(drafts):
             if draft.compliance and draft.compliance.verdict is ComplianceVerdict.BLOCK:
                 continue
+            # Two identical ads are worse than one: they compete in the same
+            # auction, split the delivery between them, and the split tells you
+            # nothing you would not have learned from either alone. The
+            # generators are asked to vary; this is the guard for when they do
+            # not.
+            fingerprint = (
+                tuple(draft.headlines),
+                tuple(draft.descriptions),
+                tuple(draft.primary_texts),
+            )
+            if fingerprint in seen:
+                logger.info(
+                    "Skipping a duplicate draft for %s: identical copy to one "
+                    "already staged in this batch.",
+                    group.name,
+                )
+                continue
+            seen.add(fingerprint)
             child = Creative(
                 ad_group_id=group.id,
-                name=f"{entity.name} > gen{entity.generation + 1}.{index + 1}",
+                name=name_for(index),
                 angle=draft.angle,
                 headlines=draft.headlines,
                 descriptions=draft.descriptions,
                 primary_texts=draft.primary_texts,
                 call_to_action=draft.call_to_action,
                 image_prompt=draft.image_prompt,
-                parent_id=entity.id,
-                generation=entity.generation + 1,
+                parent_id=parent.id if parent else None,
+                generation=(parent.generation + 1) if parent else 0,
                 generator=draft.generator,
                 generator_meta=draft.generator_meta,
                 compliance_verdict=draft.compliance.verdict
@@ -926,13 +980,170 @@ class Orchestrator:
                 child.last_error = str(exc)
                 logger.error("Variant %s could not be created: %s", child.name, exc)
 
-        if not created:
-            raise PlatformError(
-                "no usable variants were produced",
-                platform=campaign.platform,
-                code="NO_VARIANTS",
+        return created
+
+    # ------------------------------------------------------------------
+    # angle rotation
+    # ------------------------------------------------------------------
+    def rotate_offer(self, offer_id: int, policy=None, now=None) -> dict:
+        """Which of this offer's arguments to keep, rest, retire or introduce."""
+        from .rotation import analyse_rotation
+
+        offer = self.session.get(Offer, offer_id)
+        if offer is None:
+            raise PlatformError(f"offer {offer_id} not found", code="NOT_FOUND")
+        return analyse_rotation(self.session, offer, policy=policy, now=now).as_dict()
+
+    def _best_ad_group_for_a_test(self, offer_id: int) -> AdGroup | None:
+        """Where a new angle should be tried.
+
+        The proven audience, deliberately. Testing a new argument in a weak ad
+        set confounds the two: the angle fails and there is no way to tell
+        whether the argument was wrong or the audience was. Ranked on the lower
+        bound of return rather than the point estimate, so a group that got
+        lucky once does not get picked over one that has actually shown up.
+        """
+        groups = list(
+            self.session.execute(
+                select(AdGroup)
+                .join(Campaign, AdGroup.campaign_id == Campaign.id)
+                .where(
+                    Campaign.offer_id == offer_id,
+                    Campaign.status == EntityStatus.ACTIVE,
+                    AdGroup.status == EntityStatus.ACTIVE,
+                )
+            ).scalars()
+        )
+        if not groups:
+            return None
+        until = date.today() - timedelta(days=1)
+        since = until - timedelta(days=29)
+        windows = [
+            load_performance(
+                self.session, EntityLevel.AD_GROUP, g.id, since, until,
+                lag_model=self._lag_for_entity(EntityLevel.AD_GROUP, g.id),
             )
-        action.payload = {**action.payload, "created_creative_ids": created}
+            for g in groups
+        ]
+        apply_pooled_prior(windows)
+        ranked = sorted(
+            zip(groups, windows),
+            key=lambda pair: (
+                pair[1].roas_interval().lower,
+                pair[1].spend_micros,
+            ),
+            reverse=True,
+        )
+        return ranked[0][0]
+
+    def introduce_angle(
+        self, offer_id: int, angle_key: str, count: int = 2,
+        ad_group_id: int | None = None,
+    ) -> dict:
+        """Write and stage ads for an argument this offer has not been making."""
+        from .angles import get_angle
+
+        offer = self.session.get(Offer, offer_id)
+        if offer is None:
+            raise PlatformError(f"offer {offer_id} not found", code="NOT_FOUND")
+        group = (
+            self.session.get(AdGroup, ad_group_id)
+            if ad_group_id
+            else self._best_ad_group_for_a_test(offer_id)
+        )
+        if group is None:
+            raise PlatformError(
+                f"offer {offer_id} has no live ad group to test an angle in",
+                code="NO_AD_GROUP",
+            )
+        campaign = self.session.get(Campaign, group.campaign_id)
+
+        angle = get_angle(angle_key)
+        brief = build_brief(
+            offer,
+            platform=campaign.platform,
+            angle_key=angle.key,
+            keyword=(group.keywords[0] if group.keywords else ""),
+        )
+        drafts = self.studio.write_variants(
+            brief, count=count, offer=offer, same_angle=True
+        )
+        created = self._materialise_drafts(
+            drafts,
+            group=group,
+            campaign=campaign,
+            offer=offer,
+            name_for=lambda i: f"{offer.name} / {angle.name} {i + 1}",
+        )
+        self.session.commit()
+        return {
+            "offer_id": offer_id,
+            "angle": angle.key,
+            "ad_group_id": group.id,
+            "created_creative_ids": created,
+        }
+
+    def apply_rotation(
+        self, offer_id: int, policy=None, apply: bool | None = None, now=None
+    ) -> dict:
+        """Act on a rotation plan: stop spent angles, stage the next ones.
+
+        Honours DRY_RUN. Retiring and resting both mean the same thing to the
+        platform — stop serving these ads — and differ only in whether the
+        angle is expected back, which is recorded in the plan rather than in
+        the ad account.
+        """
+        from .rotation import analyse_rotation
+
+        offer = self.session.get(Offer, offer_id)
+        if offer is None:
+            raise PlatformError(f"offer {offer_id} not found", code="NOT_FOUND")
+        apply = (not self.settings.dry_run) if apply is None else apply
+        plan = analyse_rotation(self.session, offer, policy=policy, now=now)
+
+        paused: list[int] = []
+        for stat in plan.angles:
+            if stat.verdict not in ("retire", "rest"):
+                continue
+            for creative_id in stat.live_creative_ids:
+                creative = self.session.get(Creative, creative_id)
+                if creative is None:
+                    continue
+                paused.append(creative_id)
+                if not apply:
+                    continue
+                if creative.external_id:
+                    try:
+                        self.client(self._platform_of(
+                            EntityLevel.CREATIVE, creative
+                        )).set_status("creative", creative.external_id, False)
+                    except PlatformError as exc:
+                        logger.error(
+                            "Could not pause creative %s: %s", creative_id, exc
+                        )
+                        paused.pop()
+                        continue
+                creative.status = EntityStatus.PAUSED
+                creative.last_error = f"Angle {stat.verdict}: {stat.reason}"
+
+        introduced: list[dict] = []
+        if apply:
+            for angle_key in plan.introduce:
+                try:
+                    introduced.append(self.introduce_angle(offer_id, angle_key))
+                except PlatformError as exc:
+                    logger.error("Could not introduce %s: %s", angle_key, exc)
+
+        if apply:
+            self.session.commit()
+        return {
+            **plan.as_dict(),
+            "apply": {
+                "applied": apply,
+                "paused_creative_ids": paused,
+                "introduced": introduced,
+            },
+        }
 
     def _exclude_segment(
         self, platform: Platform, action: OptimizationAction, entity: AdGroup

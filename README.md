@@ -155,6 +155,7 @@ python -m adgenie.cli optimize          # propose changes, change nothing
 python -m adgenie.cli optimize --apply  # act (requires DRY_RUN=false)
 python -m adgenie.cli report            # performance by creative
 python -m adgenie.cli portfolio         # split the budget across offers
+python -m adgenie.cli rotate            # keep, rest or retire each angle
 ```
 
 ### 7. Or run the server
@@ -485,6 +486,65 @@ rejected at apply time. Age, gender and region are reported but never
 auto-excluded: those are targeting changes with consequences a human should
 weigh.
 
+### When an offer needs a new argument
+
+The fatigue rules breed variants from a worn-out ad. That is right when the
+*wording* wore out and wrong when the *argument* did — it produces a family of
+ads that all fail together, for the same reason, while the budget keeps going
+out.
+
+```bash
+python -m adgenie.cli rotate --offer 1           # what it would do
+python -m adgenie.cli rotate --offer 1 --apply   # stop spent angles, stage the next
+```
+
+```
+  angle                     verdict  ads  clicks     cvr   roas  decay
+  Problem / Solution          scale    3    1713   3.50%   2.80      1%
+  Unique Mechanism             rest    3    1218   2.87%   2.29     52%
+  Social Proof               retire    4    2044   0.00%   0.00      1%
+  Identity / Aspiration    unproven    1      60   0.00%   0.00      0%
+```
+
+Two distinctions do the work, and both are routinely collapsed.
+
+**An angle is not an execution.** One bad ad for a good argument is the most
+common outcome in advertising. Judging an angle on a single creative confounds
+the argument with that ad's headline, image and hook, and retiring it throws
+away a whole line of attack over one bad Tuesday. An angle is only ever retired
+on pooled evidence from several distinct executions — three by default — and
+then only if it clears a confidence bar raised for how many angles were
+compared, since testing seven at 90% finds a "loser" by chance more often than
+not.
+
+**Fatigue is not failure.** An angle whose click-through has decayed against
+its own opening, while its conversion rate held, is worn out *on this
+audience* — not wrong. It is rested with a return date rather than retired, and
+when it comes back it goes ahead of an untried angle: you already know the
+argument lands here, and an untried one is a coin flip. Retiring it instead
+deletes a proven asset and replaces it with the coin flip. Decay is measured
+against the angle's own opening and read from the *recent* window, never the
+lifetime rate — a lifetime average includes the good opening days, so an angle
+halfway through wearing out reads as healthy right up until it is worthless.
+
+Three more rules keep it from doing damage:
+
+- **No new angle while the running ones are unproven.** Adding a test makes
+  every test in flight slower to conclude. Same reasoning as the portfolio
+  allocator, applied one level down.
+- **Never rotate an offer down to nothing.** Retiring and resting are each
+  correct and can still, together, switch the offer off while the replacements
+  sit in policy review. The best of the condemned keeps running — and is marked
+  `last_resort`, not `hold`, so a spent offer cannot read as a healthy one
+  anywhere downstream.
+- **A new angle is tested in the proven ad group.** Testing an argument in a
+  weak ad set confounds the two: it fails, and you cannot tell whether the
+  argument was wrong or the audience was.
+
+When every angle is spent and the library is used up, it says so plainly.
+More creative is not the answer there — another variant of a worn-out argument
+to an audience that has already rejected it costs money and teaches nothing.
+
 ### Which offers deserve the money
 
 Everything above optimizes *within* an offer: which creative, which ad set,
@@ -655,6 +715,8 @@ whenever the dashboard is served from a known origin.
 | `GET /api/optimizer/rebalance-campaign/{id}` | Applicable split across ad groups |
 | `GET /api/optimizer/portfolio` | How the daily budget should divide across offers |
 | `POST /api/optimizer/portfolio/apply` | Push that split onto the campaigns |
+| `GET /api/optimizer/rotation/{offer_id}` | Which angles to keep, rest, retire or introduce |
+| `POST /api/optimizer/rotation/{id}/apply` | Stop spent angles and stage the next ones |
 | `POST /api/optimizer/push-conversions` | Send sales back to the platforms |
 | `POST /api/landing/audit` | Audit a destination the way the platforms will |
 | `POST /api/landing/sweep` | Re-check every live destination |
@@ -695,6 +757,7 @@ adgenie/
     metrics.py       joins platform delivery with network revenue
     optimizer.py     the decision rules
     portfolio.py     which offers deserve the budget at all
+    rotation.py      when an offer needs a new argument, not new wording
     launcher.py      offer to structured test
     orchestrator.py  the control loop
   platforms/
