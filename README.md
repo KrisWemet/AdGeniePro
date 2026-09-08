@@ -541,9 +541,11 @@ Three more rules keep it from doing damage:
   weak ad set confounds the two: it fails, and you cannot tell whether the
   argument was wrong or the audience was.
 
-When every angle is spent and the library is used up, it says so plainly.
-More creative is not the answer there — another variant of a worn-out argument
-to an audience that has already rejected it costs money and teaches nothing.
+When every angle is spent and the library is used up, it says so plainly, and
+the budget allocator reads it: that offer is capped at its current spend rather
+than scaled, however good its numbers look. More creative is not the answer
+there — another variant of a worn-out argument to an audience that has already
+rejected it costs money and teaches nothing.
 
 ### Which offers deserve the money
 
@@ -598,11 +600,34 @@ not diversify anything, it just leaves money earning nothing. It can never bind
 harder than an even split, so it starts to bite exactly when diversification
 becomes possible.
 
+Budget moves are written where the budget actually lives — on the campaign, or
+split across its ad sets in the proportion they already run at. Writing a
+campaign budget onto a campaign that does not have one is ABO becoming CBO on
+Meta: a structural change that resets learning across every ad set in it,
+dressed up as a budget adjustment.
+
 Budgets glide rather than jump — at most 50% a day in either direction — because
 a large change re-enters the platform learning phase, and a better allocation
 reached in one leap can deliver worse than the one it replaced. The exception
 is an offer being retired: a learning phase only costs you if you intend to
 keep spending. Where the glide and the daily cap collide, the glide gives way.
+
+**An offer with no argument left to make is harvested, not scaled.** This is
+where the budget allocator and the angle rotation meet. An offer whose every
+angle is spent still makes money today — retiring it would throw away real
+profit — but the return being measured was earned by ads that are wearing out
+and cannot be replaced. A scale decision is a forecast, and that offer's
+forecast is broken: the number will fall whatever is spent against it. So it
+holds at its current spend, the growth goes to offers that can still be
+improved, and the operator is told to find a new audience or a new platform.
+The state expires on its own: once the rested angles are due back the offer has
+arguments again and is funded normally, so the same data gives a different
+answer in a month — correctly.
+
+The connection is one explicit line in `plan()`, not a call buried inside the
+allocation. `allocate_portfolio` stays a pure function of the positions handed
+to it, reading a field that `annotate_creative_supply` sets, and
+`check_creative_supply=False` turns the whole thing off.
 
 An offer with plenty of traffic but an unfinished conversion window is
 **held at its current budget**, not re-sized. Its numbers are incomplete, not

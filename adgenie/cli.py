@@ -446,8 +446,10 @@ def cmd_portfolio(args) -> int:
             verb = "Applied" if result["applied"] else "Would apply (dry run)"
             print(f"\n  {verb} {len(result['changes'])} budget change(s).")
             for change in result["changes"]:
+                # Named by the level the budget actually lives on, so it is
+                # clear whether a campaign or its ad sets were moved.
                 print(
-                    f"    campaign {change['campaign_id']}: "
+                    f"    {change['level']} {change['entity_id']}: "
                     f"${change['from_usd']:,.2f} -> ${change['to_usd']:,.2f}"
                 )
     return 0

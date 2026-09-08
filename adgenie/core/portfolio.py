@@ -33,6 +33,7 @@ that level.
 
 from __future__ import annotations
 
+import logging
 import random
 from dataclasses import dataclass, field
 from datetime import date
@@ -48,7 +49,10 @@ from .ltv import LeadValueModel
 from .metrics import PerformanceWindow, apply_pooled_prior, load_performance
 from .stats import thompson_sample_beta
 
+logger = logging.getLogger(__name__)
+
 __all__ = [
+    "annotate_creative_supply",
     "PortfolioPolicy",
     "OfferPosition",
     "OfferAllocation",
@@ -117,6 +121,13 @@ class OfferPosition:
     window: PerformanceWindow
     campaign_ids: list[int] = field(default_factory=list)
     committed_micros: int = 0
+    # Whether this offer has any argument left to make: no angle working, none
+    # resting that is due back, and none in the library it has not tried. Set
+    # by `annotate_creative_supply`, and left False when nobody asked — the
+    # allocator reads a field rather than reaching into the rotation module, so
+    # the coupling is visible in the data and can be switched off.
+    creative_supply_exhausted: bool = False
+    angles_available: int = 0
     # Set by the allocator.
     verdict: str = "hold"
     reason: str = ""
@@ -253,6 +264,7 @@ def allocate_portfolio(
     apply_pooled_prior(windows)
 
     retired: list[OfferPosition] = []
+    harvesting: list[OfferPosition] = []
     waiting: list[OfferPosition] = []
     unproven: list[OfferPosition] = []
     candidates: list[OfferPosition] = []
@@ -278,6 +290,25 @@ def allocate_portfolio(
                 f"{window.clicks} clicks. This is not uncertainty."
             )
             retired.append(position)
+        elif position.creative_supply_exhausted and position.committed_micros > 0:
+            # It still makes money today, so it is not retired. But the return
+            # being read here was earned by ads that are wearing out and cannot
+            # be replaced: every argument has been tried, and the ones that
+            # worked are worn out on this audience. A scale decision is a
+            # forecast, and this offer's forecast is broken — the number will
+            # decline no matter what is spent against it. Hold it where it is
+            # and take what is left.
+            position.verdict = "harvest"
+            position.reason = (
+                f"Returning {interval.mean:.2f}x, but there is no argument left "
+                f"to make: every angle is spent and the library is used up. The "
+                f"return here was earned by creative that is wearing out and "
+                f"cannot be refreshed, so it will fall whatever is spent "
+                f"against it. Held at "
+                f"${micros_to_usd(position.committed_micros):,.2f}/day. Find a "
+                f"new audience or a new platform before funding it further."
+            )
+            harvesting.append(position)
         elif measurable and window.maturity < policy.judge_maturity_floor:
             # It has the traffic; the conversions have not had time to arrive.
             # Re-sizing it as though it were unproven would cut spend on an
@@ -301,10 +332,12 @@ def allocate_portfolio(
             candidates.append(position)
 
     # A held offer keeps what it already has, and that money is off the table
-    # before anything else is decided.
+    # before anything else is decided. Harvested offers are held for a
+    # different reason but in exactly the same way: capped at what they already
+    # spend, never scaled, and not competing for the discretionary pool.
     held = {
         position.offer_id: min(position.committed_micros, total_micros)
-        for position in waiting
+        for position in waiting + harvesting
     }
     committed_to_holds = min(total_micros, sum(held.values()))
 
@@ -458,6 +491,13 @@ def allocate_portfolio(
             f"${micros_to_usd(plan.unallocated_micros):,.2f}/day held back: "
             + "; ".join(reasons)
             + "."
+        )
+    if harvesting:
+        plan.notes.append(
+            f"{len(harvesting)} offer(s) held at their current spend because "
+            f"they have no creative left to make. They are still earning; they "
+            f"are not still improving. `adgenie rotate --offer N` shows what "
+            f"was tried."
         )
     if retired:
         plan.notes.append(
@@ -671,6 +711,35 @@ def load_offer_positions(
     return positions
 
 
+def annotate_creative_supply(
+    session: Session,
+    positions: list[OfferPosition],
+    rotation_policy=None,
+    now=None,
+) -> list[OfferPosition]:
+    """Mark the offers that have run out of arguments to make.
+
+    The one place the budget allocator and the angle rotation meet, and it is
+    deliberately a separate step rather than a call buried inside the
+    allocation. `allocate_portfolio` stays a pure function of the positions it
+    is handed, the coupling is one readable line in `plan`, and a caller who
+    wants budget decisions made without consulting the creative pipeline can
+    simply not call this.
+    """
+    from .rotation import analyse_rotation
+
+    for position in positions:
+        offer = session.get(Offer, position.offer_id)
+        if offer is None:
+            continue
+        rotation = analyse_rotation(
+            session, offer, policy=rotation_policy, now=now
+        )
+        position.creative_supply_exhausted = rotation.exhausted
+        position.angles_available = len(rotation.introduce) + len(rotation.untested)
+    return positions
+
+
 def _campaign_commitment(session: Session, campaign: Campaign) -> int:
     """What a campaign can spend in a day.
 
@@ -713,6 +782,8 @@ class PortfolioAllocator:
         until: date,
         total_micros: int | None = None,
         lag_model: LagModel | None = None,
+        check_creative_supply: bool = True,
+        now=None,
     ) -> PortfolioPlan:
         positions = load_offer_positions(
             self.session,
@@ -721,6 +792,12 @@ class PortfolioAllocator:
             credible_level=self.policy.credible_level,
             lag_model=lag_model,
         )
+        if check_creative_supply:
+            # `now` matters here in a way it does not elsewhere: exhaustion is
+            # a temporary state. An offer with every angle rested is out of
+            # arguments today and has them all back once the rest is over, so
+            # the answer depends on when it is asked.
+            annotate_creative_supply(self.session, positions, now=now)
         return allocate_portfolio(
             positions,
             total_micros if total_micros is not None else self.total_budget_micros(),
@@ -765,34 +842,130 @@ class PortfolioAllocator:
                     target = allocation.target_micros // len(campaigns)
                 if target == was:
                     continue
-                changes.append(
-                    {
-                        "offer_id": allocation.offer_id,
-                        "campaign_id": campaign.id,
-                        "from_usd": micros_to_usd(was),
-                        "to_usd": micros_to_usd(target),
-                        "verdict": allocation.verdict,
-                    }
-                )
-                if not apply:
-                    continue
                 if target <= 0:
+                    changes.append(
+                        {
+                            "offer_id": allocation.offer_id,
+                            "level": "campaign",
+                            "entity_id": campaign.id,
+                            "campaign_id": campaign.id,
+                            "from_usd": micros_to_usd(was),
+                            "to_usd": 0.0,
+                            "verdict": allocation.verdict,
+                        }
+                    )
+                    if not apply:
+                        continue
                     campaign.status = EntityStatus.PAUSED
                     campaign.last_error = (
-                        "Paused by portfolio allocation: "
-                        + allocation.reason
+                        "Paused by portfolio allocation: " + allocation.reason
                     )
                     if orchestrator is not None and campaign.external_id:
                         orchestrator.client(campaign.platform).set_status(
                             "campaign", campaign.external_id, False
                         )
                     continue
+
+                changes.extend(
+                    self._set_campaign_budget(
+                        campaign, target, allocation, orchestrator, apply
+                    )
+                )
+
+        if apply:
+            self.session.commit()
+        return {"applied": apply, "changes": changes}
+
+    def _set_campaign_budget(
+        self,
+        campaign: Campaign,
+        target: int,
+        allocation: OfferAllocation,
+        orchestrator,
+        apply: bool,
+    ) -> list[dict]:
+        """Write the budget where the budget actually lives.
+
+        A campaign either carries its own budget or leaves it on the ad sets,
+        and on Meta that is the difference between campaign-budget optimisation
+        and ad-set budgets. Writing a campaign budget onto a campaign that does
+        not have one converts it from the second to the first — a structural
+        change that resets learning across every ad set in it, dressed up as a
+        budget adjustment.
+
+        The level is whichever `_campaign_commitment` measured, and that is the
+        point: the plan's "from" figure is the larger of the campaign budget
+        and its ad sets' total, so writing the "to" figure anywhere else leaves
+        the two disagreeing and the plan describing a move that did not happen.
+        """
+        record = {
+            "offer_id": allocation.offer_id,
+            "campaign_id": campaign.id,
+            "verdict": allocation.verdict,
+        }
+        groups = list(
+            self.session.execute(
+                select(AdGroup).where(
+                    AdGroup.campaign_id == campaign.id,
+                    AdGroup.status == EntityStatus.ACTIVE,
+                )
+            ).scalars()
+        )
+        funded = [g for g in groups if g.daily_budget_micros > 0]
+        group_total = sum(g.daily_budget_micros for g in funded)
+
+        if campaign.daily_budget_micros >= group_total and campaign.daily_budget_micros > 0:
+            changes = [
+                {
+                    **record,
+                    "level": "campaign",
+                    "entity_id": campaign.id,
+                    "from_usd": micros_to_usd(campaign.daily_budget_micros),
+                    "to_usd": micros_to_usd(target),
+                }
+            ]
+            if apply:
                 campaign.daily_budget_micros = target
                 if orchestrator is not None and campaign.external_id:
                     orchestrator.client(campaign.platform).set_budget(
                         "campaign", campaign.external_id, target
                     )
+            return changes
 
-        if apply:
-            self.session.commit()
-        return {"applied": apply, "changes": changes}
+        if not funded:
+            logger.warning(
+                "Campaign %s has no budget on itself or on any live ad set; "
+                "there is nothing to move.",
+                campaign.id,
+            )
+            return []
+
+        changes = []
+        assigned = 0
+        for index, group in enumerate(funded):
+            if index == len(funded) - 1:
+                # The last one absorbs the rounding, so the parts always sum
+                # back to the target rather than drifting below it.
+                share = target - assigned
+            else:
+                share = int(target * group.daily_budget_micros / group_total)
+            assigned += share
+            if share == group.daily_budget_micros:
+                continue
+            changes.append(
+                {
+                    **record,
+                    "level": "ad_group",
+                    "entity_id": group.id,
+                    "from_usd": micros_to_usd(group.daily_budget_micros),
+                    "to_usd": micros_to_usd(share),
+                }
+            )
+            if not apply:
+                continue
+            group.daily_budget_micros = share
+            if orchestrator is not None and group.external_id:
+                orchestrator.client(campaign.platform).set_budget(
+                    "ad_group", group.external_id, share
+                )
+        return changes

@@ -8,9 +8,11 @@ accounts actually lose.
 from __future__ import annotations
 
 import random
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
+
+from sqlalchemy import func, select
 
 from adgenie.core.metrics import PerformanceWindow
 from adgenie.core.portfolio import (
@@ -23,6 +25,7 @@ from adgenie.core.portfolio import (
     load_offer_positions,
 )
 from adgenie.models import (
+    AdGroup,
     Campaign,
     Conversion,
     ConversionStatus,
@@ -618,3 +621,384 @@ def test_a_confident_loser_is_cut_even_on_partial_data():
     allocation = by_id(plan)[1]
     assert allocation.verdict == "retire"
     assert allocation.target_micros == 0
+
+
+# --- where budget meets creative supply ------------------------------------
+
+
+def _exhausted(position_):
+    position_.creative_supply_exhausted = True
+    return position_
+
+
+def test_an_offer_with_no_arguments_left_is_harvested_not_scaled():
+    """It still makes money. It is just not going to make more.
+
+    The return being read was earned by ads that are wearing out and cannot be
+    replaced, so scaling against it commits money at a number that is about to
+    stop being true.
+    """
+    spent = _exhausted(
+        position(1, "no creative left", 4000, 400, 1000, 20, committed_usd=60)
+    )
+    plan = allocate_portfolio([spent], usd_to_micros(500), rng=random.Random(1))
+
+    allocation = by_id(plan)[1]
+    assert allocation.verdict == "harvest"
+    assert allocation.target_micros == usd_to_micros(60)
+    assert "no argument left" in allocation.reason
+    assert allocation.roas_mean > 2.0
+
+
+def test_a_harvested_offer_is_not_retired():
+    """Stopping a profitable offer because it has no upside left is worse
+    than taking the profit while it lasts."""
+    spent = _exhausted(position(1, "spent", 4000, 400, 1000, 20, committed_usd=60))
+    plan = allocate_portfolio([spent], usd_to_micros(500), rng=random.Random(1))
+    assert by_id(plan)[1].target_micros > 0
+
+
+def test_an_exhausted_offer_that_loses_money_is_still_retired():
+    """Retire comes first. Harvesting a loser is just losing money slower."""
+    loser = _exhausted(position(1, "spent loser", 4000, 15, 2000, 20, committed_usd=60))
+    plan = allocate_portfolio([loser], usd_to_micros(500), rng=random.Random(1))
+    allocation = by_id(plan)[1]
+    assert allocation.verdict == "retire"
+    assert allocation.target_micros == 0
+
+
+def test_the_budget_a_harvested_offer_does_not_take_goes_elsewhere():
+    policy = PortfolioPolicy(max_daily_change=10.0)
+    spent = _exhausted(position(1, "spent", 4000, 400, 1000, 20, committed_usd=50))
+    fresh = position(2, "room to grow", 4000, 300, 1000, 20, committed_usd=50)
+
+    plan = allocate_portfolio(
+        [spent, fresh], usd_to_micros(400), policy=policy, rng=random.Random(3)
+    )
+    allocations = by_id(plan)
+    assert allocations[1].target_micros == usd_to_micros(50)
+    # The offer that can still be improved takes what the spent one cannot.
+    assert allocations[2].target_micros > usd_to_micros(50)
+
+
+def test_an_exhausted_offer_already_stopped_is_not_restarted():
+    spent = _exhausted(position(1, "spent", 4000, 400, 1000, 20, committed_usd=0))
+    plan = allocate_portfolio([spent], usd_to_micros(500), rng=random.Random(1))
+    assert by_id(plan)[1].verdict != "harvest"
+
+
+def test_creative_supply_is_read_from_the_rotation_analysis(session, offer, settings):
+    """The bridge itself: a real exhausted offer is marked as one."""
+    from adgenie.core.portfolio import annotate_creative_supply
+    from tests.test_rotation import run_angle
+    from adgenie.core.angles import ANGLES
+
+    campaign = Campaign(
+        offer_id=offer.id, platform=Platform.META, name="c",
+        external_id="c1", status=EntityStatus.ACTIVE,
+        daily_budget_micros=usd_to_micros(60),
+    )
+    session.add(campaign)
+    session.commit()
+    group = AdGroup(
+        campaign_id=campaign.id, name="g", external_id="g1",
+        status=EntityStatus.ACTIVE,
+    )
+    session.add(group)
+    session.commit()
+
+    # Every argument in the library tried, and every one worn out.
+    for angle in ANGLES:
+        run_angle(session, offer, group, angle.key, 3, 0.020, 0.005, 0.03)
+
+    day = date(2026, 3, 1)
+    positions = load_offer_positions(session, day, day)
+    annotate_creative_supply(
+        session, positions, now=datetime(2026, 2, 5, tzinfo=timezone.utc)
+    )
+    assert positions[0].creative_supply_exhausted is True
+    assert positions[0].angles_available == 0
+
+
+def test_an_offer_with_angles_left_is_not_marked_exhausted(session, offer, settings):
+    from adgenie.core.portfolio import annotate_creative_supply
+    from tests.test_rotation import run_angle
+
+    campaign = Campaign(
+        offer_id=offer.id, platform=Platform.META, name="c",
+        external_id="c1", status=EntityStatus.ACTIVE,
+        daily_budget_micros=usd_to_micros(60),
+    )
+    session.add(campaign)
+    session.commit()
+    group = AdGroup(
+        campaign_id=campaign.id, name="g", external_id="g1",
+        status=EntityStatus.ACTIVE,
+    )
+    session.add(group)
+    session.commit()
+    run_angle(session, offer, group, "problem_solution", 3, 0.02, 0.019, 0.04)
+
+    day = date(2026, 3, 1)
+    positions = load_offer_positions(session, day, day)
+    annotate_creative_supply(
+        session, positions, now=datetime(2026, 2, 5, tzinfo=timezone.utc)
+    )
+    assert positions[0].creative_supply_exhausted is False
+    assert positions[0].angles_available > 0
+
+
+def test_the_creative_check_changes_the_plan_and_can_be_switched_off(
+    session, offer, settings
+):
+    """Both directions, so the switch is shown to matter.
+
+    With the check on, an offer that has run out of arguments is capped at
+    what it already spends. With it off, the allocator sees only the numbers
+    and scales it — which is exactly the mistake the connection prevents.
+    """
+    from adgenie.core.angles import ANGLES
+    from tests.test_rotation import run_angle
+
+    campaign = Campaign(
+        offer_id=offer.id, platform=Platform.META, name="c",
+        external_id="c1", status=EntityStatus.ACTIVE,
+        daily_budget_micros=usd_to_micros(60),
+    )
+    session.add(campaign)
+    session.commit()
+    group = AdGroup(
+        campaign_id=campaign.id, name="g", external_id="g1",
+        status=EntityStatus.ACTIVE,
+    )
+    session.add(group)
+    session.commit()
+
+    # Every argument tried, every one worn out, and the offer still profitable.
+    for angle in ANGLES:
+        run_angle(session, offer, group, angle.key, 3, 0.020, 0.005, 0.03)
+    # Delivery is recorded against the creatives; the offer window reads its
+    # campaigns, so mirror the totals up to campaign level.
+    for row in session.execute(
+        select(
+            MetricSnapshot.day,
+            func.sum(MetricSnapshot.impressions),
+            func.sum(MetricSnapshot.clicks),
+            func.sum(MetricSnapshot.spend_micros),
+        )
+        .where(MetricSnapshot.level == EntityLevel.CREATIVE)
+        .group_by(MetricSnapshot.day)
+    ).all():
+        session.add(
+            MetricSnapshot(
+                level=EntityLevel.CAMPAIGN, entity_id=campaign.id, day=row[0],
+                impressions=int(row[1]), clicks=int(row[2]),
+                spend_micros=int(row[3]),
+            )
+        )
+    session.commit()
+
+    since, until = date(2026, 1, 1), date(2026, 1, 30)
+    # Inside the rest window: the worn-out angles are not back yet.
+    now = datetime(2026, 2, 5, tzinfo=timezone.utc)
+    allocator = PortfolioAllocator(session, settings=settings, rng=random.Random(1))
+
+    with_check = allocator.plan(
+        since, until, total_micros=usd_to_micros(500), now=now
+    )
+    assert by_id(with_check)[offer.id].verdict == "harvest"
+    assert by_id(with_check)[offer.id].target_micros == usd_to_micros(60)
+
+    without = allocator.plan(
+        since, until, total_micros=usd_to_micros(500),
+        check_creative_supply=False, now=now,
+    )
+    assert by_id(without)[offer.id].verdict == "fund"
+    assert by_id(without)[offer.id].target_micros > usd_to_micros(60)
+
+
+def test_harvesting_lifts_itself_once_the_rested_angles_come_back(
+    session, offer, settings
+):
+    """Exhaustion is a state with an expiry date, not a death sentence.
+
+    Every angle worn out means nothing left to say *today*. Thirty days on,
+    the rested arguments are due back and the offer can be funded again — so
+    the same data gives a different answer depending on when it is asked, and
+    that is the correct behaviour rather than a bug in the clock.
+    """
+    from adgenie.core.angles import ANGLES
+    from adgenie.core.portfolio import annotate_creative_supply
+    from tests.test_rotation import run_angle
+
+    campaign = Campaign(
+        offer_id=offer.id, platform=Platform.META, name="c",
+        external_id="c1", status=EntityStatus.ACTIVE,
+        daily_budget_micros=usd_to_micros(60),
+    )
+    session.add(campaign)
+    session.commit()
+    group = AdGroup(
+        campaign_id=campaign.id, name="g", external_id="g1",
+        status=EntityStatus.ACTIVE,
+    )
+    session.add(group)
+    session.commit()
+    for angle in ANGLES:
+        run_angle(session, offer, group, angle.key, 3, 0.020, 0.005, 0.03)
+
+    day = date(2026, 1, 30)
+
+    def exhausted_at(when: datetime) -> bool:
+        positions = load_offer_positions(session, day, day)
+        annotate_creative_supply(session, positions, now=when)
+        return positions[0].creative_supply_exhausted
+
+    assert exhausted_at(datetime(2026, 2, 5, tzinfo=timezone.utc)) is True
+    assert exhausted_at(datetime(2026, 4, 1, tzinfo=timezone.utc)) is False
+
+
+# --- writing the budget where it actually lives ----------------------------
+
+
+def _profitable(session, offer, campaign, clicks=3000, conversions=150):
+    day = date(2026, 3, 1)
+    _deliver(session, campaign, day, clicks=clicks, spend_usd=600)
+    for i in range(conversions):
+        session.add(
+            Conversion(
+                offer_id=offer.id, campaign_id=campaign.id,
+                status=ConversionStatus.APPROVED,
+                revenue_micros=usd_to_micros(40),
+                occurred_at=day, network_txn_id=f"{campaign.id}-{i}",
+            )
+        )
+    session.commit()
+    return day
+
+
+def test_a_campaign_budget_is_written_on_the_campaign(session, offer, settings):
+    campaign = _campaign(session, offer, "cbo", 40)
+    group = AdGroup(
+        campaign_id=campaign.id, name="g", external_id="g1",
+        status=EntityStatus.ACTIVE, daily_budget_micros=0,
+    )
+    session.add(group)
+    day = _profitable(session, offer, campaign)
+
+    allocator = PortfolioAllocator(session, settings=settings, rng=random.Random(1))
+    plan = allocator.plan(day, day, total_micros=usd_to_micros(500))
+    result = allocator.apply(plan)
+
+    assert [c["level"] for c in result["changes"]] == ["campaign"]
+    session.refresh(campaign)
+    assert campaign.daily_budget_micros == usd_to_micros(60)
+
+
+def test_an_ad_set_budget_is_not_turned_into_a_campaign_budget(
+    session, offer, settings
+):
+    """On Meta that is ABO becoming CBO — a structural change that resets
+    learning across every ad set, dressed up as a budget adjustment."""
+    campaign = _campaign(session, offer, "abo", 0)
+    groups = [
+        AdGroup(
+            campaign_id=campaign.id, name=f"g{i}", external_id=f"g{i}",
+            status=EntityStatus.ACTIVE,
+            daily_budget_micros=usd_to_micros(budget),
+        )
+        for i, budget in enumerate((30, 10))
+    ]
+    session.add_all(groups)
+    day = _profitable(session, offer, campaign)
+
+    allocator = PortfolioAllocator(session, settings=settings, rng=random.Random(1))
+    plan = allocator.plan(day, day, total_micros=usd_to_micros(500))
+    assert by_id(plan)[offer.id].target_micros == usd_to_micros(60)
+    result = allocator.apply(plan)
+
+    session.refresh(campaign)
+    assert campaign.daily_budget_micros == 0
+    assert {c["level"] for c in result["changes"]} == {"ad_group"}
+
+    for group in groups:
+        session.refresh(group)
+    # Split in the proportion they already ran at, and summing to the target.
+    assert [g.daily_budget_micros for g in groups] == [
+        usd_to_micros(45), usd_to_micros(15)
+    ]
+    assert sum(g.daily_budget_micros for g in groups) == usd_to_micros(60)
+
+
+def test_the_parts_always_sum_back_to_the_target(session, offer, settings):
+    """Rounding three ways must not quietly underspend the plan."""
+    campaign = _campaign(session, offer, "abo", 0)
+    groups = [
+        AdGroup(
+            campaign_id=campaign.id, name=f"g{i}", external_id=f"g{i}",
+            status=EntityStatus.ACTIVE, daily_budget_micros=usd_to_micros(10),
+        )
+        for i in range(3)
+    ]
+    session.add_all(groups)
+    day = _profitable(session, offer, campaign)
+
+    allocator = PortfolioAllocator(session, settings=settings, rng=random.Random(1))
+    plan = allocator.plan(day, day, total_micros=usd_to_micros(500))
+    target = by_id(plan)[offer.id].target_micros
+    allocator.apply(plan)
+
+    for group in groups:
+        session.refresh(group)
+    assert sum(g.daily_budget_micros for g in groups) == target
+
+
+def test_a_campaign_with_no_budget_anywhere_is_left_alone(session, offer, settings):
+    campaign = _campaign(session, offer, "empty", 0)
+    session.add(
+        AdGroup(
+            campaign_id=campaign.id, name="g", external_id="g1",
+            status=EntityStatus.ACTIVE, daily_budget_micros=0,
+        )
+    )
+    day = _profitable(session, offer, campaign)
+
+    allocator = PortfolioAllocator(session, settings=settings, rng=random.Random(1))
+    plan = allocator.plan(day, day, total_micros=usd_to_micros(500))
+    result = allocator.apply(plan)
+    assert result["changes"] == []
+
+
+def test_the_level_written_is_the_level_that_was_measured(session, offer, settings):
+    """The plan's "from" figure is the larger of the campaign budget and its
+    ad sets' total. Writing the "to" figure anywhere else leaves the two
+    disagreeing and the plan describing a move that did not happen.
+    """
+    campaign = _campaign(session, offer, "both", 40)
+    groups = [
+        AdGroup(
+            campaign_id=campaign.id, name=f"g{i}", external_id=f"g{i}",
+            status=EntityStatus.ACTIVE, daily_budget_micros=usd_to_micros(30),
+        )
+        for i in range(2)
+    ]
+    session.add_all(groups)
+    day = _profitable(session, offer, campaign)
+
+    # The ad sets commit $60 between them, above the campaign's own $40, so
+    # $60 is what the plan reports and the ad sets are what governs spend.
+    positions = load_offer_positions(session, day, day)
+    assert positions[0].committed_micros == usd_to_micros(60)
+
+    allocator = PortfolioAllocator(session, settings=settings, rng=random.Random(1))
+    plan = allocator.plan(day, day, total_micros=usd_to_micros(500))
+    allocation = by_id(plan)[offer.id]
+    assert allocation.current_micros == usd_to_micros(60)
+    result = allocator.apply(plan)
+
+    assert {c["level"] for c in result["changes"]} == {"ad_group"}
+    for group in groups:
+        session.refresh(group)
+    assert sum(g.daily_budget_micros for g in groups) == allocation.target_micros
+    session.refresh(campaign)
+    assert campaign.daily_budget_micros == usd_to_micros(40)

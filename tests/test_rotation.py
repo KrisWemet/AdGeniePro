@@ -106,7 +106,10 @@ def run_angle(
                     creative_id=ids[0],
                     status=ConversionStatus.APPROVED,
                     revenue_micros=usd_to_micros(40),
-                    network_txn_id=f"{angle}-{txn}",
+                    # Offer id included: the transaction id is unique across
+                    # the whole network, so two offers running the same angle
+                    # must not collide.
+                    network_txn_id=f"{offer.id}-{angle}-{txn}",
                     occurred_at=day,
                 )
             )
