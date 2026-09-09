@@ -33,8 +33,13 @@ GLOBAL_DAILY_BUDGET_CAP_USD=25
 META_ACCESS_TOKEN=...
 META_AD_ACCOUNT_ID=...
 META_PAGE_ID=...
-META_PIXEL_ID=...       # may be added after the paused-object smoke test
+META_PIXEL_ID=...
+META_API_VERSION=v26.0
 ```
+
+The Pixel is required even for the paused-object test because AdGenie's Meta
+launch uses `OUTCOME_SALES` with `OFFSITE_CONVERSIONS`; Meta requires the ad set
+to carry a promoted object for that optimization path.
 
 Do not put any of those values in Git.
 
@@ -55,12 +60,13 @@ Required result:
 READY FOR LIVE TEST: YES
 ```
 
-The live Meta check only reads the configured ad account. It does not create or
-change campaigns. The public check calls `/api/health` with the configured
-operator key.
+The live Meta check is read-only. It verifies the configured ad account, the
+Facebook Page, and the Meta Pixel using the same token the launcher will use. It
+does not create or change campaigns. The public check calls `/api/health` with
+the configured operator key.
 
-If this fails, fix the credential, account, deployment or tracking issue it
-names before moving on.
+If this fails, fix the credential, account, Page/Pixel access, deployment or
+tracking issue it names before moving on.
 
 ## Gate 3 — choose one low-risk offer
 
@@ -142,7 +148,7 @@ ad sets and ads are paused by default. Do not pass `--start-active`.
 Success means:
 
 - Meta accepted the campaign fields;
-- Meta accepted ad-set targeting and budget fields;
+- Meta accepted ad-set targeting, budget and promoted-object fields;
 - Meta accepted the creative and Page association;
 - generated media uploaded and attached correctly;
 - all external ids were stored in AdGenie;
