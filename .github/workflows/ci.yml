@@ -9,7 +9,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,6 +20,8 @@ jobs:
         run: pip install -r requirements.txt
       - name: Run test suite
         run: python -m pytest tests/
+      - name: Run end-to-end simulator
+        run: python -m adgenie.cli demo --days 3 --budget 10 --database-url sqlite:///./ci-demo.db
       - name: Validate production preflight entrypoint
         run: python -m adgenie.preflight --help
       - name: Build production container
