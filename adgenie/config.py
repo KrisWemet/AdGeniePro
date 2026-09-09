@@ -60,7 +60,9 @@ class Settings(BaseSettings):
     meta_ad_account_id: str | None = None
     meta_page_id: str | None = None
     meta_pixel_id: str | None = None
-    meta_api_version: str = "v21.0"
+    # Keep first contact on a currently-supported Marketing API version. v21
+    # was the old prototype default and is no longer usable for ad creation.
+    meta_api_version: str = "v26.0"
 
     # --- Google Ads ---
     google_developer_token: str | None = None
