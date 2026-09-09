@@ -20,5 +20,5 @@ jobs:
         run: pip install -r requirements.txt
       - name: Run test suite
         run: python -m pytest tests/
-      - name: Validate production preflight imports
-        run: python -m adgenie.preflight --platform meta --json || true
+      - name: Validate production preflight entrypoint
+        run: python -m adgenie.preflight --help
