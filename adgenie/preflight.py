@@ -188,6 +188,13 @@ def _security_checks(settings: Settings) -> list[PreflightCheck]:
     return checks
 
 
+def _meta_major(version: str) -> int | None:
+    try:
+        return int(version.lower().lstrip("v").split(".", 1)[0])
+    except (TypeError, ValueError):
+        return None
+
+
 def _meta_config_checks(settings: Settings) -> list[PreflightCheck]:
     missing = [
         name
@@ -215,22 +222,39 @@ def _meta_config_checks(settings: Settings) -> list[PreflightCheck]:
                 "Meta token, ad account and Page id are configured.",
             )
         )
+
+    major = _meta_major(settings.meta_api_version)
+    if major is None or major < 25:
+        checks.append(
+            PreflightCheck(
+                "meta.api_version",
+                "fail",
+                f"META_API_VERSION={settings.meta_api_version!r} is too old for the Friday test; use v26.0.",
+            )
+        )
+    else:
+        checks.append(
+            PreflightCheck(
+                "meta.api_version",
+                "pass",
+                f"Meta Marketing API version is {settings.meta_api_version}.",
+            )
+        )
+
     if settings.meta_pixel_id:
         checks.append(
             PreflightCheck(
                 "meta.pixel",
                 "pass",
-                "META_PIXEL_ID is configured for sending affiliate conversions back to Meta.",
-                blocking=False,
+                "META_PIXEL_ID is configured for the sales ad set and Conversions API.",
             )
         )
     else:
         checks.append(
             PreflightCheck(
                 "meta.pixel",
-                "warn",
-                "META_PIXEL_ID is unset. A paused campaign can be tested, but Conversions API upload cannot work yet.",
-                blocking=False,
+                "fail",
+                "META_PIXEL_ID is required: the Friday Meta launch uses OUTCOME_SALES with OFFSITE_CONVERSIONS.",
             )
         )
     return checks
@@ -267,33 +291,96 @@ def _platform_live_check(
     settings: Settings,
     platform_factory: Callable,
     sandbox_detector: Callable,
-) -> PreflightCheck:
+) -> tuple[PreflightCheck, object | None]:
     key = f"live.{platform.value}"
     try:
         client = platform_factory(platform, settings)
         if sandbox_detector(client):
-            return PreflightCheck(
-                key,
-                "fail",
-                f"{platform.value.title()} resolved to the simulator instead of a live adapter.",
+            return (
+                PreflightCheck(
+                    key,
+                    "fail",
+                    f"{platform.value.title()} resolved to the simulator instead of a live adapter.",
+                ),
+                None,
             )
         status = client.health_check()
     except Exception as exc:
-        return PreflightCheck(key, "fail", f"Read-only {platform.value} check failed: {exc}")
+        return PreflightCheck(key, "fail", f"Read-only {platform.value} check failed: {exc}"), None
 
     if not status.get("ok"):
-        return PreflightCheck(
-            key,
-            "fail",
-            f"Read-only {platform.value} check failed: {status.get('error') or status}",
+        return (
+            PreflightCheck(
+                key,
+                "fail",
+                f"Read-only {platform.value} check failed: {status.get('error') or status}",
+            ),
+            client,
         )
     account = status.get("account") or "account accessible"
     currency = status.get("currency") or "currency unknown"
-    return PreflightCheck(
-        key,
-        "pass",
-        f"Read-only API call succeeded: {account} ({currency}).",
+    return (
+        PreflightCheck(
+            key,
+            "pass",
+            f"Read-only API call succeeded: {account} ({currency}).",
+        ),
+        client,
     )
+
+
+def _meta_asset_live_checks(client: object, settings: Settings) -> list[PreflightCheck]:
+    checks: list[PreflightCheck] = []
+    request = getattr(client, "_request", None)
+    if not callable(request):
+        return [
+            PreflightCheck(
+                "live.meta_assets",
+                "fail",
+                "Meta adapter cannot perform the read-only Page/Pixel checks.",
+            )
+        ]
+
+    try:
+        page = request("GET", str(settings.meta_page_id), params={"fields": "id,name"})
+        if str(page.get("id") or "") != str(settings.meta_page_id):
+            raise RuntimeError(f"unexpected Page response: {page}")
+        checks.append(
+            PreflightCheck(
+                "live.meta_page",
+                "pass",
+                f"Configured Facebook Page is readable: {page.get('name') or page.get('id')}.",
+            )
+        )
+    except Exception as exc:
+        checks.append(
+            PreflightCheck(
+                "live.meta_page",
+                "fail",
+                f"Configured Facebook Page is not readable with this token: {exc}",
+            )
+        )
+
+    try:
+        pixel = request("GET", str(settings.meta_pixel_id), params={"fields": "id,name"})
+        if str(pixel.get("id") or "") != str(settings.meta_pixel_id):
+            raise RuntimeError(f"unexpected Pixel response: {pixel}")
+        checks.append(
+            PreflightCheck(
+                "live.meta_pixel",
+                "pass",
+                f"Configured Meta Pixel is readable: {pixel.get('name') or pixel.get('id')}.",
+            )
+        )
+    except Exception as exc:
+        checks.append(
+            PreflightCheck(
+                "live.meta_pixel",
+                "fail",
+                f"Configured Meta Pixel is not readable with this token: {exc}",
+            )
+        )
+    return checks
 
 
 def _public_health_check(
@@ -355,19 +442,24 @@ def run_preflight(
         detector = sandbox_detector or is_sandbox
         for platform in selected:
             credential_key = f"{platform.value}.credentials"
-            credential_failed = any(
-                c.key == credential_key and c.status == "fail" for c in checks
+            platform_config_failed = any(
+                c.key.startswith(f"{platform.value}.") and c.status == "fail" and c.blocking
+                for c in checks
             )
-            if credential_failed:
+            if platform_config_failed:
                 checks.append(
                     PreflightCheck(
                         f"live.{platform.value}",
                         "fail",
-                        "Live check cannot run until required credentials are configured.",
+                        "Live check cannot run until required platform configuration is valid.",
                     )
                 )
-            else:
-                checks.append(_platform_live_check(platform, settings, factory, detector))
+                continue
+
+            live_check, client = _platform_live_check(platform, settings, factory, detector)
+            checks.append(live_check)
+            if platform is Platform.META and live_check.status == "pass" and client is not None:
+                checks.extend(_meta_asset_live_checks(client, settings))
         checks.append(_public_health_check(settings, http_client=http_client))
 
     return PreflightReport(tuple(checks), live_requested=live)
