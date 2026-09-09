@@ -64,9 +64,9 @@ def get_platform(
             key = _live_key(platform, settings)
             if key not in _LIVE_CACHE:
                 if platform is Platform.META:
-                    from .meta import MetaAdsClient
+                    from .meta_current import CurrentMetaAdsClient
 
-                    _LIVE_CACHE[key] = MetaAdsClient(settings)
+                    _LIVE_CACHE[key] = CurrentMetaAdsClient(settings)
                 else:
                     from .google import GoogleAdsClient
 
