@@ -20,6 +20,8 @@ def _ready_settings(**overrides) -> Settings:
         meta_access_token="token",
         meta_ad_account_id="123456",
         meta_page_id="789",
+        meta_pixel_id="456",
+        meta_api_version="v26.0",
         google_developer_token="developer-token",
         google_client_id="client-id",
         google_client_secret="client-secret",
@@ -54,16 +56,24 @@ def test_configuration_preflight_requires_public_api_auth():
     assert _check(report, "security.api_key").status == "fail"
 
 
-def test_meta_paused_test_can_proceed_without_pixel_but_warns():
+def test_meta_sales_test_requires_pixel():
     report = run_preflight(
         _ready_settings(meta_pixel_id=None),
         platforms=(Platform.META,),
     )
 
-    assert report.configuration_ready
-    pixel = _check(report, "meta.pixel")
-    assert pixel.status == "warn"
-    assert pixel.blocking is False
+    assert not report.configuration_ready
+    assert _check(report, "meta.pixel").status == "fail"
+
+
+def test_meta_preflight_rejects_the_old_api_version():
+    report = run_preflight(
+        _ready_settings(meta_api_version="v21.0"),
+        platforms=(Platform.META,),
+    )
+
+    assert not report.configuration_ready
+    assert _check(report, "meta.api_version").status == "fail"
 
 
 def test_preflight_rejects_placeholder_postback_secret():
@@ -88,7 +98,7 @@ def test_preflight_does_not_require_dry_run_but_warns_if_off():
     assert dry.blocking is False
 
 
-def test_live_preflight_uses_only_health_checks_and_can_pass():
+def test_live_preflight_reads_account_page_and_pixel_and_can_pass():
     class LiveMeta:
         def health_check(self):
             return {
@@ -96,6 +106,14 @@ def test_live_preflight_uses_only_health_checks_and_can_pass():
                 "account": "Test Ad Account",
                 "currency": "CAD",
             }
+
+        def _request(self, method, path, params=None):
+            assert method == "GET"
+            if path == "789":
+                return {"id": "789", "name": "Test Page"}
+            if path == "456":
+                return {"id": "456", "name": "Test Pixel"}
+            raise AssertionError(path)
 
     calls = []
 
@@ -122,8 +140,37 @@ def test_live_preflight_uses_only_health_checks_and_can_pass():
 
     assert calls == [Platform.META]
     assert _check(report, "live.meta").status == "pass"
+    assert _check(report, "live.meta_page").status == "pass"
+    assert _check(report, "live.meta_pixel").status == "pass"
     assert _check(report, "live.public_health").status == "pass"
     assert report.ready_for_live_test
+
+
+def test_live_preflight_blocks_an_unreadable_pixel():
+    class LiveMeta:
+        def health_check(self):
+            return {"ok": True, "account": "Account", "currency": "CAD"}
+
+        def _request(self, method, path, params=None):
+            if path == "789":
+                return {"id": "789", "name": "Page"}
+            raise RuntimeError("permission denied")
+
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, json={"status": "ok"}, request=request)
+    )
+    with httpx.Client(transport=transport) as client:
+        report = run_preflight(
+            _ready_settings(),
+            platforms=(Platform.META,),
+            live=True,
+            platform_factory=lambda platform, settings: LiveMeta(),
+            sandbox_detector=lambda client: False,
+            http_client=client,
+        )
+
+    assert _check(report, "live.meta_pixel").status == "fail"
+    assert not report.ready_for_live_test
 
 
 def test_live_preflight_refuses_a_sandbox_adapter():
