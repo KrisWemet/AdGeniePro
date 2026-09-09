@@ -313,7 +313,7 @@ def _launch(api_client, offer_id):
     ).json()
 
 
-def test_click_redirects_to_the_offer_with_a_subid(api_client, created_offer):
+def test_click_redirects_to_clickbank_with_external_click_id(api_client, created_offer):
     launched = _launch(api_client, created_offer["id"])
     creative = api_client.get(f"/api/creatives/{launched['creative_ids'][0]}").json()
     subid = creative["final_url"].split("s=")[1].split("&")[0]
@@ -322,7 +322,7 @@ def test_click_redirects_to_the_offer_with_a_subid(api_client, created_offer):
     assert response.status_code == 302
     location = response.headers["location"]
     assert location.startswith("https://offer.test/calmleaf")
-    assert "subid=" in location
+    assert "extclid=" in location
     # The platform click id is forwarded so offline conversion upload can work.
     assert "fbclid=IwAR9" in location
 
@@ -345,7 +345,7 @@ def test_postback_attributes_revenue_to_the_creative(api_client, created_offer, 
     subid = creative["final_url"].split("s=")[1].split("&")[0]
 
     redirect = api_client.get(f"/r?s={subid}", follow_redirects=False)
-    click_id = redirect.headers["location"].split("subid=")[1].split("&")[0]
+    click_id = redirect.headers["location"].split("extclid=")[1].split("&")[0]
 
     body = api_client.post(
         "/postback",
