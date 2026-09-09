@@ -21,13 +21,21 @@ sandbox.py` produces correctly-sized PNGs, and the copywriter falls back to a
 deterministic template generator. If you needed a key to run the tests, that is
 a bug.
 
-## The branch
+## Branches, and more than one agent
 
-Work happens on `claude/ai-ad-platform-meta-google-69wybm`. **`main` is a
-different, older codebase** — loose prototype scripts and a GitHub Pages site.
-The branch is additive: it deletes one line each from `.gitignore` and
-`README.md` and nothing else, so the site files still work. Do not develop
-against `main` expecting to find any of this.
+`main` is the codebase. Branch from it, and open a pull request rather than
+pushing to it — more than one agent works here, and a shared branch means
+someone's commits get clobbered by someone else's force-push.
+
+Two things in the repository are older than the platform and are deliberately
+kept:
+
+- `legacy/` holds the prototype agent scripts this replaced. Nothing imports
+  them. Do not extend them; do not delete them either without asking.
+- `CNAME`, `index.html`, `privacy-policy.html`, `terms.html` and
+  `delete-data.html` serve a GitHub Pages site. Meta's app review process
+  requires a reachable privacy policy and data-deletion page, so breaking
+  these breaks something that is not visible from the code.
 
 ## What this codebase is careful about
 
