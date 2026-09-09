@@ -74,6 +74,11 @@ For the first test prefer an offer with:
 - an affiliate link/sub-id scheme that can carry AdGenie's click id;
 - a payout large enough that a $10–$25/day learning budget is meaningful.
 
+For ClickBank, use the actual HopLink or Direct Tracking Link as the offer URL.
+AdGenie appends its unique click id as `extclid`, ClickBank's current parameter
+for an external/partner click identifier. If the Meta click includes `fbclid`,
+AdGenie preserves that too.
+
 Register it:
 
 ```bash
@@ -146,19 +151,44 @@ Success means:
 If Meta rejects a field, treat the live error as the specification, fix the
 adapter, add a regression test, and repeat while the objects remain paused.
 
-## Gate 6 — attribution proof
+## Gate 6 — ClickBank attribution proof
 
 Before enabling paid delivery, verify the public tracking route and postback
 with a test click/conversion. The ad final URL should point at AdGenie `/r`, not
-directly at the advertiser.
+directly at ClickBank. `/r` records the click and then redirects to the HopLink
+with `extclid=<adgenie-click-id>`.
 
-The affiliate network must return AdGenie's click id in its postback. Configure
-that network's sub-id/TID and postback macros according to its current
-instructions, then confirm one synthetic/test conversion appears against the
-right offer/creative.
+In ClickBank, create a **Custom Postback/Pixel** S2S integration for the affiliate
+account nickname. For the first smoke test, configure the purchase event only
+and point it at this shape (replace the host and secret):
 
-Do not send fabricated revenue into a production optimizer. Use a network test
-facility if available, or a clearly isolated staging transaction/database.
+```text
+https://<public-host>/postback
+  ?transaction_id={receipt_id}
+  &click_id={extclid}
+  &network=clickbank
+  &revenue={affiliate_earnings}
+  &sale_amount={total_transaction_amount}
+  &status=approved
+  &event=sale
+  &secret=<POSTBACK_SECRET>
+```
+
+Enter it as one URL with no whitespace/newlines. ClickBank replaces the values
+inside braces when the event fires. `extclid` is the important join: it is the
+AdGenie click id that was appended to the affiliate link on the outbound click.
+
+Use ClickBank's integration test feature where possible, and confirm the
+postback response reports `attribution: click_id`. Also confirm the conversion
+row carries the correct offer and creative before allowing the optimizer to use
+that revenue.
+
+Refunds/chargebacks should be configured as a separate ClickBank event mapping
+to the same endpoint with `status=reversed`; do not treat them as new positive
+revenue.
+
+Do not send fabricated revenue into a production optimizer. Use the network's
+test facility or a clearly isolated staging transaction/database.
 
 ## Gate 7 — tiny live spend
 
