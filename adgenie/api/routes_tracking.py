@@ -36,6 +36,18 @@ _STATUS_MAP = {
     "reversed": ConversionStatus.REVERSED,
 }
 
+# Affiliate networks do not agree on the name of a third-party click id.
+# ClickBank's current S2S/Postback integration returns `extclid`, so putting
+# AdGenie's opaque click id there gives the postback a lossless route back to
+# the exact click. Other/manual networks retain the generic `subid` convention.
+_NETWORK_CLICK_ID_PARAM = {
+    "clickbank": "extclid",
+}
+
+
+def _network_click_id_param(network: str | None) -> str:
+    return _NETWORK_CLICK_ID_PARAM.get((network or "").strip().lower(), "subid")
+
 
 @router.get("/r", include_in_schema=False)
 def redirect_click(
@@ -75,7 +87,10 @@ def redirect_click(
         key: params[key] for key in PLATFORM_CLICK_PARAM.values() if key in params
     }
     destination = build_final_url(
-        offer.destination_url, click.click_id, extra=passthrough
+        offer.destination_url,
+        click.click_id,
+        subid_param=_network_click_id_param(offer.network),
+        extra=passthrough,
     )
     session.commit()
     # 302, not 301: a permanent redirect would be cached and the click never
