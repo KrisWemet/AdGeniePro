@@ -3,6 +3,7 @@ from __future__ import annotations
 import httpx
 
 from adgenie.config import Settings
+from adgenie.models import Platform
 from adgenie.money import usd_to_micros
 from adgenie.platforms.base import CampaignSpec
 from adgenie.platforms.factory import get_platform, reset_sandboxes
