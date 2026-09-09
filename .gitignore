@@ -1,1 +1,19 @@
-.envvenv/
+.env
+.env.*
+!.env.example
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.db
+*.sqlite3
+.DS_Store
+dist/
+build/
+*.egg-info/
+.coverage
+htmlcov/
+# Downloaded generated assets. Anchored to the root so it cannot swallow
+# the adgenie/media source package.
+/media/

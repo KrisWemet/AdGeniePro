@@ -1,0 +1,310 @@
+"""Optimizer control: sync, run, review and approve."""
+
+from __future__ import annotations
+
+from datetime import date, datetime, timedelta, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from ..config import get_settings
+from ..core.metrics import default_window
+from ..core.orchestrator import Orchestrator
+from ..platforms.base import PlatformError
+from ..db import get_session
+from ..models import (
+    ActionStatus,
+    AdGroup,
+    AuditLog,
+    Campaign,
+    OptimizationAction,
+    OptimizerRun,
+)
+from ..schemas import ActionOut, OptimizeIn, SyncIn
+
+router = APIRouter(tags=["optimizer"])
+
+
+def _action_out(action: OptimizationAction) -> ActionOut:
+    return ActionOut(
+        id=action.id,
+        level=action.level.value,
+        entity_id=action.entity_id,
+        action=action.action.value,
+        rule=action.rule,
+        reason=action.reason,
+        confidence=action.confidence,
+        status=action.status.value,
+        requires_approval=action.requires_approval,
+        payload=action.payload,
+    )
+
+
+@router.post("/optimizer/sync")
+def sync(payload: SyncIn, session: Session = Depends(get_session)) -> dict:
+    """Pull the latest delivery data from every connected platform."""
+    settings = get_settings()
+    until = payload.until or (date.today() - timedelta(days=1))
+    since = payload.since or (until - timedelta(days=settings.optimizer_lookback_days))
+    if since > until:
+        raise HTTPException(422, "since must not be after until")
+    return Orchestrator(session, settings=settings).sync_metrics(since, until)
+
+
+@router.post("/optimizer/run")
+def run_optimizer(
+    payload: OptimizeIn, session: Session = Depends(get_session)
+) -> dict:
+    """Evaluate every entity and record what should change.
+
+    With `apply` false (the default in a dry-run deployment) this changes
+    nothing on the ad platforms; it produces a reviewable set of proposals.
+    """
+    settings = get_settings()
+    if payload.apply and settings.dry_run:
+        raise HTTPException(
+            409,
+            "DRY_RUN is on. Applying would rewrite stored budgets and statuses "
+            "while sending nothing to the ad platforms, leaving this database "
+            "disagreeing with the live accounts. Set DRY_RUN=false first.",
+        )
+    return Orchestrator(session, settings=settings).run_cycle(
+        lookback_days=payload.lookback_days, apply=payload.apply
+    )
+
+
+@router.get("/optimizer/runs")
+def list_runs(
+    session: Session = Depends(get_session), limit: int = Query(default=20, le=100)
+) -> list[dict]:
+    runs = session.execute(
+        select(OptimizerRun).order_by(OptimizerRun.started_at.desc()).limit(limit)
+    ).scalars()
+    return [
+        {
+            "run_id": r.run_id,
+            "started_at": r.started_at.isoformat(),
+            "finished_at": r.finished_at.isoformat() if r.finished_at else None,
+            "dry_run": r.dry_run,
+            "evaluated": r.entities_evaluated,
+            "proposed": r.actions_proposed,
+            "applied": r.actions_applied,
+            "summary": r.summary,
+        }
+        for r in runs
+    ]
+
+
+@router.get("/optimizer/actions", response_model=list[ActionOut])
+def list_actions(
+    session: Session = Depends(get_session),
+    status: ActionStatus | None = None,
+    run_id: str | None = None,
+    limit: int = Query(default=100, le=500),
+) -> list[ActionOut]:
+    query = select(OptimizationAction).order_by(OptimizationAction.created_at.desc())
+    if status:
+        query = query.where(OptimizationAction.status == status)
+    if run_id:
+        query = query.where(OptimizationAction.run_id == run_id)
+    return [_action_out(a) for a in session.execute(query.limit(limit)).scalars()]
+
+
+@router.post("/optimizer/actions/{action_id}/approve", response_model=ActionOut)
+def approve_action(
+    action_id: int, session: Session = Depends(get_session)
+) -> ActionOut:
+    """Approve and immediately apply a proposal that was held for review."""
+    action = session.get(OptimizationAction, action_id)
+    if action is None:
+        raise HTTPException(404, f"action {action_id} not found")
+    if action.status not in (ActionStatus.PROPOSED, ActionStatus.APPROVED):
+        raise HTTPException(
+            409, f"action {action_id} is already {action.status.value}"
+        )
+
+    settings = get_settings()
+    if settings.dry_run:
+        raise HTTPException(
+            409,
+            "DRY_RUN is on, so approving would change this database without "
+            "changing the ad account. Set DRY_RUN=false first.",
+        )
+    orchestrator = Orchestrator(session, settings=settings)
+    applied = orchestrator.apply_action(action, actor="human")
+    session.commit()
+    if not applied:
+        raise HTTPException(502, action.error or "failed to apply action")
+    return _action_out(action)
+
+
+@router.post("/optimizer/actions/{action_id}/reject", response_model=ActionOut)
+def reject_action(
+    action_id: int,
+    reason: str = Query(default=""),
+    session: Session = Depends(get_session),
+) -> ActionOut:
+    action = session.get(OptimizationAction, action_id)
+    if action is None:
+        raise HTTPException(404, f"action {action_id} not found")
+    if action.status is ActionStatus.APPLIED:
+        raise HTTPException(409, "cannot reject an action that was already applied")
+    action.status = ActionStatus.REJECTED
+    action.error = reason or "rejected by operator"
+    session.commit()
+    return _action_out(action)
+
+
+@router.get("/optimizer/rebalance/{ad_group_id}")
+def rebalance(
+    ad_group_id: int,
+    days: int = Query(default=7, ge=1, le=90),
+    session: Session = Depends(get_session),
+) -> dict:
+    """Advisory split across an ad group's creatives.
+
+    Neither platform funds an individual ad, so this guides which creatives to
+    keep running. Use the campaign endpoint for a split that can be applied.
+    """
+    if session.get(AdGroup, ad_group_id) is None:
+        raise HTTPException(404, f"ad group {ad_group_id} not found")
+    since, until = default_window(days)
+    return Orchestrator(session, settings=get_settings()).rebalance_ad_group(
+        ad_group_id, since, until
+    )
+
+
+@router.get("/optimizer/rebalance-campaign/{campaign_id}")
+def rebalance_campaign(
+    campaign_id: int,
+    days: int = Query(default=7, ge=1, le=90),
+    session: Session = Depends(get_session),
+) -> dict:
+    """Thompson-sampled budget split across a campaign's ad groups."""
+    if session.get(Campaign, campaign_id) is None:
+        raise HTTPException(404, f"campaign {campaign_id} not found")
+    since, until = default_window(days)
+    return Orchestrator(session, settings=get_settings()).rebalance_campaign(
+        campaign_id, since, until
+    )
+
+
+@router.get("/optimizer/rotation/{offer_id}")
+def rotation_plan(offer_id: int, session: Session = Depends(get_session)) -> dict:
+    """Which of an offer's arguments are working, worn out, or wrong.
+
+    The optimizer breeds variants of a fatigued ad, and those inherit its
+    angle. This says when the argument itself is the problem, and when an
+    angle is merely tired and should come back later rather than be dropped.
+    """
+    return Orchestrator(session, settings=get_settings()).rotate_offer(offer_id)
+
+
+@router.post("/optimizer/rotation/{offer_id}/apply")
+def apply_rotation(offer_id: int, session: Session = Depends(get_session)) -> dict:
+    """Stop spent angles and stage ads for the next ones. Honours DRY_RUN."""
+    return Orchestrator(session, settings=get_settings()).apply_rotation(offer_id)
+
+
+@router.get("/optimizer/portfolio")
+def portfolio_plan(
+    days: int = Query(default=14, ge=1, le=90),
+    budget_usd: float | None = Query(default=None, gt=0),
+    session: Session = Depends(get_session),
+) -> dict:
+    """How the daily budget should divide across offers.
+
+    The rebalance endpoints optimize inside one campaign. This one decides
+    which offers deserve the money at all, which is the larger half of the
+    problem and the one nothing else here answers.
+    """
+    from ..core.portfolio import PortfolioAllocator
+
+    since, until = default_window(days)
+    allocator = PortfolioAllocator(session, settings=get_settings())
+    total = int(budget_usd * 1_000_000) if budget_usd else None
+    return allocator.plan(since, until, total_micros=total).as_dict()
+
+
+@router.post("/optimizer/portfolio/apply")
+def apply_portfolio_plan(
+    days: int = Query(default=14, ge=1, le=90),
+    budget_usd: float | None = Query(default=None, gt=0),
+    session: Session = Depends(get_session),
+) -> dict:
+    """Push a fresh portfolio plan onto the campaigns.
+
+    Honours DRY_RUN, and says in the response whether it acted.
+    """
+    from ..core.portfolio import PortfolioAllocator
+
+    since, until = default_window(days)
+    settings = get_settings()
+    allocator = PortfolioAllocator(session, settings=settings)
+    total = int(budget_usd * 1_000_000) if budget_usd else None
+    plan = allocator.plan(since, until, total_micros=total)
+    result = allocator.apply(
+        plan, orchestrator=Orchestrator(session, settings=settings)
+    )
+    return {**plan.as_dict(), "apply": result}
+
+
+@router.get("/optimizer/segments/{ad_group_id}")
+def segment_report(
+    ad_group_id: int,
+    dimension: str = Query(default="placement"),
+    days: int = Query(default=14, ge=1, le=90),
+    session: Session = Depends(get_session),
+) -> dict:
+    """Where an ad group's budget actually goes, sliced one way.
+
+    Campaign totals hide their own worst parts. One placement or age bracket
+    quietly taking a fifth of the spend at a fraction of the conversion rate is
+    common, and cutting it usually beats another creative test.
+    """
+    if session.get(AdGroup, ad_group_id) is None:
+        raise HTTPException(404, f"ad group {ad_group_id} not found")
+    since, until = default_window(days)
+    try:
+        return Orchestrator(session, settings=get_settings()).segment_report(
+            ad_group_id, since, until, dimension
+        )
+    except PlatformError as exc:
+        raise HTTPException(422, str(exc))
+
+
+@router.post("/optimizer/push-conversions")
+def push_conversions(
+    hours: int = Query(default=48, ge=1, le=720),
+    session: Session = Depends(get_session),
+) -> dict:
+    """Send network-confirmed sales back to Meta and Google.
+
+    Bidding algorithms can only optimize toward events they can observe, and an
+    affiliate sale happens on someone else's domain.
+    """
+    return Orchestrator(session, settings=get_settings()).push_conversions(hours)
+
+
+@router.get("/audit")
+def audit_log(
+    session: Session = Depends(get_session), limit: int = Query(default=100, le=500)
+) -> list[dict]:
+    """Every mutation this platform has sent to an ad account."""
+    rows = session.execute(
+        select(AuditLog).order_by(AuditLog.created_at.desc()).limit(limit)
+    ).scalars()
+    return [
+        {
+            "id": r.id,
+            "actor": r.actor,
+            "platform": r.platform.value if r.platform else None,
+            "operation": r.operation,
+            "target": r.target,
+            "ok": r.ok,
+            "dry_run": r.dry_run,
+            "created_at": r.created_at.isoformat(),
+        }
+        for r in rows
+    ]

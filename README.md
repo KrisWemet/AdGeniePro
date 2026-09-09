@@ -1,1 +1,887 @@
-# AdGeniePro
+# AdGenie Pro
+
+Writes, launches and optimizes ads on Meta and Google for affiliate offers.
+
+Give it an offer. It generates the ad copy, checks it against both platforms'
+policies before anything goes live, builds a structured test, measures the
+result against network-reported revenue rather than platform pixels, and then
+manages budget across the winners and losers with decisions you can audit.
+
+```bash
+pip install -r requirements.txt
+python -m adgenie.cli demo --days 21
+```
+
+The demo runs the entire pipeline against a built-in auction simulator,
+including realistic conversion reporting delay. No credentials, no spend.
+
+---
+
+## Why this is built the way it is
+
+Most "AI ad bot" tooling fails in one of four specific ways. Each of those
+failure modes drove a design decision here.
+
+**It gets the ad account banned.** Affiliate marketing dies of policy
+enforcement, not bad copy. So every creative passes a policy engine before it
+can reach an ad account, and a blocking finding stops the launch instead of
+producing a warning nobody reads. The rules cover Meta's personal-attributes
+policy, unrealistic-outcome and health claims, prohibited categories, Google's
+editorial standards, and the FTC's disclosure requirement for affiliate links.
+See `adgenie/core/compliance.py`.
+
+**It optimizes toward the wrong number.** Affiliate conversions fire on the
+advertiser's domain, where neither the Meta pixel nor a Google tag can see
+them. A platform's reported conversion count is therefore not a safe basis for
+spending money. This platform builds its own measurement path: every ad click
+passes through a tracking redirect that assigns an opaque click id, that id
+travels to the network as its sub-id, and the network's postback carries it
+back. Revenue and ROAS come from that side. See `adgenie/core/tracking.py`.
+
+**It acts on noise.** Kill a good ad after three unlucky days and you burn the
+winner; keep a bad one because "it might turn around" and you burn the budget.
+Both are the same mistake: acting on a point estimate with no error bar. Every
+decision here is gated on a credible interval from a Beta-Binomial posterior,
+with an empirical-Bayes prior pooled across comparable ads so a creative with
+ten clicks is not judged as though it had a thousand. See
+`adgenie/core/stats.py` and `adgenie/core/optimizer.py`.
+
+**You cannot tell what it did or why.** Every decision records the rule that
+fired, the metrics it saw, and its confidence, before anything is applied.
+Every mutation sent to an ad account is written to an append-only audit log.
+
+---
+
+## What a cycle looks like
+
+```
+offer ──► copy generation ──► policy review ──► launch (paused)
+                                   │
+                                   └── blocked ──► held for human review
+
+                    ┌──────────────────────────────────────┐
+                    │                                      │
+              sync delivery                         apply decisions
+                    │                                      │
+                    ▼                                      │
+          join network conversions ──► evaluate ──► record decisions
+```
+
+Copy that fails review is sent back to the generator with the specific findings
+attached, up to a bounded number of attempts. Copy that passes is hard-trimmed
+to the platform's character limits before the API call, because an asset one
+character over the limit is a rejected ad.
+
+---
+
+## Getting started
+
+### 1. Configure
+
+```bash
+cp .env.example .env
+```
+
+Everything is optional. Any integration you leave blank falls back to the
+sandbox, and the logs say so explicitly rather than silently doing nothing.
+
+| Setting | Effect when unset |
+|---|---|
+| `ANTHROPIC_API_KEY` | Copy comes from the built-in angle templates instead of Claude |
+| `META_*` | Meta calls go to the simulator; competitor research is unavailable |
+| `KIE_API_KEY` | Images are simulated placeholders at the correct dimensions |
+| `GOOGLE_*` | Google calls go to the simulator |
+| `DRY_RUN` | Defaults to `true`: nothing is sent to a live ad account |
+| `API_KEY` | The `/api` routes are unauthenticated; bind to localhost |
+| `AUDIT_LANDING_PAGES` | Defaults to `true`; destinations are checked before launch |
+
+### 2. Add an offer
+
+```bash
+python -m adgenie.cli offer-add \
+  --name "CalmLeaf Sleep Support" \
+  --url "https://your-affiliate-link.example/lp" \
+  --payout 42 --network clickbank --vertical supplements \
+  --benefit "wind down without next-morning grogginess" \
+  --proof "Third-party tested in a US facility" \
+  --regulated
+```
+
+`--payout` is what the network pays per conversion. The optimizer discounts it
+by the expected reversal rate, because scaling a campaign on revenue that later
+refunds is a way to lose money slowly.
+
+### 3. Launch a test
+
+```bash
+python -m adgenie.cli launch --offer 1 --platform google --budget 45 \
+  --angles 3 --keyword "natural sleep aid"
+```
+
+One ad group per angle. An angle is the *argument* an ad makes, not its
+wording. Rotating wording produces ads that all fail together; rotating the
+angle is what actually finds a winner. Ten angles ship in
+`adgenie/core/angles.py`.
+
+Campaigns start paused. Turning on spend is a separate, deliberate call.
+
+### 4. See what the market is already running
+
+```bash
+python -m adgenie.cli research --term "sleep supplement" --country GB --country DE
+```
+
+Read the section below on what this can and cannot tell you before relying on
+it. Add `--research` to a launch to feed the patterns straight into the
+copywriter.
+
+### 5. Generate the imagery
+
+```bash
+python -m adgenie.cli launch --offer 1 --platform meta --budget 45 --with-media
+python -m adgenie.cli media --creative 3 --kind video
+```
+
+One asset per placement, at the size the placement actually serves. Every
+prompt is screened against Meta's imagery rules *before* generation, because a
+rejected prompt costs nothing and a generated one costs money and a minute.
+Google search ads carry no imagery and are skipped.
+
+### 6. Measure and optimize
+
+```bash
+python -m adgenie.cli sync              # pull delivery from the platforms
+python -m adgenie.cli optimize          # propose changes, change nothing
+python -m adgenie.cli optimize --apply  # act (requires DRY_RUN=false)
+python -m adgenie.cli report            # performance by creative
+python -m adgenie.cli portfolio         # split the budget across offers
+python -m adgenie.cli rotate            # keep, rest or retire each angle
+```
+
+### 7. Or run the server
+
+```bash
+uvicorn adgenie.main:app --reload
+```
+
+Dashboard at `http://localhost:8000`, API docs at `/docs`.
+
+---
+
+## Landing page auditing
+
+**Both platforms review the destination, not just the ad.** This is where most
+affiliate bans originate, and until now the platform screened ad text and
+imagery while never once looking at the page it was sending traffic to.
+
+```bash
+python -m adgenie.cli landing --offer 1          # audit and record
+python -m adgenie.cli landing --sweep --pause    # re-check everything live
+```
+
+A launch audits the destination before creating anything, so a broken page
+means no campaign rather than paused wreckage in the ad account. Set
+`AUDIT_LANDING_PAGES=false` to turn that off, or pass
+`--skip-landing-check` for one launch.
+
+### The check that matters most
+
+The page is fetched **twice**: once as an ordinary mobile browser, once as each
+platform's reviewing crawler. If the two differ materially, the page is
+cloaking — an instant and usually permanent ban.
+
+This matters more for affiliates than for advertisers generally, because *you
+may not control the page*. A network can cloak on their own initiative without
+telling you, and the first you hear of it is the enforcement email. Finding out
+from this tool is survivable.
+
+Three signatures are caught: materially different content, an error served only
+to the crawler, and the crawler being redirected somewhere the human never
+goes. Normal variation — timestamps, rotating testimonials, visitor counters —
+does not trip it.
+
+### Everything else it checks
+
+| Check | Why |
+|---|---|
+| Reachable, not a 4xx/5xx | Every click is being paid for and wasted |
+| Privacy policy link | Blocking; the most common rejection reason |
+| Terms and contact links | Their absence reads as a throwaway page |
+| HTTPS, and HTTPS forms | Blocking when the page takes card details |
+| Redirect chain length and scheme | Long chains lose visitors and read as cloaking |
+| Meta refresh redirects | A classic cloaking signature |
+| Viewport tag | Most of this traffic is on a phone |
+| Word count | A page that is mostly a button is a bridge page, which Google rejects |
+| FTC disclosure on the page | The ad's disclosure does not cover the destination |
+| Autoplay audio, back-button traps, unsubstantiated press logos | Rejection reasons in their own right |
+| The page's own claims | A guaranteed-cure promise is no safer one click away |
+| Ad-to-page consistency | Google rejects destination mismatch outright |
+
+### Noticing when the page changes
+
+An audit run once at launch answers the wrong question — the page was compliant
+*then*. Networks rotate creatives and advertisers edit copy, so every audit is
+stored with a content hash and a later one that finds different content says
+so. `landing --sweep` re-checks every live destination; `--pause` stops
+spending on the ones that now fail.
+
+`--pause` honours `DRY_RUN` like every other mutation here: under a dry run it
+reports the campaigns it *would* stop and touches neither the platform nor the
+database. Set `DRY_RUN=false` when you actually want a sweep to act.
+
+---
+
+## Competitor research: what it can and cannot tell you
+
+Read this before trusting the output.
+
+**The Ad Library has no performance data for commercial ads.** No click-through
+rate, no conversions, no ROAS, no spend. Political and issue ads report spend
+and impressions as wide ranges; EU commercial ads report a single reach figure;
+everything else reports nothing.
+
+**Outside the EU and UK it carries no commercial ads at all.** Ordinary product
+ads are archived under the Digital Services Act, which covers the EU and UK
+only. A US search returns political and issue ads plus the US special
+categories (housing, employment, financial products). An empty US result means
+"not carried", not "no competition" — so `/api/research/coverage` and the CLI
+both say so out loud rather than handing back an empty list.
+
+**What it can tell you is what is still running, and for how long.** That is
+the inference experienced buyers make from it, and this platform makes it
+explicit:
+
+| Signal | What it means |
+|---|---|
+| Days running | The main one. Nobody funds a losing ad for three months. |
+| Still live | A stopped ad is a finished experiment. |
+| Variant count | Fifteen versions of one idea means the advertiser is scaling it. |
+| EU reach | Actual delivery volume, where the DSA requires it. |
+| Ads that stopped fast | The only negative signal available (`/api/research/retired`). |
+
+The retirement signal needs its own pass: a scan restricted to live ads can
+never *see* an ad stop, it just stops being returned. Run
+`adgenie research-sweep` (or `POST /api/research/sweep-retirements`) on a
+schedule to re-scan stored searches including stopped ads.
+
+Each ad gets a **staying-power** score weighting longevity on a log scale — the
+step from 7 days to 30 says far more than 90 to 120 — plus whether it is live
+and how many variants exist. Angles are weighted by that score rather than
+counted, so one advertiser flooding the archive with new ads cannot outvote a
+durable competitor. The result carries a `confidence` of none, low, moderate or
+high, because a handful of ads from two advertisers is an anecdote.
+
+**Competitor copy is never reused.** What reaches the copywriter is *pattern*
+guidance — which arguments survive, how long-running copy is structured, the
+register and CTA distribution — never wording. Reproducing a competitor's copy
+risks their trademark, and this platform's own policy engine would block it.
+
+Scans are stored, so repeated scans build a history. That history is what makes
+the negative signal possible: an ad you saw last month that has since vanished
+was probably not working.
+
+## Media generation
+
+Meta ads need imagery; a text-only Meta ad barely delivers. Generation runs
+through [kie.ai](https://kie.ai), which fronts Nano Banana, Flux, Veo, Kling and
+others behind one asynchronous job API.
+
+The sequence is deliberate:
+
+1. **Plan** a prompt from the offer and the creative's angle, so the image
+   carries the same argument as the copy. A mismatch between them is a common
+   reason a well-written ad still fails.
+2. **Screen** it against Meta's imagery rules — no before-and-after, no
+   idealised or negative body framing, nothing mimicking a UI element, no
+   third-party marks or likenesses, no graphic medical or wealth-bait imagery.
+   A rejected prompt is never submitted.
+3. **Generate**, polling the task. A timeout says explicitly not to resubmit,
+   because a resubmitted task is charged twice.
+4. **Download immediately.** Provider URLs expire in about a day, so the local
+   copy is the source of truth and files are content-addressed.
+
+One asset per placement, at the size the placement serves: Meta feed 4:5,
+square 1:1, story 9:16, Google Demand Gen 1.91:1, 1:1 and 4:5. Text-only
+formats generate nothing.
+
+### Getting it onto the ad
+
+Generation produces a file. An ad needs a reference the platform will still
+resolve in six weeks, and those are not the same thing — the gap between them
+is where a campaign serves a broken image while continuing to spend.
+
+So the file is **uploaded into the ad account**, which then owns it:
+
+```bash
+python -m adgenie.cli media --creative 3 --upload
+```
+
+```
+  Uploaded to meta account act_123456:
+    image   9f2c1b7ae4d8...                          ready
+```
+
+Meta takes an image through `/adimages` and hands back a hash; a video goes to
+`/advideos` and comes back as an id. Uploads are content-addressed and keyed by
+**ad account as well as platform**, because an image hash belongs to the account
+it was uploaded into — handing account A's hash to account B produces an ad
+referencing something that does not exist there. The same file going to the
+same account a second time costs nothing.
+
+Three things about video are not optional and are easy to get wrong. A video is
+not usable the moment it uploads — Meta transcodes it, and an ad built against
+one still processing is rejected, so the upload is not finished until Meta says
+it is. A video ad is a different object, `video_data` rather than `link_data`
+with a video attached. And it needs a still for the pre-roll frame; Meta
+generates candidates during transcoding and marks one preferred, which is the
+one used. If none exists, the ad is refused rather than built broken.
+
+`MEDIA_PUBLIC_BASE_URL` is now optional. It only matters if you also want the
+assets reachable over HTTP; the upload path needs nothing but the local file.
+
+**Google is refused, deliberately.** The only format this adapter builds is a
+responsive search ad, which is text. Uploading an image as an account asset
+would succeed, cost a call, and produce something no ad here references — the
+operator would see media "attached" and wonder why the ads look the same. Image
+ads on Google mean Demand Gen, Display or Performance Max, which are campaign
+types this adapter does not create yet.
+
+Generation is also suppressed under `DRY_RUN`, which falls back to the sandbox.
+A mode whose purpose is to have no side effects should not have billing as its
+one exception.
+
+---
+
+## Wiring up tracking
+
+This is the part that makes revenue attributable, and the part most setups get
+wrong.
+
+Each creative's final URL points at **this** platform, not at the offer:
+
+```
+https://track.yourdomain.com/r?s=o7-a56-pm&pc={{campaign.id}}&pa={{ad.id}}
+```
+
+The `/r` endpoint records the click, then 302s to the advertiser with the click
+id attached as a sub-id. Configure the network to send that sub-id back:
+
+```
+https://track.yourdomain.com/postback
+  ?transaction_id={order_id}
+  &click_id={subid}
+  &revenue={commission}
+  &status=approved
+  &secret=YOUR_POSTBACK_SECRET
+```
+
+Both GET and POST are accepted, since most networks only support a GET pixel.
+The endpoint is authenticated with a shared secret: it writes the revenue
+numbers the optimizer spends against, so leaving it open is a way to make the
+system scale a losing campaign. Until `POSTBACK_SECRET` is changed from the
+example value the endpoint rejects everything with a 503 and the server warns
+at startup, so an unconfigured deployment cannot be fed forged revenue. Duplicate postbacks are idempotent and refunds
+update the original conversion in place.
+
+`push-conversions` sends network-confirmed sales back to Meta's Conversions API
+and Google's offline conversion upload. Without that step, Smart Bidding and
+Advantage+ are optimizing toward landing-page views they can see rather than
+the sales they cannot.
+
+---
+
+## The optimizer's rules
+
+Evaluated in order; the first match wins.
+
+| Rule | Fires when | Action |
+|---|---|---|
+| `compliance_block` | Creative has a blocking policy finding | Pause |
+| `cooldown` | Acted on this entity within the cooldown window | Hold |
+| `learning` | Not enough spend or clicks to say anything | Hold |
+| `awaiting_conversions` | Too little of the conversion window has elapsed | Hold |
+| `funnel_learning` | Too few leads to price against their value | Hold |
+| `funnel_unprofitable` | Leads cost more than they are conservatively worth | Pause |
+| `funnel_scale` | Leads are cheap even on the pessimistic value | Raise budget |
+| `zero_conversion_kill` | Lifetime spend past N× payout, no conversions, and breakeven is implausible | Pause |
+| `unprofitable_kill` | ROAS and its upper credible bound both below breakeven | Pause |
+| `scale_winner` | ROAS above target **and** the lower bound clears breakeven | Raise budget |
+| `throttle_marginal` | Profitable but the upper bound cannot reach target | Cut budget |
+| `decayed_winner_throttle` | Bad window, but a profitable lifetime record | Cut budget |
+| `placement_waste` | One segment is measurably worse than its peers | Exclude it (needs approval) |
+| `frequency_fatigue` | Frequency above the ceiling | Generate new creative |
+| `ctr_decay` | CTR decayed against the ad's own opening week | Generate new creative |
+
+Levers are matched to the level that has them. Neither platform funds an
+individual ad, so at creative level a winner is held (its gain is realised by
+funding the parent ad set and by the budget split across its siblings) and the
+usable actions are pause, resume and creative refresh. Budget changes apply to
+ad sets and campaigns.
+
+### Funnels and lead value
+
+Sending traffic straight to an affiliate page monetises a click once. A lead
+magnet monetises it repeatedly — and gives you a destination you control, which
+is the single biggest reduction in ban risk available, since Meta reviews the
+page, not just the ad.
+
+The catch is measurement. Take 1,000 clicks at $0.80:
+
+| | Direct | Through a funnel |
+|---|---|---|
+| Day one | 2% × $40 = **$800** | 30% opt in, 5% tripwire = **$255** |
+| Over a month | — | ~8% of 300 leads take the offer = **$960** |
+| Total from the same clicks | $800 | **$1,215**, about $4 a lead |
+| You keep | nothing | 300 leads, promotable for months |
+
+The funnel earns more from the same traffic, but on day one it looks like a
+0.32 return. An optimizer reading realised revenue kills the campaign that was
+working — the same censoring problem as conversion lag, an order of magnitude
+worse.
+
+So a funnel campaign is judged on **pipeline value**: realised revenue plus
+what its leads are *still* expected to pay. Note "still": the measured lead
+value is built from revenue leads have already produced, and that revenue is
+also in the realised figure, so only the remainder counts as pipeline. Adding
+the whole lead value on top would count the same money twice and push a
+break-even campaign over the scaling threshold.
+
+That worth is measured, not assumed:
+
+- Only cohorts older than a week count toward it, since a lead captured
+  yesterday has not finished earning and averaging it in understates every
+  lead. Younger cohorts are projected up their maturity curve instead.
+- The estimate is shrunk toward the funnel's own economics while the sample is
+  thin, so five lucky leads cannot carry a large number. With no prior supplied
+  the sample stands on its own — shrinking toward an unstated zero would bias
+  the optimizer toward killing every funnel.
+- Lead value is heavily skewed, so the interval is built to respect a long
+  right tail rather than assuming symmetry.
+- **Spending decisions use the lower bound**, never the mean. A list scaled on
+  an optimistic lead value is a list funded by a forecast.
+- A trickle of opt-ins does not switch the safety rules off. Below the minimum
+  needed to price a lead, the ordinary kill rules still apply, so a campaign
+  cannot buy immunity with ten leads and no sales.
+
+```bash
+python -m adgenie.cli funnel --offer 1 \
+  --step optin:optin --step tripwire:tripwire:17 --step core:core:40
+```
+
+Only a salted hash of each address is stored. The address belongs in your email
+platform; an ad optimizer needs only to tell one lead from another.
+
+The opt-in and event endpoints authenticate with the **postback secret**, not
+the admin API key, since a landing page or an email webhook cannot hold your
+operator credentials. Funnel configuration and lead reporting stay behind the
+admin key.
+
+A note on tripwires: their job is not profit, it is to make the list
+self-funding. If a tripwire covers ad spend, your leads are free and everything
+after is margin — so judging one on its own ROAS misreads what it is for.
+
+### Segment analysis
+
+A campaign total hides its own worst parts. An affiliate ad set frequently has
+one placement quietly taking a fifth of the budget at a fraction of the
+conversion rate — Audience Network and Reels are the usual suspects — and
+because the average still looks acceptable, nobody goes looking. Cutting it is
+often a larger ROAS move than any creative test, and it is available
+immediately rather than after another week of data.
+
+```bash
+python -m adgenie.cli segments --dimension placement --days 14
+```
+
+Delivery can be sliced by placement, device, age and gender, region or hour.
+The hard part is not finding the worst segment — sorting does that — but
+knowing whether it is genuinely bad or merely unlucky. Each segment is compared
+against **the rest of the entity pooled**, not against the best performer, on
+the same Beta posterior the rest of the optimizer uses. Four guards must clear
+before anything is cut, and each stops a specific way of being wrong:
+
+| Guard | Stops |
+|---|---|
+| Minimum clicks | Cutting on noise |
+| Minimum share of spend | Cutting something too small to matter |
+| Confidence adjusted for how many segments were tested | Finding a "significant" loser by chance — with five segments at 95%, you will roughly half the time |
+| Keep a minimum number of segments | Starving the entity of anywhere to deliver |
+
+At most two are cut per cycle so the effect of each stays measurable, and every
+exclusion requires human approval, because Meta has no "exclude this placement"
+call: the only way to stop serving somewhere is to list every placement that
+stays, which resets ad set learning.
+
+That also means an ad set on **automatic placements is refused rather than
+guessed at**. Meta's automatic set changes over time, so enumerating it from a
+constant would silently switch off placements nobody asked to lose. Set the
+placements explicitly first, then re-run.
+
+Each platform is offered a lever it can actually apply — placements on Meta,
+devices on Google — so an exclusion is never reviewed, approved and then
+rejected at apply time. Age, gender and region are reported but never
+auto-excluded: those are targeting changes with consequences a human should
+weigh.
+
+### When an offer needs a new argument
+
+The fatigue rules breed variants from a worn-out ad. That is right when the
+*wording* wore out and wrong when the *argument* did — it produces a family of
+ads that all fail together, for the same reason, while the budget keeps going
+out.
+
+```bash
+python -m adgenie.cli rotate --offer 1           # what it would do
+python -m adgenie.cli rotate --offer 1 --apply   # stop spent angles, stage the next
+```
+
+```
+  angle                     verdict  ads  clicks     cvr   roas  decay
+  Problem / Solution          scale    3    1713   3.50%   2.80      1%
+  Unique Mechanism             rest    3    1218   2.87%   2.29     52%
+  Social Proof               retire    4    2044   0.00%   0.00      1%
+  Identity / Aspiration    unproven    1      60   0.00%   0.00      0%
+```
+
+Two distinctions do the work, and both are routinely collapsed.
+
+**An angle is not an execution.** One bad ad for a good argument is the most
+common outcome in advertising. Judging an angle on a single creative confounds
+the argument with that ad's headline, image and hook, and retiring it throws
+away a whole line of attack over one bad Tuesday. An angle is only ever retired
+on pooled evidence from several distinct executions — three by default — and
+then only if it clears a confidence bar raised for how many angles were
+compared, since testing seven at 90% finds a "loser" by chance more often than
+not.
+
+**Fatigue is not failure.** An angle whose click-through has decayed against
+its own opening, while its conversion rate held, is worn out *on this
+audience* — not wrong. It is rested with a return date rather than retired, and
+when it comes back it goes ahead of an untried angle: you already know the
+argument lands here, and an untried one is a coin flip. Retiring it instead
+deletes a proven asset and replaces it with the coin flip. Decay is measured
+against the angle's own opening and read from the *recent* window, never the
+lifetime rate — a lifetime average includes the good opening days, so an angle
+halfway through wearing out reads as healthy right up until it is worthless.
+
+Three more rules keep it from doing damage:
+
+- **No new angle while the running ones are unproven.** Adding a test makes
+  every test in flight slower to conclude. Same reasoning as the portfolio
+  allocator, applied one level down.
+- **Never rotate an offer down to nothing.** Retiring and resting are each
+  correct and can still, together, switch the offer off while the replacements
+  sit in policy review. The best of the condemned keeps running — and is marked
+  `last_resort`, not `hold`, so a spent offer cannot read as a healthy one
+  anywhere downstream.
+- **A new angle is tested in the proven ad group.** Testing an argument in a
+  weak ad set confounds the two: it fails, and you cannot tell whether the
+  argument was wrong or the audience was.
+
+When every angle is spent and the library is used up, it says so plainly, and
+the budget allocator reads it: that offer is capped at its current spend rather
+than scaled, however good its numbers look. More creative is not the answer
+there — another variant of a worn-out argument to an audience that has already
+rejected it costs money and teaches nothing.
+
+### Which offers deserve the money
+
+Everything above optimizes *within* an offer: which creative, which ad set,
+which placement. That is the smaller half of the problem. Accounts usually
+fail because most of the daily budget sat on an offer that was never going to
+pay while the one that would have paid was starved into statistical silence.
+
+```bash
+python -m adgenie.cli portfolio --days 14           # what it would do
+python -m adgenie.cli portfolio --days 14 --apply   # do it
+```
+
+```
+  offer                         verdict       now    target            roas  p(best)
+  ----------------------------------------------------------------------------------
+  CalmLeaf Sleep Support           fund     98.43    147.64       1.83-2.71     100%
+```
+
+It differs from the creative-level split in four ways that each cost money if
+you get them wrong.
+
+**Return per dollar, not per click.** Ranking by revenue per click is only
+correct when clicks cost the same everywhere, and across offers they never do.
+An offer converting at 3% on $2.00 clicks loses money; one converting at 1% on
+$0.40 clicks makes it. A per-click ranking picks the loser.
+
+**A loser gets zero, not a floor.** The creative-level allocator gives every
+candidate a minimum share so exploration never stops, which is right for
+creatives inside an offer that already works. Across offers it is a permanent
+leak. An offer whose *upper* credible bound is below breakeven is not
+uncertain, and funding it forever is a subscription, not a test. An offer that
+is merely losing the ranking keeps its floor — that is a different thing, and
+pausing a working second earner over a ranking throws away an asset.
+
+**Exploration is concentrated, not spread.** Funding eight untested offers at
+$5/day buys eight windows too small to conclude anything from; a month later
+there are still eight unproven offers and the money is gone. An unproven
+offer's budget is sized from what a verdict actually costs — enough clicks
+that five conversions would be expected at its own breakeven rate — and only
+as many offers run as can be funded at that level. A useful thing falls out of
+the arithmetic: at breakeven you spend the payout per conversion, so **deciding
+an offer costs about five times its payout regardless of what its clicks
+cost.** Cheap traffic makes a test slower, not cheaper.
+
+**No offer holds more than 40% of the portfolio.** This one is not statistical.
+Affiliate offers get pulled, capped, or have their payout cut overnight by
+someone who does not tell you first, and a portfolio with 90% on one offer goes
+to zero revenue that morning. The cap relaxes when there is nowhere else for
+the money to go: with a single live offer, holding back 60% of the budget does
+not diversify anything, it just leaves money earning nothing. It can never bind
+harder than an even split, so it starts to bite exactly when diversification
+becomes possible.
+
+Budget moves are written where the budget actually lives — on the campaign, or
+split across its ad sets in the proportion they already run at. Writing a
+campaign budget onto a campaign that does not have one is ABO becoming CBO on
+Meta: a structural change that resets learning across every ad set in it,
+dressed up as a budget adjustment.
+
+Budgets glide rather than jump — at most 50% a day in either direction — because
+a large change re-enters the platform learning phase, and a better allocation
+reached in one leap can deliver worse than the one it replaced. The exception
+is an offer being retired: a learning phase only costs you if you intend to
+keep spending. Where the glide and the daily cap collide, the glide gives way.
+
+**An offer with no argument left to make is harvested, not scaled.** This is
+where the budget allocator and the angle rotation meet. An offer whose every
+angle is spent still makes money today — retiring it would throw away real
+profit — but the return being measured was earned by ads that are wearing out
+and cannot be replaced. A scale decision is a forecast, and that offer's
+forecast is broken: the number will fall whatever is spent against it. So it
+holds at its current spend, the growth goes to offers that can still be
+improved, and the operator is told to find a new audience or a new platform.
+The state expires on its own: once the rested angles are due back the offer has
+arguments again and is funded normally, so the same data gives a different
+answer in a month — correctly.
+
+The connection is one explicit line in `plan()`, not a call buried inside the
+allocation. `allocate_portfolio` stays a pure function of the positions handed
+to it, reading a field that `annotate_creative_supply` sets, and
+`check_creative_supply=False` turns the whole thing off.
+
+An offer with plenty of traffic but an unfinished conversion window is
+**held at its current budget**, not re-sized. Its numbers are incomplete, not
+bad, and treating them as bad is the censoring mistake the lag model exists to
+prevent. The hold sits after the retire test, not before: an offer losing money
+even on the optimistic reading of partial data is not waiting for good news.
+Exploration is likewise capped at 30% of the portfolio — testing is how
+tomorrow's winner is found, but not at today's expense.
+
+A funnel offer is judged on its pipeline, not on completed sales. Otherwise a
+lead magnet with most of its value still sitting in the list reads as a
+confident loser and gets retired on day one — the exact failure the lead-value
+model exists to prevent.
+
+### Conversion lag
+
+A click does not convert instantly. A third convert in-session, most within a
+day, and a long tail runs for weeks on trials and networks that confirm late.
+That makes recent data **right-censored**: the spend has happened, some of the
+conversions it bought have not been reported yet.
+
+Comparing the two as if both were complete is the most expensive mistake an ad
+optimizer can make, because incomplete looks exactly like failure. A four-day-
+old ad with a real 5% conversion rate shows zero conversions, and a naive kill
+rule retires it with 98% "confidence" the week before it starts paying.
+
+So each day of clicks is weighted by how much of its conversion window has
+elapsed, and the posterior counts that **effective exposure** instead of raw
+clicks. The curve is fitted per offer from your own history and shrunk toward a
+sensible default while that history is thin, so a trial offer that confirms
+after ten days is judged on a slower clock than an impulse purchase.
+
+Two asymmetries fall out of this, both deliberate:
+
+- **Killing is blocked early** (below 15% maturity nothing is judged at all),
+  because a wrong kill destroys a winner.
+- **Scaling waits much longer** (60% maturity), because a wrong scale spends
+  real money where a slow scale only forgoes a little upside. Projected ROAS is
+  reported as evidence and never funded against.
+
+The rate is estimated from matured clicks only, then applied to *every* click
+already paid for — scaling it by matured clicks instead would quietly write off
+the outstanding ones, which is the same censoring error in a different place.
+
+Three further properties are deliberate:
+
+- **The bar for scaling is higher than the bar for pausing.** Pausing a good ad
+  costs opportunity; scaling a bad one costs cash.
+- **Kill rules read lifetime data, not the rolling window.** An ad that has
+  burned money for three weeks should not get a clean slate every Monday
+  because the window moved on. Conversely a creative with a profitable lifetime
+  record that has one bad week has *decayed*, not failed, so it is throttled
+  rather than retired.
+- **Budget is allocated by Thompson sampling with an exploration floor.**
+  Ranking by observed conversion rate hands the budget to whichever ad got
+  lucky first. Sampling from each posterior keeps a promising-but-unproven
+  creative funded long enough to actually be measured.
+- **The shrinkage prior is leave-one-out.** Each creative is judged against a
+  prior built from its peers, never from itself, so an ad group holding a
+  single creative does not treat that creative's own rate as extra evidence
+  for it.
+
+### Guard rails
+
+Three independent limits stand between the optimizer and your money:
+
+1. `DRY_RUN` blocks every mutation globally. While it is on, the API and CLI
+   both refuse to apply rather than rewriting stored budgets to match changes
+   that were never sent.
+2. Budget changes above `AUTO_APPLY_BUDGET_CEILING_USD` are held for approval
+   (`POST /api/optimizer/actions/{id}/approve`).
+3. `GLOBAL_DAILY_BUDGET_CAP_USD` caps total committed daily spend, so no
+   sequence of individually-reasonable increases can run away. A campaign
+   counts the larger of its own budget and the sum of its ad sets, so neither
+   budgeting style escapes the cap.
+
+### Access control
+
+The `/api` routes launch campaigns and move budgets, so set `API_KEY` for any
+deployment reachable beyond localhost. Every `/api` route then requires it in
+an `X-API-Key` header, and the server logs a warning at startup when it is
+unset. The two public routes stay open by necessity: `/r` takes anonymous ad
+clicks, and `/postback` authenticates with its own shared secret because
+affiliate networks cannot send custom headers. Narrow `CORS_ORIGINS` from `*`
+whenever the dashboard is served from a known origin.
+
+---
+
+## API
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/offers` | Register an affiliate offer |
+| `POST /api/copy/generate` | Generate reviewed ad copy variants |
+| `POST /api/copy/review` | Check existing copy against ad policy |
+| `POST /api/campaigns/launch` | Generate, review and build a campaign |
+| `POST /api/campaigns/{id}/status` | Turn a campaign on or off |
+| `GET /api/performance` | Metrics with credible intervals |
+| `POST /api/optimizer/sync` | Pull delivery data |
+| `POST /api/optimizer/run` | Evaluate and decide |
+| `GET /api/optimizer/actions` | Review proposals |
+| `POST /api/optimizer/actions/{id}/approve` | Approve a held proposal |
+| `PUT /api/offers/{offer_id}/funnel` | Define the steps between click and money |
+| `GET /api/offers/{offer_id}/lead-value` | What this offer's leads have been worth |
+| `POST /api/funnel/optin` | Record a lead (postback secret) |
+| `POST /api/funnel/event` | Record a completed funnel step (postback secret) |
+| `GET /api/funnel/leads` | Leads and their attribution |
+| `GET /api/optimizer/segments/{ad_group_id}` | Where an ad group's budget actually goes |
+| `GET /api/optimizer/rebalance/{ad_group_id}` | Advisory split across creatives |
+| `GET /api/optimizer/rebalance-campaign/{id}` | Applicable split across ad groups |
+| `GET /api/optimizer/portfolio` | How the daily budget should divide across offers |
+| `POST /api/optimizer/portfolio/apply` | Push that split onto the campaigns |
+| `GET /api/optimizer/rotation/{offer_id}` | Which angles to keep, rest, retire or introduce |
+| `POST /api/optimizer/rotation/{id}/apply` | Stop spent angles and stage the next ones |
+| `POST /api/optimizer/push-conversions` | Send sales back to the platforms |
+| `POST /api/landing/audit` | Audit a destination the way the platforms will |
+| `POST /api/landing/sweep` | Re-check every live destination |
+| `GET /api/landing/history` | Past audits, to see when a page changed |
+| `GET /api/research/coverage` | What the Ad Library will actually return |
+| `POST /api/research/scan` | Scan the archive and summarise what is running |
+| `POST /api/research/sweep-retirements` | Re-scan including stopped ads |
+| `GET /api/research/brief` | Rebuild a brief from stored scans, no API call |
+| `GET /api/research/retired` | Competitor ads that stopped quickly |
+| `GET /api/media/placements` | Placement sizes per platform |
+| `POST /api/media/preview-prompt` | Build and screen a prompt, generating nothing |
+| `POST /api/media/generate/{creative_id}` | Generate the imagery a creative needs |
+| `POST /api/media/upload/{creative_id}` | Put its files into the live ad account |
+| `GET /api/media/assets` | Generated assets |
+| `GET /api/audit` | Every mutation ever sent to an ad account |
+| `GET /r` | Click redirect (public) |
+| `GET,POST /postback` | Network conversion postback (public, authenticated) |
+
+---
+
+## Layout
+
+```
+adgenie/
+  config.py          settings, with graceful degradation everywhere
+  models.py          domain model; money is integer micros throughout
+  money.py           micro conversions
+  core/
+    stats.py         Beta-Binomial helpers, no numpy or scipy
+    lag.py           conversion delay curves and maturity weighting
+    segments.py      placement and audience waste detection
+    ltv.py           what a lead is worth before you know what it was worth
+    landing.py       destination auditing, including cloaking detection
+    destination.py   storing audits so a changed page is noticed
+    compliance.py    Meta and Google policy engine
+    angles.py        the angle library
+    copywriter.py    Claude generation + template fallback + repair loop
+    tracking.py      click tracking and conversion attribution
+    metrics.py       joins platform delivery with network revenue
+    optimizer.py     the decision rules
+    portfolio.py     which offers deserve the budget at all
+    rotation.py      when an offer needs a new argument, not new wording
+    launcher.py      offer to structured test
+    orchestrator.py  the control loop
+  platforms/
+    base.py          the adapter interface
+    specs.py         hard format limits per platform
+    meta.py          Meta Marketing API
+    google.py        Google Ads API
+    sandbox.py       auction simulator
+  media/
+    specs.py         placement sizes
+    prompts.py       prompt building and pre-generation screening
+    kie.py           kie.ai async job client
+    store.py         download before the URL expires
+    uploader.py      into the ad account, so the reference cannot rot
+    sandbox.py       real PNGs at the right size, no key needed
+    studio.py        plan, screen, generate, persist
+  research/
+    ad_library.py    Meta Ad Library client
+    signals.py       staying power, angle inference, market brief
+    service.py       persistence and history
+  api/               FastAPI routers
+  static/            dashboard
+  cli.py             command line
+  demo.py            end-to-end simulation
+tests/               566 tests
+legacy/              the original prototype scripts, kept for reference
+```
+
+## Tests
+
+```bash
+python -m pytest
+```
+
+The suite covers the statistics against known closed forms, every policy rule,
+copy generation for all ten angles on both platforms, sub-id round trips and
+attribution edge cases, both live adapters against mocked transports, and the
+whole loop end to end against the simulator.
+
+`tests/test_regressions.py` is kept separate: each test there documents a
+specific defect found in review, so a fix that silently reverts fails loudly.
+
+## Limits worth knowing
+
+- The Ad Library carries no commercial ads outside the EU and UK, and no
+  performance data anywhere. Longevity is a proxy for profitability, not a
+  measurement of it.
+- Ad Library creative images sit behind a rendered snapshot page rather than a
+  media endpoint. This platform records the URL and does not fetch it.
+- Generated video is short-form only, and the models are stronger at product
+  and lifestyle imagery than at anything needing legible on-screen text.
+- Google holds one budget per campaign. An ad-group scale decision therefore
+  moves the parent campaign's budget by the delta, and per-ad-group
+  reallocation is unavailable there.
+- Neither platform funds an individual ad, so creative-level allocation is
+  advisory. It tells you which creatives to keep running, not how to fund them.
+- The compliance engine is an automated pre-screen and a forcing function for
+  better copy. It is not legal advice and does not replace each platform's own
+  review.
+- Revenue-share offers are modelled with an average order value, falling back
+  to observed revenue per conversion. Offers with a wide order-value
+  distribution will have wider real uncertainty than the ROAS interval shows,
+  and an offer with neither a payout nor any revenue yet is reported as
+  unjudgeable rather than guessed at.
