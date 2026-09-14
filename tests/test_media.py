@@ -150,11 +150,15 @@ def test_submit_sends_model_and_input(kie_settings):
     )
     assert task_id == "t-1"
     assert seen["model"] == kie_settings.kie_image_model
+    assert seen["model"] == "nano-banana-pro"
     assert seen["input"]["prompt"] == "a photo"
     assert seen["input"]["aspect_ratio"] == "4:5"
+    assert seen["input"]["image_input"] == []
+    assert seen["input"]["resolution"] == "1K"
+    assert "negative_prompt" not in seen["input"]
 
 
-def test_video_requests_use_the_video_model_and_duration(kie_settings):
+def test_video_requests_use_the_current_veo_contract(kie_settings):
     seen = {}
 
     def handler(request):
@@ -164,8 +168,11 @@ def test_video_requests_use_the_video_model_and_duration(kie_settings):
     _kie(handler, kie_settings).submit(
         MediaRequest(prompt="x", kind="video", duration_seconds=8)
     )
-    assert seen["model"] == kie_settings.kie_video_model
-    assert seen["input"]["duration"] == 8
+    assert seen["model"] == "veo-3-1"
+    assert seen["input"]["generation_type"] == "TEXT_2_VIDEO"
+    assert seen["input"]["aspect_ratio"] == "16:9"
+    assert seen["input"]["enable_translation"] is True
+    assert "duration" not in seen["input"]
 
 
 def test_an_error_code_inside_a_200_response_is_still_an_error(kie_settings):

@@ -86,8 +86,8 @@ class Settings(BaseSettings):
     # --- media generation (kie.ai) ---
     kie_api_key: str | None = None
     kie_base_url: str = "https://api.kie.ai"
-    kie_image_model: str = "google/nano-banana-pro-text-to-image"
-    kie_video_model: str = "veo3.1-fast"
+    kie_image_model: str = "nano-banana-pro"
+    kie_video_model: str = "veo-3-1"
     kie_poll_interval_seconds: float = 5.0
     kie_poll_timeout_seconds: float = 600.0
     # Generated asset URLs expire within about a day, so they are downloaded

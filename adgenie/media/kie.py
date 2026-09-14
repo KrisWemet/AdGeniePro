@@ -143,28 +143,61 @@ class KieClient(MediaProvider):
             else self.settings.kie_image_model
         )
 
-    def _build_input(self, request: MediaRequest) -> dict:
+    def _build_input(self, request: MediaRequest, model: str) -> dict:
+        """Translate the common media request into the selected model contract."""
         payload: dict = {"prompt": request.prompt}
-        if request.negative_prompt:
-            payload["negative_prompt"] = request.negative_prompt
-        if request.aspect_ratio:
-            payload["aspect_ratio"] = request.aspect_ratio
-        if request.kind == "image":
+
+        if model == "nano-banana-pro":
+            # Nano Banana Pro does not accept the generic negative_prompt or
+            # num_images fields. The empty image_input array is part of its
+            # text-to-image contract; references turn the same request into an
+            # image-guided generation.
+            payload["image_input"] = (
+                [request.reference_image_url] if request.reference_image_url else []
+            )
+            payload["aspect_ratio"] = request.aspect_ratio or "1:1"
+            payload["resolution"] = request.extra.get("resolution", "1K")
             payload["output_format"] = request.extra.get("output_format", "png")
-            if request.count > 1:
-                payload["num_images"] = request.count
+        elif model == "veo-3-1":
+            if request.reference_image_url:
+                payload["image_urls"] = [request.reference_image_url]
+                payload["generation_type"] = request.extra.get(
+                    "generation_type", "REFERENCE_2_VIDEO"
+                )
+            else:
+                payload["generation_type"] = request.extra.get(
+                    "generation_type", "TEXT_2_VIDEO"
+                )
+            payload["aspect_ratio"] = request.aspect_ratio or "16:9"
+            payload["enable_fallback"] = request.extra.get("enable_fallback", False)
+            payload["enable_translation"] = request.extra.get(
+                "enable_translation", True
+            )
         else:
-            if request.duration_seconds:
-                payload["duration"] = int(round(request.duration_seconds))
-            payload["enable_audio"] = request.extra.get("enable_audio", False)
-        if request.reference_image_url:
-            payload["image_urls"] = [request.reference_image_url]
+            # Keep the generic Market-model path available for an explicitly
+            # configured model. Model-specific fields can be supplied through
+            # extra["input"] without changing this adapter.
+            if request.negative_prompt:
+                payload["negative_prompt"] = request.negative_prompt
+            if request.aspect_ratio:
+                payload["aspect_ratio"] = request.aspect_ratio
+            if request.kind == "image":
+                payload["output_format"] = request.extra.get("output_format", "png")
+                if request.count > 1:
+                    payload["num_images"] = request.count
+            else:
+                if request.duration_seconds:
+                    payload["duration"] = int(round(request.duration_seconds))
+                payload["enable_audio"] = request.extra.get("enable_audio", False)
+            if request.reference_image_url:
+                payload["image_urls"] = [request.reference_image_url]
+
         payload.update(request.extra.get("input", {}))
         return payload
 
     def submit(self, request: MediaRequest) -> str:
         model = self._model_for(request)
-        body: dict = {"model": model, "input": self._build_input(request)}
+        body: dict = {"model": model, "input": self._build_input(request, model)}
         if request.extra.get("callback_url"):
             body["callBackUrl"] = request.extra["callback_url"]
 
