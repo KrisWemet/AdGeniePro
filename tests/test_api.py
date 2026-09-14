@@ -397,3 +397,14 @@ def test_performance_endpoint_returns_intervals(api_client, created_offer):
     rows = api_client.get("/api/performance?level=creative&days=7").json()
     # No delivery has been simulated, so the list is empty rather than fabricated.
     assert rows == []
+
+
+def test_openapi_exposes_api_key_authorization(api_client):
+    schema = api_client.get("/openapi.json").json()
+    schemes = schema["components"]["securitySchemes"]
+    matching = [
+        name for name, value in schemes.items()
+        if value == {"type": "apiKey", "in": "header", "name": "X-API-Key"}
+    ]
+    assert matching
+    assert {matching[0]: []} in schema["paths"]["/api/offers"]["post"]["security"]

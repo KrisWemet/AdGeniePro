@@ -14,13 +14,17 @@ from __future__ import annotations
 
 import hmac
 
-from fastapi import Header, HTTPException, status
+from fastapi import HTTPException, Security, status
+from fastapi.security import APIKeyHeader
 
 from ..config import Settings, get_settings
 
 
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
 async def require_api_key(
-    x_api_key: str | None = Header(default=None),
+    x_api_key: str | None = Security(_api_key_header),
 ) -> None:
     """FastAPI dependency guarding every mutating and reporting route."""
     settings: Settings = get_settings()
