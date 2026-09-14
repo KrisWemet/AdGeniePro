@@ -48,6 +48,14 @@ def test_dashboard_is_served(api_client):
     response = api_client.get("/")
     assert response.status_code == 200
     assert "AdGenie Pro" in response.text
+    assert "Generate one image" in response.text
+    assert "API access" in response.text
+
+
+def test_swagger_keeps_operator_authorization(api_client):
+    response = api_client.get("/docs")
+    assert response.status_code == 200
+    assert '"persistAuthorization": true' in response.text
 
 
 def test_prelanding_page_is_public_and_keeps_clicks_for_the_cta(

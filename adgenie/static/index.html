@@ -46,6 +46,13 @@
     background:var(--panel);color:var(--ink);cursor:pointer}
   button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
   button:disabled{opacity:.5;cursor:progress}
+  textarea,select{font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);
+    border-radius:7px;padding:9px 11px}
+  textarea{width:100%;min-height:118px;resize:vertical;margin:8px 0}
+  select{min-width:90px}
+  #media-result{margin-top:14px}
+  #media-result img{display:block;width:min(100%,520px);border-radius:9px;border:1px solid var(--line);
+    margin:12px 0}
   .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
   .action{border-left:3px solid var(--line);padding:10px 0 10px 12px;margin-bottom:12px}
   .action.pause{border-color:var(--bad)}
@@ -65,6 +72,7 @@
   <span class="sub" id="status">loading…</span>
   <span style="flex:1"></span>
   <div class="row">
+    <button id="access">API access</button>
     <button id="sync">Sync metrics</button>
     <button id="optimize" class="primary">Run optimizer</button>
   </div>
@@ -72,6 +80,22 @@
 
 <main>
   <div class="kpis" id="kpis"></div>
+
+  <div class="panel" style="margin-bottom:16px">
+    <h2>Creative generator <span class="sub">one click submits and tracks one Kie image</span></h2>
+    <textarea id="media-prompt">Premium editorial advertising photograph for a household water preparedness guide. A calm, attractive modern home scene with a clear glass of fresh water, neatly organized household preparedness supplies and simple tools, conveying readiness, independence and peace of mind. Realistic natural photography, warm morning light, strong focal point, polished direct-response advertising aesthetic. Leave generous uncluttered space in the upper third for a headline overlay. No specific product, no people, no text, no letters, no logos, no packaging, no medical imagery, no fear or disaster imagery.</textarea>
+    <div class="row">
+      <select id="media-ratio" aria-label="Image aspect ratio">
+        <option value="4:5" selected>4:5 Meta feed</option>
+        <option value="1:1">1:1 square</option>
+        <option value="9:16">9:16 story</option>
+        <option value="16:9">16:9 landscape</option>
+      </select>
+      <button id="generate-media" class="primary">Generate one image</button>
+      <span class="sub">Each click may use one Kie credit.</span>
+    </div>
+    <div id="media-result" class="sub">Ready. The app will submit, poll, and display the result automatically.</div>
+  </div>
 
   <div class="grid">
     <div class="panel" style="grid-column:1/-1">
@@ -116,13 +140,22 @@ const pct = n => (n*100).toFixed(2) + "%";
 
 // Set by an operator when the deployment requires a key:
 //   localStorage.setItem("adgenie_api_key", "…")
-const API_KEY = (() => { try { return localStorage.getItem("adgenie_api_key"); }
-                         catch { return null; } })();
+let API_KEY = (() => { try { return localStorage.getItem("adgenie_api_key"); }
+                       catch { return null; } })();
+
+function setApiKey(){
+  const value = prompt("Enter your AdGenie API key. It stays in this browser.", API_KEY || "");
+  if(!value) return false;
+  API_KEY = value.trim();
+  try { localStorage.setItem("adgenie_api_key", API_KEY); } catch {}
+  return true;
+}
 
 async function api(path, opts){
   opts = {...(opts || {})};
   if(API_KEY) opts.headers = {...(opts.headers || {}), "X-API-Key": API_KEY};
   const r = await fetch("/api" + path, opts);
+  if(r.status === 401) throw new Error("API access required. Click API access and enter the AdGenie API key.");
   if(!r.ok) throw new Error(await r.text());
   return r.json();
 }
@@ -241,10 +274,63 @@ $("#sync").onclick = e => withButton(e.target,
 $("#optimize").onclick = e => withButton(e.target,
   () => api("/optimizer/run", {method:"POST", headers:{"content-type":"application/json"}, body:"{}"}));
 
+$("#access").onclick = () => { if(setApiKey()) refresh(); };
+
+const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+$("#generate-media").onclick = async e => {
+  const btn = e.target;
+  const host = $("#media-result");
+  if(!API_KEY && !setApiKey()) return;
+  btn.disabled = true;
+  btn.textContent = "Generating…";
+  host.textContent = "Submitting one image task…";
+  try {
+    const submitted = await api("/media/kie/image-test", {
+      method:"POST",
+      headers:{"content-type":"application/json"},
+      body:JSON.stringify({
+        prompt:$("#media-prompt").value,
+        aspect_ratio:$("#media-ratio").value,
+      }),
+    });
+    host.textContent = `Task ${submitted.task_id} accepted. Waiting for Kie…`;
+    for(let attempt=0; attempt<120; attempt++){
+      await wait(5000);
+      const result = await api(`/media/kie/tasks/${encodeURIComponent(submitted.task_id)}`);
+      if(result.state === "success"){
+        if(!result.urls.length) throw new Error("Kie finished without returning an image URL.");
+        host.textContent = "Image ready.";
+        const img = document.createElement("img");
+        img.src = result.urls[0];
+        img.alt = "Generated advertising concept";
+        host.appendChild(img);
+        const link = document.createElement("a");
+        link.href = result.urls[0];
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.textContent = "Open full-size image";
+        host.appendChild(link);
+        return;
+      }
+      if(["fail","failed","error","cancelled","canceled"].includes(result.state)){
+        throw new Error(result.error || "Kie image generation failed.");
+      }
+      host.textContent = `Task ${submitted.task_id} is ${result.state || "generating"}…`;
+    }
+    throw new Error("The task is still running. Its task ID is shown above; do not submit it again.");
+  } catch(err){
+    host.textContent = err.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Generate one image";
+  }
+};
+
 async function refresh(){
   await Promise.all([loadHealth(), loadPerformance(), loadActions(), loadCampaigns()]);
 }
-refresh();
+refresh().catch(e => { $("#status").textContent = e.message; });
 setInterval(refresh, 60000);
 </script>
 </body>

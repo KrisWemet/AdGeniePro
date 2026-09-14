@@ -113,6 +113,7 @@ app = FastAPI(
         "optimizer decision is recorded with the evidence behind it."
     ),
     lifespan=lifespan,
+    swagger_ui_parameters={"persistAuthorization": True},
 )
 
 _settings = get_settings()
