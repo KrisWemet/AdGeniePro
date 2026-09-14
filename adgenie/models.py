@@ -214,6 +214,19 @@ class Offer(Base):
         return int(gross * (1.0 - self.expected_reversal_rate))
 
 
+class ClickBankReceipt(Base):
+    """Financial event ledger; receipts keep rebills distinct and retries harmless.
+
+    A separate table also lets existing databases upgrade with create_all.
+    Store only accounting fields, never the decrypted customer record.
+    """
+
+    __tablename__ = "clickbank_receipts"
+    receipt: Mapped[str] = mapped_column(String(160), primary_key=True)
+    events: Mapped[dict] = mapped_column(JSON, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
 class PlatformAccount(Base):
     """A connected Meta ad account or Google Ads customer."""
 

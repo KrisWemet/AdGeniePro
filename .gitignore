@@ -17,3 +17,4 @@ htmlcov/
 # Downloaded generated assets. Anchored to the root so it cannot swallow
 # the adgenie/media source package.
 /media/
+/backups/

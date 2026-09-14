@@ -1,5 +1,9 @@
 # AdGenie Pro
 
+For the first real ClickBank trial, follow [LIVE_TEST_RUNBOOK.md](LIVE_TEST_RUNBOOK.md).
+It covers the encrypted INS receiver, compatible HopLink TIDs, persistent Docker
+deployment, read-only `preflight`, and the remaining live verification gates.
+
 Writes, launches and optimizes ads on Meta and Google for affiliate offers.
 
 Give it an offer. It generates the ad copy, checks it against both platforms'
@@ -84,6 +88,9 @@ cp .env.example .env
 
 Everything is optional. Any integration you leave blank falls back to the
 sandbox, and the logs say so explicitly rather than silently doing nothing.
+
+That fallback is for local development. With `ENVIRONMENT=prod`, missing ad
+credentials fail closed and production startup requires secure configuration.
 
 | Setting | Effect when unset |
 |---|---|
@@ -353,6 +360,12 @@ one exception.
 ---
 
 ## Wiring up tracking
+
+**ClickBank uses its dedicated receiver:** `/postback/clickbank` accepts encrypted
+INS v7/v8 notifications using `CLICKBANK_INS_SECRET` and `CLICKBANK_NICKNAME`.
+ClickBank offers receive a lowercase opaque click ID in `tid`; other networks
+continue using `subid`. The generic postback example below applies to networks
+that send that contract, not directly to ClickBank INS.
 
 This is the part that makes revenue attributable, and the part most setups get
 wrong.

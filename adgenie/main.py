@@ -24,6 +24,7 @@ from .api import (
     routes_optimizer,
     routes_research,
     routes_tracking,
+    routes_clickbank,
 )
 from .api.security import require_api_key
 from .config import get_settings
@@ -44,6 +45,8 @@ STATIC_DIR = Path(__file__).parent / "static"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
+    if settings.environment == "prod" and (errors := settings.production_errors()):
+        raise RuntimeError("Production configuration: " + "; ".join(errors))
     init_db()
     logger.info("%s %s starting (env=%s)", settings.app_name, __version__, settings.environment)
     if settings.dry_run:
@@ -69,7 +72,7 @@ async def lifespan(app: FastAPI):
         (Platform.GOOGLE, settings.has_google),
     ):
         logger.info(
-            "%s: %s", platform.value, "connected" if configured else "sandbox (simulated)"
+            "%s: %s", platform.value, "configured (unverified)" if configured else "not configured"
         )
     if not settings.has_copywriter_llm:
         logger.info(
@@ -136,6 +139,18 @@ app.include_router(routes_funnel.router, prefix="/api", dependencies=_guard)
 # landing page or an email webhook cannot hold the operator's admin key.
 app.include_router(routes_funnel.public_router, prefix="/api")
 app.include_router(routes_tracking.router)
+app.include_router(routes_clickbank.router)
+
+
+@app.get("/healthz", include_in_schema=False)
+def liveness() -> dict:
+    """Local service probe; never contacts paid providers or exposes settings."""
+    from sqlalchemy import text
+    from .db import engine
+    with engine.connect() as connection:
+        connection.execute(text("SELECT 1"))
+    return {"status": "ok", "service": "adgenie", "version": __version__,
+            "capabilities": ["clickbank_ins_v8"]}
 
 
 @app.get("/api/health", tags=["system"], dependencies=[Depends(require_api_key)])

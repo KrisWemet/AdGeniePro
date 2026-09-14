@@ -1,8 +1,8 @@
 """Runtime configuration for AdGenie Pro.
 
-Every external integration degrades gracefully: when credentials are absent the
-platform runs against the built-in sandbox so the full pipeline (generate ->
-review -> launch -> measure -> optimize) is exercisable end to end.
+In local development, absent credentials select the built-in sandbox so the
+full pipeline (generate -> review -> launch -> measure -> optimize) can run.
+Production refuses ad-platform simulator fallback.
 """
 
 from __future__ import annotations
@@ -109,6 +109,7 @@ class Settings(BaseSettings):
     # --- affiliate networks ---
     clickbank_api_key: str | None = None
     clickbank_nickname: str | None = None
+    clickbank_ins_secret: str | None = None
     # Deliberately the example value: postbacks are rejected until it is
     # changed, so an unconfigured deployment cannot be fed forged revenue.
     postback_secret: str = "change-me-postback"
@@ -129,6 +130,35 @@ class Settings(BaseSettings):
     @property
     def requires_api_key(self) -> bool:
         return bool(self.api_key)
+
+    def production_errors(self) -> list[str]:
+        """Configuration errors only; this never contacts a provider."""
+        from urllib.parse import urlparse
+        from .core.tracking import secret_is_placeholder
+
+        errors = []
+        origin = urlparse(self.public_base_url)
+        if (origin.scheme != "https" or not origin.hostname
+                or origin.hostname in {"localhost", "127.0.0.1", "track.yourdomain.com"}
+                or origin.username or origin.password or origin.query or origin.fragment
+                or origin.path not in {"", "/"}):
+            errors.append("PUBLIC_BASE_URL must be your public HTTPS origin")
+        for name in ("api_key", "secret_key", "postback_secret"):
+            value = getattr(self, name) or ""
+            if len(value) < 24 or secret_is_placeholder(value):
+                errors.append(f"{name.upper()} must be a non-placeholder secret of at least 24 characters")
+        if not self.cors_origins or "*" in self.cors_origins:
+            errors.append("CORS_ORIGINS must list explicit origins")
+        from pathlib import Path
+        from sqlalchemy.engine import make_url
+        database = make_url(self.database_url)
+        if database.get_backend_name() == "sqlite" and (
+                not database.database or database.database == ":memory:"
+                or not Path(database.database).is_absolute()):
+            errors.append("SQLite DATABASE_URL must use an absolute path on persistent storage")
+        if self.global_daily_budget_cap_usd <= 0:
+            errors.append("GLOBAL_DAILY_BUDGET_CAP_USD must be positive")
+        return errors
 
     @property
     def has_meta(self) -> bool:

@@ -36,7 +36,7 @@ from ..platforms.base import (
     CreativeSpec,
     PlatformError,
 )
-from ..platforms.factory import get_platform
+from ..platforms.factory import get_platform, is_sandbox
 from ..platforms.specs import DEFAULT_FORMAT
 from .angles import angles_for
 from .copywriter import CopyStudio, build_brief
@@ -169,6 +169,25 @@ class CampaignLauncher:
         if offer is None:
             raise ValueError(f"offer {plan.offer_id} not found")
 
+        errors = []
+        if not 0 < plan.daily_budget_usd <= self.settings.global_daily_budget_cap_usd:
+            errors.append("Daily budget must be positive and no greater than the global cap")
+        if self.settings.environment == "prod":
+            from ..networks.clickbank import configured
+            errors.extend(self.settings.production_errors())
+            if offer.network.lower() == "clickbank" and not configured(self.settings):
+                errors.append("Configure ClickBank INS before creating a production campaign")
+            if not plan.start_paused:
+                errors.append("Production campaigns must be created paused; activate after inspection")
+            if plan.platform is Platform.META and not self.settings.dry_run:
+                if not self.settings.meta_page_id or not self.settings.meta_pixel_id:
+                    errors.append("Meta launch requires Page and pixel IDs")
+                if not plan.generate_media or not self.settings.has_media_generation:
+                    errors.append("Meta launch requires --with-media and KIE_API_KEY for real imagery")
+        if errors:
+            return LaunchResult(campaign_id=0, campaign_external_id=None,
+                                dry_run=self.settings.dry_run, errors=errors)
+
         client = self._client(plan.platform)
         ad_format = plan.ad_format or DEFAULT_FORMAT[plan.platform]
         budget_micros = usd_to_micros(plan.daily_budget_usd)
@@ -278,6 +297,9 @@ class CampaignLauncher:
             settings={
                 "geo_targets": plan.geo_targets or offer.geo_targets,
                 "angles": plan.angles,
+                "execution_mode": "sandbox" if is_sandbox(client) else (
+                    "dry_run" if self.settings.dry_run else "live"
+                ),
             },
         )
         self.session.add(campaign)

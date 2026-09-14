@@ -72,6 +72,12 @@ def get_platform(
 
                     _LIVE_CACHE[key] = GoogleAdsClient(settings)
             return _LIVE_CACHE[key]
+        if settings.environment == "prod":
+            from .base import PlatformError
+            raise PlatformError(
+                f"Production requires real {platform.value} credentials; sandbox fallback refused",
+                platform=platform, code="NO_CREDENTIALS",
+            )
         logger.warning(
             "No %s credentials configured; using the sandbox simulator. "
             "Numbers are simulated, not real.",

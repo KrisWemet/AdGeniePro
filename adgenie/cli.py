@@ -30,12 +30,32 @@ from .money import fmt_usd, micros_to_usd, usd_to_micros
 def cmd_init(args) -> int:
     init_db()
     settings = get_settings()
-    print(f"Database ready at {settings.database_url}")
+    from sqlalchemy.engine import make_url
+    print(f"Database ready at {make_url(settings.database_url).render_as_string(hide_password=True)}")
     print(f"Dry run: {settings.dry_run}")
-    print(f"Meta: {'connected' if settings.has_meta else 'sandbox'}")
-    print(f"Google: {'connected' if settings.has_google else 'sandbox'}")
+    print(f"Meta: {'configured; run preflight to verify' if settings.has_meta else 'sandbox'}")
+    print(f"Google: {'configured; run preflight to verify' if settings.has_google else 'sandbox'}")
     print(f"Copywriter: {'claude' if settings.has_copywriter_llm else 'template'}")
     return 0
+
+
+def cmd_preflight(args) -> int:
+    from .preflight import run_preflight
+    # Deliberately do not init_db: preflight is a read-only operation.
+    with session_scope() as session:
+        report = run_preflight(session, get_settings(), Platform(args.platform), args.offer)
+    print(json.dumps(report, indent=2))
+    return 0 if report["ready_for_paused_launch"] else 1
+
+
+def cmd_push_conversions(args) -> int:
+    if not 1 <= args.hours <= 720:
+        print("--hours must be between 1 and 720", file=sys.stderr)
+        return 2
+    with session_scope() as session:
+        report = Orchestrator(session).push_conversions(args.hours)
+    print(json.dumps(report, indent=2))
+    return 1 if report.get("errors") else 0
 
 
 def cmd_offer_add(args) -> int:
@@ -654,6 +674,15 @@ def build_parser() -> argparse.ArgumentParser:
         description="Write, launch and optimize affiliate ads on Meta and Google.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
+
+    preflight = sub.add_parser("preflight", help="read-only checks before a paused live launch")
+    preflight.add_argument("--platform", choices=[p.value for p in Platform], default="meta")
+    preflight.add_argument("--offer", type=int, required=True)
+    preflight.set_defaults(func=cmd_preflight)
+
+    push = sub.add_parser("push-conversions", help="upload confirmed conversions; honors DRY_RUN")
+    push.add_argument("--hours", type=int, default=48)
+    push.set_defaults(func=cmd_push_conversions)
 
     sub.add_parser("init", help="create the database and show configuration").set_defaults(
         func=cmd_init

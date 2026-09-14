@@ -1,0 +1,13 @@
+.git
+.env
+.env.*
+*.db
+*.db-*
+media
+__pycache__
+.pytest_cache
+.venv
+legacy
+tests
+*.log
+backups

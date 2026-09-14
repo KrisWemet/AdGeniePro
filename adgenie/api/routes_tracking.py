@@ -75,7 +75,9 @@ def redirect_click(
         key: params[key] for key in PLATFORM_CLICK_PARAM.values() if key in params
     }
     destination = build_final_url(
-        offer.destination_url, click.click_id, extra=passthrough
+        offer.destination_url, click.click_id,
+        subid_param="tid" if offer.network.lower() == "clickbank" else "subid",
+        extra=passthrough,
     )
     session.commit()
     # 302, not 301: a permanent redirect would be cached and the click never
