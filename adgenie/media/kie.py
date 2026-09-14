@@ -61,6 +61,10 @@ class KieClient(MediaProvider):
             "Content-Type": "application/json",
         }
 
+    def close(self) -> None:
+        """Release the connection pool used by this short-lived client."""
+        self._client.close()
+
     def _request(self, method: str, path: str, **kwargs) -> dict:
         url = f"{self.base_url}/{path.lstrip('/')}"
         last: MediaError | None = None

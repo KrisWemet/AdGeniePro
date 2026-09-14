@@ -74,8 +74,75 @@ def test_prelanding_support_pages_are_reachable(api_client):
 
 def test_openapi_documents_every_router(api_client):
     paths = api_client.get("/openapi.json").json()["paths"]
-    for path in ("/api/offers", "/api/campaigns/launch", "/api/optimizer/run", "/postback"):
+    for path in (
+        "/api/offers",
+        "/api/campaigns/launch",
+        "/api/optimizer/run",
+        "/api/media/kie/image-test",
+        "/postback",
+    ):
         assert path in paths
+
+
+def test_kie_image_test_requires_provider_credentials(api_client):
+    response = api_client.post("/api/media/kie/image-test", json={})
+    assert response.status_code == 503
+    assert response.json()["detail"] == "KIE_API_KEY is not configured"
+
+
+def test_kie_image_test_submits_once_and_status_only_polls(
+    api_client, settings, monkeypatch
+):
+    import adgenie.api.routes_media as routes_media
+    from adgenie.media.base import MediaResult
+
+    calls = []
+
+    class FakeKieClient:
+        def __init__(self, received_settings):
+            assert received_settings is settings
+
+        def submit(self, request):
+            calls.append(("submit", request))
+            return "task-one"
+
+        def poll(self, task_id):
+            calls.append(("poll", task_id))
+            return MediaResult(
+                task_id=task_id,
+                state="success",
+                provider="kie",
+                model="nano-banana-pro",
+                urls=["https://cdn.test/water.png"],
+            )
+
+        def close(self):
+            calls.append(("close", None))
+
+    settings.kie_api_key = "test-kie-key"
+    monkeypatch.setattr(routes_media, "KieClient", FakeKieClient)
+
+    submitted = api_client.post("/api/media/kie/image-test", json={})
+    assert submitted.status_code == 202
+    assert submitted.json()["task_id"] == "task-one"
+    assert submitted.json()["model"] == "nano-banana-pro"
+    assert len([call for call in calls if call[0] == "submit"]) == 1
+
+    polled = api_client.get("/api/media/kie/tasks/task-one")
+    assert polled.status_code == 200
+    assert polled.json()["state"] == "success"
+    assert polled.json()["urls"] == ["https://cdn.test/water.png"]
+    assert len([call for call in calls if call[0] == "submit"]) == 1
+
+
+def test_kie_image_test_blocks_noncompliant_prompt(api_client, settings):
+    settings.kie_api_key = "test-kie-key"
+    response = api_client.post(
+        "/api/media/kie/image-test",
+        json={"prompt": "Create guaranteed before and after results for this product"},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"]["findings"]
 
 
 # --- offers ----------------------------------------------------------------
