@@ -1,521 +1,134 @@
-"""Production-readiness checks for the first real ad-account test.
+"""Read-only readiness checks. Passing these never authorizes ad spending."""
 
-The preflight is deliberately read-only. With ``--live`` it talks to configured
-platforms and the deployed AdGenie health endpoint, but it never creates,
-updates, pauses or enables an ad object. Its job is to prove the plumbing before
-``DRY_RUN`` is ever turned off.
-
-Run the first Meta check with::
-
-    python -m adgenie.preflight --platform meta --live
-
-Without ``--live`` only configuration is inspected, so it is safe to run on a
-laptop with no network access.
-"""
-
-from __future__ import annotations
-
-import argparse
-import json
-from dataclasses import asdict, dataclass
-from typing import Callable, Iterable, Literal
+from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
+from sqlalchemy import inspect, select, text
+from sqlalchemy.engine import make_url
+from sqlalchemy.orm import Session
 
-from .config import Settings, get_settings
-from .core.tracking import secret_is_placeholder
-from .models import Platform
+from .config import Settings
+from .models import ClickBankReceipt, Offer, Platform
+from .networks.clickbank import configured
 from .platforms.factory import get_platform, is_sandbox
 
-Status = Literal["pass", "warn", "fail", "skip"]
 
+def run_preflight(session: Session, settings: Settings, platform: Platform,
+                  offer_id: int | None = None, *, client=None, http=None,
+                  check_destination: bool = True) -> dict:
+    checks = []
 
-@dataclass(frozen=True)
-class PreflightCheck:
-    key: str
-    status: Status
-    detail: str
-    blocking: bool = True
+    def add(name, ok, detail, *, warning=False):
+        checks.append({"check": name, "status": "pass" if ok else ("warning" if warning else "fail"),
+                       "detail": detail})
 
-    def as_dict(self) -> dict:
-        return asdict(self)
-
-
-@dataclass(frozen=True)
-class PreflightReport:
-    checks: tuple[PreflightCheck, ...]
-    live_requested: bool
-
-    @property
-    def configuration_ready(self) -> bool:
-        return not any(c.status == "fail" and c.blocking for c in self.checks)
-
-    @property
-    def live_verified(self) -> bool:
-        if not self.live_requested:
-            return False
-        live_checks = [c for c in self.checks if c.key.startswith("live.")]
-        return bool(live_checks) and all(c.status == "pass" for c in live_checks)
-
-    @property
-    def ready_for_live_test(self) -> bool:
-        return self.configuration_ready and self.live_verified
-
-    def as_dict(self) -> dict:
-        return {
-            "configuration_ready": self.configuration_ready,
-            "live_requested": self.live_requested,
-            "live_verified": self.live_verified,
-            "ready_for_live_test": self.ready_for_live_test,
-            "checks": [c.as_dict() for c in self.checks],
-        }
-
-
-def _public_origin_check(settings: Settings) -> PreflightCheck:
-    parsed = urlparse(settings.public_base_url)
-    host = (parsed.hostname or "").lower()
-    local_hosts = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
-    if parsed.scheme != "https" or not host or host in local_hosts:
-        return PreflightCheck(
-            "tracking.public_url",
-            "fail",
-            "PUBLIC_BASE_URL must be a public HTTPS origin before paid traffic can be tracked.",
-        )
-    return PreflightCheck(
-        "tracking.public_url", "pass", f"Public tracking origin is {settings.public_base_url.rstrip('/')}"
-    )
-
-
-def _security_checks(settings: Settings) -> list[PreflightCheck]:
-    checks: list[PreflightCheck] = []
-    checks.append(_public_origin_check(settings))
-
-    if settings.api_key:
-        checks.append(PreflightCheck("security.api_key", "pass", "API routes require X-API-Key."))
-    else:
-        checks.append(
-            PreflightCheck(
-                "security.api_key",
-                "fail",
-                "API_KEY is unset. A public deployment would expose campaign and budget controls.",
-            )
-        )
-
-    insecure_secret_keys = {
-        "",
-        "dev-insecure-change-me",
-        "change-me",
-        "change-me-to-something-random",
-        "changeme",
-        "secret",
-    }
-    if (settings.secret_key or "").strip().lower() in insecure_secret_keys:
-        checks.append(
-            PreflightCheck(
-                "security.secret_key",
-                "fail",
-                "SECRET_KEY is still a development/example value.",
-            )
-        )
-    else:
-        checks.append(PreflightCheck("security.secret_key", "pass", "SECRET_KEY is non-placeholder."))
-
-    if secret_is_placeholder(settings.postback_secret):
-        checks.append(
-            PreflightCheck(
-                "tracking.postback_secret",
-                "fail",
-                "POSTBACK_SECRET is still an example value; conversion revenue would be rejected.",
-            )
-        )
-    else:
-        checks.append(
-            PreflightCheck(
-                "tracking.postback_secret", "pass", "POSTBACK_SECRET is non-placeholder."
-            )
-        )
-
-    if settings.global_daily_budget_cap_usd <= 0:
-        checks.append(
-            PreflightCheck(
-                "safety.daily_cap",
-                "fail",
-                "GLOBAL_DAILY_BUDGET_CAP_USD must be positive for a controlled live test.",
-            )
-        )
-    else:
-        checks.append(
-            PreflightCheck(
-                "safety.daily_cap",
-                "pass",
-                f"Global daily spend cap is ${settings.global_daily_budget_cap_usd:.2f}.",
-            )
-        )
-
-    if settings.dry_run:
-        checks.append(
-            PreflightCheck(
-                "safety.dry_run",
-                "pass",
-                "DRY_RUN is on. Preflight can contact live accounts without allowing mutations.",
-                blocking=False,
-            )
-        )
-    else:
-        checks.append(
-            PreflightCheck(
-                "safety.dry_run",
-                "warn",
-                "DRY_RUN is off. Preflight is read-only, but other commands can mutate live accounts.",
-                blocking=False,
-            )
-        )
-
-    if settings.database_url.startswith("sqlite"):
-        checks.append(
-            PreflightCheck(
-                "database.production",
-                "warn",
-                "SQLite is acceptable for a single-instance smoke test, but not for multi-instance production.",
-                blocking=False,
-            )
-        )
-    else:
-        checks.append(
-            PreflightCheck("database.production", "pass", "Database is not SQLite.", blocking=False)
-        )
-    return checks
-
-
-def _meta_major(version: str) -> int | None:
+    errors = settings.production_errors()
+    add("production_config", not errors, "; ".join(errors) or "Public URL, API authentication, secrets and cap configured")
+    add("spending_mode", True, "Dry run: no ad mutations" if settings.dry_run else "Live writes enabled; create only a paused campaign")
+    add("landing_audit_enabled", settings.audit_landing_pages, "AUDIT_LANDING_PAGES must remain enabled for the first test")
+    db_ready = False
     try:
-        return int(version.lower().lstrip("v").split(".", 1)[0])
-    except (TypeError, ValueError):
-        return None
+        actual_url = session.get_bind().url
+        if actual_url.get_backend_name() == "sqlite" and actual_url.database not in {None, "", ":memory:"}:
+            if not Path(actual_url.database).is_file():
+                raise FileNotFoundError("Run init before preflight")
+        session.execute(text("SELECT 1"))
+        tables = set(inspect(session.get_bind()).get_table_names())
+        missing = {"offers", "campaigns", "clicks", "conversions", "clickbank_receipts"} - tables
+        db_ready = not missing
+        add("database_schema", db_ready, "Schema readable" if db_ready else "Run init; missing tables: " + ", ".join(sorted(missing)))
+        url = make_url(settings.database_url)
+        if url.get_backend_name() == "sqlite":
+            persistent = bool(url.database and url.database != ":memory:" and Path(url.database).is_absolute())
+            add("database_storage", persistent, "SQLite requires an absolute path on a persistent mounted disk", warning=True)
+        else:
+            add("database_storage", True, "External database configured; verify its backup and restore separately")
+    except Exception:
+        session.rollback()
+        add("database_schema", False, "Database unavailable or schema inspection failed; credentials are omitted")
 
+    offer = session.get(Offer, offer_id) if db_ready and offer_id else None
+    add("offer", offer is not None, "Offer loaded" if offer else "Provide --offer with an existing offer ID")
+    if offer:
+        add("offer_value", offer.expected_value_micros() > 0, "Expected affiliate payout must be positive")
+        if offer.network.lower() == "clickbank":
+            add("clickbank_ins", configured(settings), "Configure affiliate nickname and a 1–16 character uppercase alphanumeric INS secret")
+            host = urlparse(offer.destination_url).hostname or ""
+            add("clickbank_hoplink", urlparse(offer.destination_url).scheme == "https" and
+                (host == "hop.clickbank.net" or host.endswith(".hop.clickbank.net")),
+                "The first test requires an HTTPS ClickBank HopLink; decode the checkout affiliate manually")
+            count = session.query(ClickBankReceipt).count()
+            add("clickbank_live_evidence", count > 0,
+                f"{count} receipt ledger(s) present; reconcile them with ClickBank before trusting revenue", warning=True)
 
-def _meta_config_checks(settings: Settings) -> list[PreflightCheck]:
-    missing = [
-        name
-        for name, value in (
-            ("META_ACCESS_TOKEN", settings.meta_access_token),
-            ("META_AD_ACCOUNT_ID", settings.meta_ad_account_id),
-            ("META_PAGE_ID", settings.meta_page_id),
-        )
-        if not value
-    ]
-    checks: list[PreflightCheck] = []
-    if missing:
-        checks.append(
-            PreflightCheck(
-                "meta.credentials",
-                "fail",
-                "Missing " + ", ".join(missing) + ".",
-            )
-        )
-    else:
-        checks.append(
-            PreflightCheck(
-                "meta.credentials",
-                "pass",
-                "Meta token, ad account and Page id are configured.",
-            )
-        )
-
-    major = _meta_major(settings.meta_api_version)
-    if major is None or major < 25:
-        checks.append(
-            PreflightCheck(
-                "meta.api_version",
-                "fail",
-                f"META_API_VERSION={settings.meta_api_version!r} is too old for the Friday test; use v26.0.",
-            )
-        )
-    else:
-        checks.append(
-            PreflightCheck(
-                "meta.api_version",
-                "pass",
-                f"Meta Marketing API version is {settings.meta_api_version}.",
-            )
-        )
-
-    if settings.meta_pixel_id:
-        checks.append(
-            PreflightCheck(
-                "meta.pixel",
-                "pass",
-                "META_PIXEL_ID is configured for the sales ad set and Conversions API.",
-            )
-        )
-    else:
-        checks.append(
-            PreflightCheck(
-                "meta.pixel",
-                "fail",
-                "META_PIXEL_ID is required: the Friday Meta launch uses OUTCOME_SALES with OFFSITE_CONVERSIONS.",
-            )
-        )
-    return checks
-
-
-def _google_config_checks(settings: Settings) -> list[PreflightCheck]:
-    required = (
-        ("GOOGLE_DEVELOPER_TOKEN", settings.google_developer_token),
-        ("GOOGLE_CLIENT_ID", settings.google_client_id),
-        ("GOOGLE_CLIENT_SECRET", settings.google_client_secret),
-        ("GOOGLE_REFRESH_TOKEN", settings.google_refresh_token),
-        ("GOOGLE_CUSTOMER_ID", settings.google_customer_id),
-    )
-    missing = [name for name, value in required if not value]
-    if missing:
-        return [
-            PreflightCheck(
-                "google.credentials",
-                "fail",
-                "Missing " + ", ".join(missing) + ".",
-            )
-        ]
-    return [
-        PreflightCheck(
-            "google.credentials",
-            "pass",
-            "Google developer token, OAuth credentials and customer id are configured.",
-        )
-    ]
-
-
-def _platform_live_check(
-    platform: Platform,
-    settings: Settings,
-    platform_factory: Callable,
-    sandbox_detector: Callable,
-) -> tuple[PreflightCheck, object | None]:
-    key = f"live.{platform.value}"
+    owned_http = http is None
+    http = http or httpx.Client(timeout=20, follow_redirects=False)
     try:
-        client = platform_factory(platform, settings)
-        if sandbox_detector(client):
-            return (
-                PreflightCheck(
-                    key,
-                    "fail",
-                    f"{platform.value.title()} resolved to the simulator instead of a live adapter.",
-                ),
-                None,
-            )
-        status = client.health_check()
-    except Exception as exc:
-        return PreflightCheck(key, "fail", f"Read-only {platform.value} check failed: {exc}"), None
+        # No /r query is sent: probing routing must not create synthetic clicks.
+        origin = settings.public_base_url.rstrip("/")
+        if urlparse(origin).scheme == "https" and not errors:
+            try:
+                response = http.get(origin + "/healthz")
+                body = response.json()
+                add("public_service", response.status_code == 200 and body.get("service") == "adgenie"
+                    and "clickbank_ins_v8" in body.get("capabilities", []),
+                    "HTTPS service must expose the ClickBank-capable build")
+                response = http.get(origin + "/r")
+                add("public_redirect_route", response.status_code == 422,
+                    "Tracking route responds without creating a test click")
+                response = http.get(origin + "/postback/clickbank")
+                add("public_ins_route", response.status_code == 405,
+                    "INS route is POST-only; use ClickBank Test URL to verify delivery and decryption")
+            except Exception:
+                add("public_service", False, "Public service probe failed; no secrets are included in this report")
+        else:
+            add("public_service", False, "Fix production configuration before probing the public service")
 
-    if not status.get("ok"):
-        return (
-            PreflightCheck(
-                key,
-                "fail",
-                f"Read-only {platform.value} check failed: {status.get('error') or status}",
-            ),
-            client,
-        )
-    account = status.get("account") or "account accessible"
-    currency = status.get("currency") or "currency unknown"
-    return (
-        PreflightCheck(
-            key,
-            "pass",
-            f"Read-only API call succeeded: {account} ({currency}).",
-        ),
-        client,
-    )
-
-
-def _meta_asset_live_checks(client: object, settings: Settings) -> list[PreflightCheck]:
-    checks: list[PreflightCheck] = []
-    request = getattr(client, "_request", None)
-    if not callable(request):
-        return [
-            PreflightCheck(
-                "live.meta_assets",
-                "fail",
-                "Meta adapter cannot perform the read-only Page/Pixel checks.",
-            )
-        ]
-
-    try:
-        page = request("GET", str(settings.meta_page_id), params={"fields": "id,name"})
-        if str(page.get("id") or "") != str(settings.meta_page_id):
-            raise RuntimeError(f"unexpected Page response: {page}")
-        checks.append(
-            PreflightCheck(
-                "live.meta_page",
-                "pass",
-                f"Configured Facebook Page is readable: {page.get('name') or page.get('id')}.",
-            )
-        )
-    except Exception as exc:
-        checks.append(
-            PreflightCheck(
-                "live.meta_page",
-                "fail",
-                f"Configured Facebook Page is not readable with this token: {exc}",
-            )
-        )
-
-    try:
-        pixel = request("GET", str(settings.meta_pixel_id), params={"fields": "id,name"})
-        if str(pixel.get("id") or "") != str(settings.meta_pixel_id):
-            raise RuntimeError(f"unexpected Pixel response: {pixel}")
-        checks.append(
-            PreflightCheck(
-                "live.meta_pixel",
-                "pass",
-                f"Configured Meta Pixel is readable: {pixel.get('name') or pixel.get('id')}.",
-            )
-        )
-    except Exception as exc:
-        checks.append(
-            PreflightCheck(
-                "live.meta_pixel",
-                "fail",
-                f"Configured Meta Pixel is not readable with this token: {exc}",
-            )
-        )
-    return checks
-
-
-def _public_health_check(
-    settings: Settings, http_client: httpx.Client | None = None
-) -> PreflightCheck:
-    key = "live.public_health"
-    parsed = urlparse(settings.public_base_url)
-    if parsed.scheme != "https" or not parsed.hostname:
-        return PreflightCheck(key, "fail", "Public health check skipped because PUBLIC_BASE_URL is invalid.")
-
-    client = http_client or httpx.Client(timeout=10.0, follow_redirects=True)
-    owns_client = http_client is None
-    headers = {"X-API-Key": settings.api_key} if settings.api_key else {}
-    try:
-        response = client.get(settings.public_base_url.rstrip("/") + "/api/health", headers=headers)
-        if response.status_code != 200:
-            return PreflightCheck(
-                key,
-                "fail",
-                f"Public /api/health returned HTTP {response.status_code}.",
-            )
-        body = response.json()
-        if body.get("status") != "ok":
-            return PreflightCheck(key, "fail", f"Public health endpoint returned {body}.")
-        return PreflightCheck(
-            key,
-            "pass",
-            f"Public AdGenie health endpoint is reachable at {settings.public_base_url.rstrip('/')}.",
-        )
-    except Exception as exc:
-        return PreflightCheck(key, "fail", f"Public health endpoint is not reachable: {exc}")
+        configured_platform = settings.has_meta if platform is Platform.META else settings.has_google
+        if not configured_platform:
+            add("ad_account", False, f"{platform.value} credentials missing; simulator is not a live connection")
+        else:
+            try:
+                client = client or get_platform(platform, settings)
+                health = client.health_check()
+                add("ad_account", bool(health.get("ok")) and not is_sandbox(client),
+                    "Live account read succeeded" if health.get("ok") else "Live account read failed; check token, permissions and API version")
+                add("account_currency", health.get("currency") == "USD",
+                    "Current revenue and spend accounting requires a USD ad account; no currency conversion is implemented")
+                if platform is Platform.META:
+                    for name, object_id in (("page_access", settings.meta_page_id), ("pixel_access", settings.meta_pixel_id)):
+                        if not object_id:
+                            add(name, False, "Configure the corresponding Meta object ID")
+                            continue
+                        try:
+                            body = client._request("GET", object_id, params={"fields": "id"})
+                            add(name, body.get("id") == object_id, "Read access verified; assignment and write permissions still require a paused launch")
+                        except Exception:
+                            add(name, False, "Object read failed; check ID and token access")
+                else:
+                    add("google_oauth", bool(settings.google_client_id and settings.google_client_secret), "OAuth client ID and secret required")
+                    add("google_conversions", bool(settings.google_conversion_action_id), "Configure the offline conversion action")
+            except Exception:
+                add("ad_account", False, "Account probe failed; verify credentials and installed dependencies")
     finally:
-        if owns_client:
-            client.close()
+        if owned_http:
+            http.close()
 
-
-def run_preflight(
-    settings: Settings | None = None,
-    *,
-    platforms: Iterable[Platform] = (Platform.META, Platform.GOOGLE),
-    live: bool = False,
-    platform_factory: Callable | None = None,
-    sandbox_detector: Callable | None = None,
-    http_client: httpx.Client | None = None,
-) -> PreflightReport:
-    """Run configuration checks and optionally read-only live calls."""
-
-    settings = settings or get_settings()
-    selected = tuple(platforms)
-    checks = _security_checks(settings)
-
-    if Platform.META in selected:
-        checks.extend(_meta_config_checks(settings))
-    if Platform.GOOGLE in selected:
-        checks.extend(_google_config_checks(settings))
-
-    if live:
-        factory = platform_factory or get_platform
-        detector = sandbox_detector or is_sandbox
-        for platform in selected:
-            credential_key = f"{platform.value}.credentials"
-            platform_config_failed = any(
-                c.key.startswith(f"{platform.value}.") and c.status == "fail" and c.blocking
-                for c in checks
-            )
-            if platform_config_failed:
-                checks.append(
-                    PreflightCheck(
-                        f"live.{platform.value}",
-                        "fail",
-                        "Live check cannot run until required platform configuration is valid.",
-                    )
-                )
-                continue
-
-            live_check, client = _platform_live_check(platform, settings, factory, detector)
-            checks.append(live_check)
-            if platform is Platform.META and live_check.status == "pass" and client is not None:
-                checks.extend(_meta_asset_live_checks(client, settings))
-        checks.append(_public_health_check(settings, http_client=http_client))
-
-    return PreflightReport(tuple(checks), live_requested=live)
-
-
-def _selected_platforms(value: str) -> tuple[Platform, ...]:
-    if value == "meta":
-        return (Platform.META,)
-    if value == "google":
-        return (Platform.GOOGLE,)
-    return (Platform.META, Platform.GOOGLE)
-
-
-def _print_report(report: PreflightReport) -> None:
-    icons = {"pass": "PASS", "warn": "WARN", "fail": "FAIL", "skip": "SKIP"}
-    for check in report.checks:
-        print(f"{icons[check.status]:<4}  {check.key:<26} {check.detail}")
-    print()
-    if not report.live_requested:
-        state = "CONFIG READY" if report.configuration_ready else "CONFIG NOT READY"
-        print(f"{state}. Run again with --live to verify real accounts and the public endpoint.")
-    else:
-        print(
-            "READY FOR LIVE TEST: " + ("YES" if report.ready_for_live_test else "NO")
-        )
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="adgenie-preflight",
-        description="Prove AdGenie is ready for a live test without mutating an ad account.",
-    )
-    parser.add_argument(
-        "--platform",
-        choices=("meta", "google", "all"),
-        default="all",
-        help="which live integration must be ready",
-    )
-    parser.add_argument(
-        "--live",
-        action="store_true",
-        help="make read-only calls to the selected ad platform(s) and the public health endpoint",
-    )
-    parser.add_argument("--json", action="store_true", help="print machine-readable output")
-    args = parser.parse_args(argv)
-
-    report = run_preflight(platforms=_selected_platforms(args.platform), live=args.live)
-    if args.json:
-        print(json.dumps(report.as_dict(), indent=2))
-    else:
-        _print_report(report)
-
-    if args.live:
-        return 0 if report.ready_for_live_test else 1
-    return 0 if report.configuration_ready else 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    if offer and check_destination:
+        from .core.landing import LandingPageFetcher, audit_landing_page
+        try:
+            with LandingPageFetcher() as fetcher:
+                audit = audit_landing_page(offer.destination_url, fetcher=fetcher, offer=offer)
+            add("destination_audit", audit.passed,
+                "Destination audit passed" if audit.passed else ", ".join(f.code for f in audit.blocking))
+        except Exception:
+            add("destination_audit", False, "Could not complete destination audit")
+    if platform is Platform.META:
+        add("media_provider", settings.has_media_generation,
+            "KIE_API_KEY required by the generated-image launch path; real generation still needs verification")
+    add("live_verification", False,
+        "Still required: affiliate checkout decode, ClickBank Test URL, paused ad review, and a reconciled real sale", warning=True)
+    return {"ready_for_paused_launch": not any(c["status"] == "fail" for c in checks),
+            "ready_to_spend": False, "platform": platform.value,
+            "dry_run": settings.dry_run, "checks": checks}

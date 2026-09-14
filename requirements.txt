@@ -8,6 +8,8 @@ pydantic-settings>=2.3
 httpx>=0.27
 python-multipart>=0.0.9
 jinja2>=3.1
+cryptography>=44,<47
+psycopg[binary]>=3.2,<4
 
 # Ad copy generation. Optional: without it the template generator is used.
 anthropic>=1.0

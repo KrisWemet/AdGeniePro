@@ -51,7 +51,7 @@ persistent volume or a managed database before relying on it for real traffic.
 From the deployed environment, while `DRY_RUN=true`:
 
 ```bash
-python -m adgenie.preflight --platform meta --live
+python -m adgenie.platform_preflight --platform meta --live
 ```
 
 Required result:
@@ -80,10 +80,9 @@ For the first test prefer an offer with:
 - an affiliate link/sub-id scheme that can carry AdGenie's click id;
 - a payout large enough that a $10–$25/day learning budget is meaningful.
 
-For ClickBank, use the actual HopLink or Direct Tracking Link as the offer URL.
-AdGenie appends its unique click id as `extclid`, ClickBank's current parameter
-for an external/partner click identifier. If the Meta click includes `fbclid`,
-AdGenie preserves that too.
+For ClickBank, use an HTTPS HopLink. AdGenie appends its unique click id
+as `tid`; encrypted INS returns that value in `trackingCodes`. Meta's `fbclid`
+is also preserved when supplied.
 
 Register it:
 
@@ -137,7 +136,7 @@ DRY_RUN=false
 Then immediately rerun the preflight:
 
 ```bash
-python -m adgenie.preflight --platform meta --live
+python -m adgenie.platform_preflight --platform meta --live
 ```
 
 It will warn that mutations are now enabled but remains read-only itself.
@@ -159,42 +158,17 @@ adapter, add a regression test, and repeat while the objects remain paused.
 
 ## Gate 6 — ClickBank attribution proof
 
-Before enabling paid delivery, verify the public tracking route and postback
-with a test click/conversion. The ad final URL should point at AdGenie `/r`, not
-directly at ClickBank. `/r` records the click and then redirects to the HopLink
-with `extclid=<adgenie-click-id>`.
+Follow `LIVE_TEST_RUNBOOK.md` for the encrypted INS v8 setup. Configure the
+account nickname and INS secret, and point ClickBank to `/postback/clickbank`.
+The generic `/postback` URL is not the INS receiver.
 
-In ClickBank, create a **Custom Postback/Pixel** S2S integration for the affiliate
-account nickname. For the first smoke test, configure the purchase event only
-and point it at this shape (replace the host and secret):
+Verify `/r` records a click and redirects to the HopLink with `tid`. Use
+ClickBank's Test URL to verify delivery and decryption; that TEST notification
+must create no revenue. A permitted real transaction is still needed to prove
+that the receipt links to the original click and the affiliate commission
+reconciles with ClickBank. Verify refund handling before trusting optimization.
 
-```text
-https://<public-host>/postback
-  ?transaction_id={receipt_id}
-  &click_id={extclid}
-  &network=clickbank
-  &revenue={affiliate_earnings}
-  &sale_amount={total_transaction_amount}
-  &status=approved
-  &event=sale
-  &secret=<POSTBACK_SECRET>
-```
-
-Enter it as one URL with no whitespace/newlines. ClickBank replaces the values
-inside braces when the event fires. `extclid` is the important join: it is the
-AdGenie click id that was appended to the affiliate link on the outbound click.
-
-Use ClickBank's integration test feature where possible, and confirm the
-postback response reports `attribution: click_id`. Also confirm the conversion
-row carries the correct offer and creative before allowing the optimizer to use
-that revenue.
-
-Refunds/chargebacks should be configured as a separate ClickBank event mapping
-to the same endpoint with `status=reversed`; do not treat them as new positive
-revenue.
-
-Do not send fabricated revenue into a production optimizer. Use the network's
-test facility or a clearly isolated staging transaction/database.
+Do not send fabricated revenue into a production optimizer.
 
 ## Gate 7 — tiny live spend
 
@@ -211,3 +185,5 @@ The first objective is correctness, not profit. Once one complete conversion can
 be traced from ad click to network revenue and back to the correct creative, the
 system has crossed the important boundary from simulation to a real operating
 loop.
+
+For encrypted ClickBank INS setup and offer-level verification, follow `LIVE_TEST_RUNBOOK.md`. ClickBank INS attribution uses the HopLink `tid` parameter.

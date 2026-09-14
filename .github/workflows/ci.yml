@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, "chatgpt/**"]
+    branches: [main, "chatgpt/**", "feat/**"]
   pull_request:
     branches: [main]
 
@@ -23,6 +23,8 @@ jobs:
       - name: Run end-to-end simulator
         run: python -m adgenie.cli demo --days 3 --budget 10 --database-url sqlite:///./ci-demo.db
       - name: Validate production preflight entrypoint
-        run: python -m adgenie.preflight --help
+        run: python -m adgenie.platform_preflight --help
+      - name: Validate offer preflight entrypoint
+        run: python -m adgenie.cli preflight --help
       - name: Build production container
         run: docker build -t adgenie-pro:test .

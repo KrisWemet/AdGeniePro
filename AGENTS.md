@@ -141,12 +141,12 @@ tests/        663 of them; start here to understand a subsystem
 
 Roughly in the order they block getting real ads running:
 
-1. No deployment config at all — no Dockerfile, no Procfile.
-   `PUBLIC_BASE_URL` defaults to localhost, so click redirects and network
-   postbacks cannot work with real traffic until this is deployed.
+1. Docker/Compose deployment and a ClickBank INS receiver are implemented;
+   the deployed service and actual ClickBank delivery still need verification.
+   See LIVE_TEST_RUNBOOK.md. Never mistake encrypted fixtures for a live sale.
 2. Google builds only responsive search ads. No image or video ad path, which
    is why `GoogleAdsClient.upload_media` refuses rather than uploading an asset
    nothing would reference.
 3. First contact with the live Meta and Google APIs has not happened.
-4. No preflight command that validates credentials with read-only calls before
-   anything spends.
+4. `preflight` performs read-only checks, but cannot prove write permissions,
+   policy approval or successful affiliate sale attribution.

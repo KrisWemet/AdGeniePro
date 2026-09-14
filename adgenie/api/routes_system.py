@@ -10,10 +10,15 @@ from __future__ import annotations
 
 from typing import Literal
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.orm import Session
+
+from ..config import get_settings
+from ..db import get_session
+from ..preflight import run_preflight as run_offer_preflight
 
 from ..models import Platform
-from ..preflight import run_preflight
+from ..platform_preflight import run_preflight
 
 router = APIRouter(tags=["system"])
 
@@ -37,3 +42,13 @@ def production_preflight(
         selected = (Platform.META, Platform.GOOGLE)
 
     return run_preflight(platforms=selected, live=live).as_dict()
+
+
+@router.get("/preflight/offer")
+def offer_preflight(
+    offer_id: int = Query(..., gt=0),
+    platform: Literal["meta", "google"] = Query(default="meta"),
+    session: Session = Depends(get_session),
+) -> dict:
+    """Read-only offer, database, INS and platform checks in the deployed app."""
+    return run_offer_preflight(session, get_settings(), Platform(platform), offer_id)

@@ -114,8 +114,8 @@ class TrackingContext:
 
 
 def new_click_id() -> str:
-    """22 characters of URL-safe randomness. Opaque and non-enumerable."""
-    return secrets.token_urlsafe(16)[:22]
+    """128 random bits, encoded with ClickBank-compatible lowercase digits."""
+    return secrets.token_hex(16)
 
 
 # --------------------------------------------------------------------------
@@ -147,9 +147,9 @@ def _from_b36(text: str) -> int:
 def encode_subid(ctx: TrackingContext) -> str:
     """Pack the entity ids into a compact token.
 
-    Networks truncate sub-ids hard: ClickBank's TID field is 24 characters, and
-    a token that gets cut in half attributes revenue to nothing. So ids are
-    base-36 encoded, and only the offer and the creative are carried. The
+    This token stays on our own /r URL; the downstream network receives the
+    opaque click ID instead. IDs are base-36 encoded to keep the route compact,
+    and only the offer and the creative are carried. The
     campaign and ad group are derivable from the creative, and are included
     only when there is no creative to derive them from.
     """

@@ -22,7 +22,7 @@ from ..models import (
     Offer,
     Platform,
 )
-from ..money import micros_to_usd
+from ..money import micros_to_usd, usd_to_micros
 from ..schemas import CampaignOut, CreativeOut, LaunchIn, PerformanceOut
 
 router = APIRouter(tags=["campaigns"])
@@ -140,7 +140,30 @@ def set_campaign_status(
     if campaign is None:
         raise HTTPException(404, f"campaign {campaign_id} not found")
 
-    orchestrator = Orchestrator(session, settings=get_settings())
+    settings = get_settings()
+    if settings.dry_run:
+        return {"campaign_id": campaign_id, "status": campaign.status.value,
+                "requested_status": "active" if active else "paused",
+                "applied": False, "dry_run": True}
+    if active and campaign.external_id and campaign.external_id.startswith("dryrun_"):
+        raise HTTPException(409, "Dry-run campaign has no real platform objects; create a new paused campaign")
+    if active and settings.environment == "prod":
+        if (campaign.settings or {}).get("execution_mode") != "live":
+            raise HTTPException(409, "Create and inspect a real paused campaign before production activation")
+        if errors := settings.production_errors():
+            raise HTTPException(409, "; ".join(errors))
+    orchestrator = Orchestrator(session, settings=settings)
+    if active:
+        groups = list(session.scalars(select(AdGroup).where(AdGroup.campaign_id == campaign.id)))
+        eligible = [g for g in groups if g.status in (EntityStatus.ACTIVE, EntityStatus.PAUSED)]
+        target = max(campaign.daily_budget_micros, sum(g.daily_budget_micros for g in eligible))
+        current = 0
+        if campaign.status is EntityStatus.ACTIVE:
+            current = max(campaign.daily_budget_micros,
+                          sum(g.daily_budget_micros for g in groups if g.status is EntityStatus.ACTIVE))
+        projected = orchestrator._committed_daily_micros() - current + target
+        if projected > usd_to_micros(settings.global_daily_budget_cap_usd):
+            raise HTTPException(422, "Activating this campaign would exceed the global daily budget cap")
     if campaign.external_id:
         orchestrator.client(campaign.platform).set_status(
             "campaign", campaign.external_id, active
@@ -167,7 +190,7 @@ def set_campaign_status(
                         "creative", creative.external_id, active
                     )
     session.commit()
-    return {"campaign_id": campaign_id, "status": campaign.status.value}
+    return {"campaign_id": campaign_id, "status": campaign.status.value, "applied": True}
 
 
 @router.get("/creatives/{creative_id}")
