@@ -26,54 +26,61 @@ _PASSTHROUGH = set(PLATFORM_CLICK_PARAM.values()) | {
 }
 
 _STYLE = """
-:root{color-scheme:light;--ink:#172033;--muted:#526079;--blue:#2257d6;--paper:#f5f8ff}
-*{box-sizing:border-box}body{margin:0;font-family:Arial,sans-serif;color:var(--ink);line-height:1.58;background:#fff}
-main{max-width:800px;margin:auto;padding:32px 22px 64px}.eyebrow{font-weight:700;color:var(--blue);letter-spacing:.05em}
-h1{font-size:clamp(2rem,6vw,3.5rem);line-height:1.08;margin:.25em 0}.lead{font-size:1.15rem;color:var(--muted)}
-.disclosure{background:var(--paper);border-left:5px solid var(--blue);padding:15px 18px;margin:24px 0}
-.card{border:1px solid #d8dfec;border-radius:14px;padding:22px;margin:22px 0}.button{display:inline-block;background:var(--blue);color:#fff;text-decoration:none;font-weight:700;padding:14px 22px;border-radius:9px}
-small,footer{color:var(--muted)}footer{border-top:1px solid #d8dfec;margin-top:36px;padding-top:20px}
-footer a{color:var(--blue);margin-right:18px}@media(max-width:520px){main{padding-top:22px}.button{width:100%;text-align:center}}
+:root{color-scheme:light;--navy:#071c2c;--ink:#102838;--muted:#567080;--aqua:#4fd1c5;--blue:#0786b5;--foam:#eefbfc;--orange:#f4a340}
+*{box-sizing:border-box}body{margin:0;font-family:Inter,Arial,sans-serif;color:var(--ink);line-height:1.5;background:#fff}
+main{max-width:1080px;margin:auto;padding:22px 24px 44px}.top{display:flex;justify-content:space-between;align-items:center;font-weight:800;color:var(--navy)}
+.badge{font-size:.77rem;letter-spacing:.12em;color:var(--blue)}.hero{display:grid;grid-template-columns:1.25fr .75fr;gap:48px;align-items:center;padding:68px 0 48px}
+h1{font-size:clamp(2.65rem,7vw,5.25rem);line-height:.98;letter-spacing:-.045em;margin:.18em 0;color:var(--navy)}h2{font-size:1.55rem}
+.lead{font-size:1.25rem;max-width:620px;color:var(--muted);margin:20px 0 26px}.button{display:inline-block;background:var(--orange);color:#16222a;text-decoration:none;font-weight:900;padding:16px 24px;border-radius:10px;box-shadow:0 9px 24px #d98a283d}
+.micro{display:block;color:var(--muted);font-size:.82rem;margin-top:10px}.visual{height:360px;border-radius:42% 58% 60% 40%/45% 38% 62% 55%;background:radial-gradient(circle at 38% 30%,#dfffff 0 8%,#62d9d1 9% 26%,#0786b5 58%,#063454 100%);box-shadow:0 28px 70px #0786b540;position:relative;overflow:hidden}
+.visual:after{content:"";position:absolute;left:-10%;right:-10%;bottom:12%;height:28%;background:#fff5;border-radius:50% 50% 0 0;transform:rotate(-8deg)}
+.disclosure{font-size:.78rem;color:var(--muted);border-top:1px solid #d7e8eb;border-bottom:1px solid #d7e8eb;padding:12px 0}
+.why{text-align:center;max-width:710px;margin:54px auto 30px}.why p{font-size:1.08rem;color:var(--muted)}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}.card{background:var(--foam);border-radius:16px;padding:24px}.num{font-size:.78rem;font-weight:900;color:var(--blue);letter-spacing:.1em}
+.final{text-align:center;background:var(--navy);color:white;border-radius:22px;padding:38px 24px;margin-top:38px}.final h2{margin-top:0}.final p{color:#c5d7df}
+footer{display:flex;justify-content:space-between;gap:20px;align-items:center;margin-top:28px;color:var(--muted);font-size:.8rem}footer a{color:var(--blue);margin-right:16px}
+@media(max-width:760px){.hero{grid-template-columns:1fr;padding:44px 0 34px}.visual{height:230px;order:-1}.grid{grid-template-columns:1fr}.button{width:100%;text-align:center}footer{display:block}.top span:last-child{display:none}}
 """
 
 _PAGE = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="description" content="An independent overview of a third-party digital guide about household water preparedness.">
-<title>Household Water Preparedness Guide | AdGenie Pro</title>
+<meta name="description" content="Explore a practical digital guide focused on household water preparedness.">
+<title>Build a More Water-Ready Home</title>
 <style>__STYLE__</style>
 </head>
 <body><main>
-<p class="eyebrow">INDEPENDENT PRODUCT OVERVIEW</p>
-<h1>Explore a guide to household water preparedness</h1>
-<p class="lead">This page introduces <strong>__OFFER_NAME__</strong>, a third-party digital guide. It is intended for adults comparing information about household water systems and practical preparedness topics.</p>
-<div class="disclosure"><strong>Affiliate disclosure:</strong> We may earn a commission if you purchase through the link on this page, at no additional cost to you. That relationship does not change the price you pay.</div>
-<section class="card">
-<h2>What you are reviewing</h2>
-<p>This is a digital information product offered by an independent seller through ClickBank. It is not a physical water-treatment device, installation service, emergency service, or professional assessment. The seller controls the product, checkout, pricing, delivery, support, and refund terms.</p>
-<p>Before purchasing, read the seller's description carefully. Check what files or materials are included, how access is delivered, which devices can open them, and whether the subject matter fits what you are actually trying to learn. Keep a copy of the checkout receipt and the terms shown at purchase.</p>
+<header class="top"><span>WATER READY</span><span class="badge">HOUSEHOLD PREPAREDNESS</span></header>
+<section class="hero">
+<div>
+<p class="badge">A PRACTICAL DIGITAL GUIDE</p>
+<h1>Build a more water-ready home.</h1>
+<p class="lead">Water is easy to take for granted. Explore a practical approach to household water preparedness and see whether <strong>__OFFER_NAME__</strong> fits your plans.</p>
+<a class="button" rel="sponsored nofollow" href="__CTA_URL__">Explore Water Freedom System</a>
+<span class="micro">See the full presentation, product details and current checkout information.</span>
+</div>
+<div class="visual" role="img" aria-label="Abstract water illustration"></div>
 </section>
-<section>
-<h2>A practical evaluation checklist</h2>
-<ul>
-<li>Confirm that the product is a digital guide and understand what is included.</li>
-<li>Review the current price, billing currency, and any optional items at checkout.</li>
-<li>Read the seller's refund and customer-support information before paying.</li>
-<li>Treat the material as general information, not professional engineering, safety, health, or legal advice.</li>
-<li>For household water equipment or safety decisions, consult an appropriately qualified local professional.</li>
-</ul>
-<p>No outcome is promised by this page. Individual needs, properties, local conditions, equipment, and regulations differ. Make decisions based on your own circumstances and independently verified information.</p>
+<div class="disclosure"><strong>Affiliate disclosure:</strong> We may earn a commission if you purchase through this link, at no additional cost to you.</div>
+<section class="why">
+<p class="badge">WHY EXPLORE IT?</p>
+<h2>A simple starting point for thinking ahead</h2>
+<p>Household water planning can feel complicated. This guide offers a focused place to explore the subject, understand the approach being presented, and decide what deserves a closer look.</p>
 </section>
-<section class="card">
-<h2>Continue to the seller</h2>
-<p>The button below records an outbound affiliate click so AdGenie Pro can connect any ClickBank notification back to the campaign that produced it. It then sends you through the original ClickBank HopLink supplied for this offer.</p>
-<a class="button" rel="sponsored nofollow" href="__CTA_URL__">Review the seller's product details</a>
-<p><small>You will leave this site. The destination and checkout are operated by third parties.</small></p>
+<section class="grid">
+<div class="card"><span class="num">01</span><h3>Explore the idea</h3><p>Learn how the Water Freedom approach is presented and what the digital guide includes.</p></div>
+<div class="card"><span class="num">02</span><h3>Compare it to your needs</h3><p>Review the information against your home, priorities, local conditions and existing plans.</p></div>
+<div class="card"><span class="num">03</span><h3>Make your own decision</h3><p>Check the current offer, support information and purchase terms before choosing.</p></div>
+</section>
+<section class="final">
+<h2>Ready to take a closer look?</h2>
+<p>Continue to the complete Water Freedom System presentation.</p>
+<a class="button" rel="sponsored nofollow" href="__CTA_URL__">See the Water Freedom System</a>
 </section>
 <footer>
-<a href="/privacy">Privacy</a><a href="/terms">Terms</a><a href="/contact">Contact</a>
-<p>AdGenie Pro provides this independent disclosure page and campaign measurement. It is not the product seller or ClickBank.</p>
+<div><a href="/privacy">Privacy</a><a href="/terms">Terms</a><a href="/contact">Contact</a></div>
+<span>Information only. Product details and checkout are provided on the next page.</span>
 </footer>
 </main></body></html>"""
 
@@ -140,7 +147,7 @@ def privacy() -> HTMLResponse:
 def terms() -> HTMLResponse:
     return _support_page(
         "Terms",
-        """<p>The offer page is an independent informational introduction to a third-party product. Product descriptions, prices, availability, delivery, support, and refund terms are controlled by the seller and may change.</p>
+        """<p>The offer page provides general information about a digital product. Product descriptions, prices, availability, delivery, support, and refund terms may change.</p>
 <p>Review the seller's current terms before purchasing. Information on this site is not professional engineering, safety, health, financial, or legal advice.</p>""",
     )
 
