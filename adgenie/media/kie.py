@@ -168,7 +168,11 @@ class KieClient(MediaProvider):
                 payload["generation_type"] = request.extra.get(
                     "generation_type", "TEXT_2_VIDEO"
                 )
-            payload["aspect_ratio"] = request.aspect_ratio or "16:9"
+            payload["aspect_ratio"] = (
+                request.aspect_ratio
+                if request.aspect_ratio in {"16:9", "9:16"}
+                else "16:9"
+            )
             payload["enable_fallback"] = request.extra.get("enable_fallback", False)
             payload["enable_translation"] = request.extra.get(
                 "enable_translation", True
