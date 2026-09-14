@@ -50,6 +50,28 @@ def test_dashboard_is_served(api_client):
     assert "AdGenie Pro" in response.text
 
 
+def test_prelanding_page_is_public_and_keeps_clicks_for_the_cta(
+    api_client, created_offer, session
+):
+    from adgenie.models import Click
+
+    response = api_client.get(
+        f"/offer/{created_offer['id']}?s=o{created_offer['id']}&fbclid=IwAR9"
+    )
+    assert response.status_code == 200
+    assert "Affiliate disclosure" in response.text
+    assert "Privacy" in response.text
+    assert f"/r?s=o{created_offer['id']}&amp;fbclid=IwAR9" in response.text
+    assert session.query(Click).count() == 0
+
+
+def test_prelanding_support_pages_are_reachable(api_client):
+    for path in ("/privacy", "/terms", "/contact"):
+        response = api_client.get(path)
+        assert response.status_code == 200
+        assert "AdGenie Pro" in response.text
+
+
 def test_openapi_documents_every_router(api_client):
     paths = api_client.get("/openapi.json").json()["paths"]
     for path in ("/api/offers", "/api/campaigns/launch", "/api/optimizer/run", "/postback"):

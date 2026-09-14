@@ -52,6 +52,7 @@ __all__ = [
     "encode_subid",
     "decode_subid",
     "build_tracking_url",
+    "build_prelanding_url",
     "build_final_url",
     "sign_payload",
     "verify_signature",
@@ -215,6 +216,30 @@ def build_tracking_url(
         if macros:
             query += "&" + "&".join(f"{k}={v}" for k, v in macros.items())
     return f"{base}/r?{query}"
+
+
+def build_prelanding_url(
+    ctx: TrackingContext,
+    settings: Settings | None = None,
+    extra: dict[str, str] | None = None,
+) -> str:
+    """Build the page URL placed in an ad before the outbound affiliate click.
+
+    The page itself does not write a click. Its call-to-action carries the same
+    compact token to /r, where an outbound ClickBank click is recorded and a
+    fresh tid is attached. This keeps page views distinct from affiliate-link
+    clicks while preserving creative-level revenue attribution.
+    """
+    settings = settings or get_settings()
+    base = settings.public_base_url.rstrip("/")
+    params: dict[str, str] = {"s": encode_subid(ctx)}
+    params.update(extra or {})
+    query = urlencode(params)
+    if ctx.platform:
+        macros = PLATFORM_MACROS.get(ctx.platform, {})
+        if macros:
+            query += "&" + "&".join(f"{k}={v}" for k, v in macros.items())
+    return f"{base}/offer/{ctx.offer_id}?{query}"
 
 
 def build_final_url(

@@ -63,10 +63,17 @@ class DestinationMonitor:
         offer: Offer,
         ad_texts: list[str] | None = None,
         check_cloaking: bool = True,
+        destination_url: str | None = None,
     ) -> LandingPageCheck:
-        """Audit an offer's destination and record the result."""
+        """Audit the controlled ad landing page and record the result."""
+        if destination_url is None:
+            from .tracking import TrackingContext, build_prelanding_url
+
+            destination_url = build_prelanding_url(
+                TrackingContext(offer_id=offer.id), settings=self.settings
+            )
         audit = audit_landing_page(
-            offer.destination_url,
+            destination_url,
             fetcher=self.fetcher,
             ad_texts=ad_texts,
             offer=offer,
@@ -87,7 +94,7 @@ class DestinationMonitor:
             raise ValueError(f"creative {creative.id} has no reachable offer")
 
         audit = audit_landing_page(
-            offer.destination_url,
+            creative.final_url,
             fetcher=self.fetcher,
             ad_texts=creative.headlines + creative.primary_texts,
             offer=offer,

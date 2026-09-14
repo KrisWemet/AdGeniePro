@@ -25,6 +25,7 @@ from .api import (
     routes_research,
     routes_system,
     routes_tracking,
+    routes_landing,
     routes_clickbank,
 )
 from .api.security import require_api_key
@@ -150,6 +151,7 @@ app.include_router(routes_system.router, prefix="/api", dependencies=_guard)
 # landing page or an email webhook cannot hold the operator's admin key.
 app.include_router(routes_funnel.public_router, prefix="/api")
 app.include_router(routes_tracking.router)
+app.include_router(routes_landing.router)
 app.include_router(routes_clickbank.router)
 
 

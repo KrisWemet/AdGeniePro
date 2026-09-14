@@ -117,11 +117,29 @@ def run_preflight(session: Session, settings: Settings, platform: Platform,
 
     if offer and check_destination:
         from .core.landing import LandingPageFetcher, audit_landing_page
+        from .core.tracking import TrackingContext, build_prelanding_url
         try:
+            landing_url = build_prelanding_url(
+                TrackingContext(offer_id=offer.id), settings=settings
+            )
             with LandingPageFetcher() as fetcher:
-                audit = audit_landing_page(offer.destination_url, fetcher=fetcher, offer=offer)
+                audit = audit_landing_page(landing_url, fetcher=fetcher, offer=offer)
+                vendor_audit = audit_landing_page(
+                    offer.destination_url, fetcher=fetcher, offer=offer
+                )
             add("destination_audit", audit.passed,
-                "Destination audit passed" if audit.passed else ", ".join(f.code for f in audit.blocking))
+                "Controlled pre-landing page passed" if audit.passed else ", ".join(f.code for f in audit.blocking))
+            add(
+                "vendor_destination_audit",
+                vendor_audit.passed,
+                (
+                    "Vendor destination passed automated review"
+                    if vendor_audit.passed
+                    else "Manual review required: "
+                    + ", ".join(f.code for f in vendor_audit.blocking)
+                ),
+                warning=True,
+            )
         except Exception:
             add("destination_audit", False, "Could not complete destination audit")
     if platform is Platform.META:

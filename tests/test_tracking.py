@@ -10,6 +10,7 @@ from adgenie.core.tracking import (
     TrackingContext,
     attribution_window_ok,
     build_final_url,
+    build_prelanding_url,
     build_tracking_url,
     decode_subid,
     encode_subid,
@@ -88,6 +89,14 @@ def test_meta_macros_use_double_braces(settings):
     url = build_tracking_url(
         TrackingContext(1, 2, 3, 4, Platform.META), settings=settings
     )
+    assert "{{campaign.id}}" in url
+
+
+def test_prelanding_url_keeps_attribution_until_the_outbound_click(settings):
+    url = build_prelanding_url(
+        TrackingContext(1, 2, 3, 4, Platform.META), settings=settings
+    )
+    assert url.startswith("https://track.test/offer/1?s=")
     assert "{{campaign.id}}" in url
 
 

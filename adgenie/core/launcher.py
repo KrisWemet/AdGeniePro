@@ -40,7 +40,7 @@ from ..platforms.factory import get_platform, is_sandbox
 from ..platforms.specs import DEFAULT_FORMAT
 from .angles import angles_for
 from .copywriter import CopyStudio, build_brief
-from .tracking import TrackingContext, build_tracking_url
+from .tracking import TrackingContext, build_prelanding_url
 
 logger = logging.getLogger(__name__)
 
@@ -428,7 +428,7 @@ class CampaignLauncher:
 
         # The tracking link needs the creative's own id, so it is built after
         # the row exists and written back before the ad is created.
-        creative.final_url = build_tracking_url(
+        creative.final_url = build_prelanding_url(
             TrackingContext(
                 offer_id=offer.id,
                 campaign_id=campaign.id,
@@ -501,7 +501,13 @@ class CampaignLauncher:
 
         try:
             monitor = self._monitor or DestinationMonitor(self.session)
-            check = monitor.check_offer(offer)
+            check = monitor.check_offer(
+                offer,
+                destination_url=build_prelanding_url(
+                    TrackingContext(offer_id=offer.id),
+                    settings=self.settings,
+                ),
+            )
         except Exception as exc:
             # A page that cannot be audited is not a page that should stop a
             # launch on its own; report it and continue.
