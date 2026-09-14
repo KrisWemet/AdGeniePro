@@ -82,7 +82,7 @@ def test_every_creative_gets_its_own_tracking_link(launched, session):
     urls = [c.final_url for c in creatives]
     assert len(set(urls)) == 3
     for creative in creatives:
-        assert creative.final_url.startswith("https://track.test/r?s=")
+        assert creative.final_url.startswith("https://track.test/offer/1?s=")
         assert encode_subid(
             TrackingContext(
                 offer_id=1, creative_id=creative.id, platform=Platform.META
