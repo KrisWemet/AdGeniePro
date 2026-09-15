@@ -129,7 +129,10 @@ _ANGLE_DIRECTION: dict[str, str] = {
     "search_intent": ("a straightforward product shot on a plain background"),
 }
 
-_DEFAULT_DIRECTION = "the product in natural, everyday use"
+_DEFAULT_DIRECTION = (
+    "one clear visual puzzle or payoff visible at once, framed like a candid "
+    "phone photo in a real place"
+)
 
 
 @dataclass
@@ -190,8 +193,10 @@ def _compose(
     parts = [
         f"Advertising photograph of {subject}.",
         f"Composition: {direction}.",
-        "Style: honest editorial product photography, natural light, shallow "
-        "depth of field, muted realistic colour, no heavy retouching.",
+        "Hook: make one odd, useful or unresolved detail clear in the first glance. "
+        "The image must earn a pause without fear, fake proof or a false result.",
+        "Style: candid phone-camera realism in a real place, natural light, slight "
+        "tilt, imperfect framing, ordinary background detail, no staged studio look.",
         f"Framing: {spec.aspect_ratio} aspect ratio, subject centred with "
         "generous margins so no placement crop loses it.",
     ]
@@ -265,8 +270,8 @@ def build_video_prompt(
 
     beats = [
         f"Advertising video of {_subject_from(offer)}.",
-        "Open on the product already in use; the first second must show the "
-        "subject, not a logo or a title card.",
+        "Open on a clear visual puzzle or payoff already happening; the first "
+        "second must make the viewer wonder what caused it.",
         f"Then: {_ANGLE_DIRECTION.get(angle, _DEFAULT_DIRECTION)}.",
         "Close on a clean, steady shot of the product.",
         f"Style: handheld documentary realism, natural light, {seconds:.0f} "

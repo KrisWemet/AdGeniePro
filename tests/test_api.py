@@ -73,6 +73,56 @@ def test_prelanding_page_is_public_and_keeps_clicks_for_the_cta(
     assert session.query(Click).count() == 0
 
 
+def test_prelanding_sends_attribution_to_systeme_when_configured(
+    api_client, created_offer, settings
+):
+    settings.systeme_capture_url = "https://pages.test/water?from=adgenie"
+    response = api_client.get(
+        f"/offer/{created_offer['id']}?s=o{created_offer['id']}-a9-pm&fbclid=IwAR9",
+        follow_redirects=False,
+    )
+    assert response.status_code == 302
+    assert response.headers["location"] == (
+        "https://pages.test/water?from=adgenie&"
+        f"s=o{created_offer['id']}-a9-pm&fbclid=IwAR9"
+    )
+    assert response.headers["cache-control"] == "no-store"
+
+
+def test_systeme_optin_webhook_is_secret_guarded_and_retry_safe(
+    api_client, created_offer, settings, session
+):
+    from adgenie.models import Lead
+
+    path = f"/api/systeme/optin?offer_id={created_offer['id']}"
+    payload = {
+        "data": {"contact": {
+            "email": "Lead@Example.test",
+            "sourceURL": f"https://pages.test/water?s=o{created_offer['id']}-a9-pm",
+        }}
+    }
+    assert api_client.post(path, json=payload).status_code == 401
+    headers = {"X-Webhook-Secret": settings.postback_secret}
+    first = api_client.post(path, json=payload, headers=headers)
+    replay = api_client.post(path, json=payload, headers=headers)
+    assert first.status_code == 200
+    assert replay.status_code == 200
+    assert first.json()["lead_id"] == replay.json()["lead_id"]
+    assert session.query(Lead).count() == 1
+
+
+def test_systeme_optin_webhook_rejects_a_body_without_email(
+    api_client, created_offer, settings
+):
+    response = api_client.post(
+        f"/api/systeme/optin?offer_id={created_offer['id']}",
+        json={"event": "opt_in"},
+        headers={"X-Webhook-Secret": settings.postback_secret},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Systeme opt-in payload has no contact email"
+
+
 def test_prelanding_support_pages_are_reachable(api_client):
     for path in ("/privacy", "/terms", "/contact"):
         response = api_client.get(path)

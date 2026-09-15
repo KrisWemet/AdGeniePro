@@ -98,6 +98,10 @@ class Settings(BaseSettings):
     # imagery by URL rather than owning it.
     media_public_base_url: str | None = None
 
+    # --- funnel provider (Systeme.io) ---
+    # /offer/{id} keeps AdGenie attribution and redirects to this capture page.
+    systeme_capture_url: str | None = None
+
     # --- competitor research (Meta Ad Library) ---
     # Uses meta_access_token. The library returns commercial ads only for
     # EU and UK delivery; elsewhere it carries political and issue ads only.
@@ -160,6 +164,11 @@ class Settings(BaseSettings):
             errors.append("SQLite DATABASE_URL must use an absolute path on persistent storage")
         if self.global_daily_budget_cap_usd <= 0:
             errors.append("GLOBAL_DAILY_BUDGET_CAP_USD must be positive")
+        if self.systeme_capture_url:
+            capture = urlparse(self.systeme_capture_url)
+            if (capture.scheme != "https" or not capture.hostname
+                    or capture.username or capture.password):
+                errors.append("SYSTEME_CAPTURE_URL must be a public HTTPS URL")
         return errors
 
     @property

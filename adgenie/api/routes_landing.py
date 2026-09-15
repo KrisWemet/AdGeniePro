@@ -6,9 +6,10 @@ from html import escape
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from sqlalchemy.orm import Session
 
+from ..config import get_settings
 from ..core.tracking import (
     PLATFORM_CLICK_PARAM,
     PLATFORM_MACROS,
@@ -91,13 +92,24 @@ def _token_for(offer_id: int, supplied: str | None) -> str:
     return encode_subid(TrackingContext(offer_id=offer_id))
 
 
+def _merge_query(url: str, params: dict[str, str]) -> str:
+    """Add attribution without dropping the provider page query."""
+    from urllib.parse import parse_qsl, urlsplit, urlunsplit
+
+    parsed = urlsplit(url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query.update(params)
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path,
+                       urlencode(query), parsed.fragment))
+
+
 @router.get("/offer/{offer_id}", response_class=HTMLResponse, include_in_schema=False)
 def offer_landing(
     offer_id: int,
     request: Request,
     s: str | None = Query(default=None),
     session: Session = Depends(get_session),
-) -> HTMLResponse:
+) -> Response:
     """Show the same substantive disclosure page to visitors and reviewers."""
     offer = session.get(Offer, offer_id)
     if offer is None:
@@ -109,6 +121,14 @@ def offer_landing(
         for key, value in request.query_params.items()
         if key in _PASSTHROUGH and value
     )
+    settings = get_settings()
+    if settings.systeme_capture_url:
+        return RedirectResponse(
+            _merge_query(settings.systeme_capture_url, params),
+            status_code=302,
+            headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+        )
+
     cta = "/r?" + urlencode(params)
     html = (
         _PAGE.replace("__STYLE__", _STYLE)

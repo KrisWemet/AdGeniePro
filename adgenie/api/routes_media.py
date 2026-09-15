@@ -23,11 +23,12 @@ router = APIRouter(tags=["media"])
 class KieImageTestIn(BaseModel):
     prompt: str = Field(
         default=(
-            "Honest editorial photograph of a bright modern kitchen with a clear "
-            "glass of water beside a simple countertop water pitcher. Natural "
-            "morning light, realistic materials, calm household setting, generous "
-            "negative space, no people, no text, no logo, no packaging, no "
-            "watermark."
+            "Candid iPhone photo in a real home kitchen. A hand holds a cold "
+            "metal cup covered in large water drops while one finger points at "
+            "the drops. The odd close-up must make a person pause and wonder "
+            "where the water came from. Slight tilt, imperfect framing, natural "
+            "window light, real counter clutter, sharp cup and drops, no staged "
+            "studio look. No product, text, logo, packaging or fear scene."
         ),
         min_length=20,
         max_length=1500,

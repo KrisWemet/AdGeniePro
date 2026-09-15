@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -60,6 +62,45 @@ class FunnelEventIn(BaseModel):
     status: str = "approved"
     timestamp: int | None = None
 
+
+
+def _nested(payload: dict[str, Any], *path: str) -> Any:
+    value: Any = payload
+    for key in path:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value
+
+
+def _first_text(payload: dict[str, Any], paths: tuple[tuple[str, ...], ...]) -> str | None:
+    for path in paths:
+        value = _nested(payload, *path)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _systeme_optin_fields(payload: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Read only the email and attribution from known Systeme webhook shapes."""
+    email = _first_text(payload, (
+        ("email",), ("contact", "email"), ("data", "email"),
+        ("data", "contact", "email"), ("payload", "contact", "email"),
+    ))
+    subid = _first_text(payload, (
+        ("s",), ("subid",), ("contact", "s"), ("contact", "subid"),
+        ("data", "s"), ("data", "subid"),
+    ))
+    if not subid:
+        source = _first_text(payload, (
+            ("sourceURL",), ("sourceUrl",), ("source_url",),
+            ("contact", "sourceURL"), ("contact", "sourceUrl"),
+            ("data", "sourceURL"), ("data", "sourceUrl"),
+            ("data", "contact", "sourceURL"), ("data", "contact", "sourceUrl"),
+        ))
+        if source:
+            subid = parse_qs(urlsplit(source).query).get("s", [None])[0]
+    return email, subid
 
 _STATUS = {
     "pending": ConversionStatus.PENDING,
@@ -197,6 +238,39 @@ def capture_lead(
     )
     session.commit()
     return {
+        "lead_id": lead.id,
+        "attribution": method,
+        "creative_id": lead.creative_id,
+    }
+
+
+@public_router.post("/systeme/optin")
+def systeme_optin(
+    payload: dict[str, Any],
+    offer_id: int = Query(..., ge=1),
+    session: Session = Depends(get_session),
+    x_postback_secret: str | None = Header(default=None),
+    x_webhook_secret: str | None = Header(default=None),
+    secret: str | None = Query(default=None),
+) -> dict:
+    """Adapt a Systeme.io opt-in webhook to AdGenie's lead ledger.
+
+    Systeme retries deliveries. record_lead is idempotent by email and offer,
+    so a retry cannot create or credit a second lead. Raw webhook bodies are
+    not stored.
+    """
+    _require_secret(x_postback_secret or x_webhook_secret or secret)
+    if session.get(Offer, offer_id) is None:
+        raise HTTPException(404, f"offer {offer_id} not found")
+    email, subid = _systeme_optin_fields(payload)
+    if not email:
+        raise HTTPException(422, "Systeme opt-in payload has no contact email")
+    lead, method = record_lead(
+        session, offer_id=offer_id, email=email, subid=subid, source_step="optin"
+    )
+    session.commit()
+    return {
+        "accepted": True,
         "lead_id": lead.id,
         "attribution": method,
         "creative_id": lead.creative_id,
