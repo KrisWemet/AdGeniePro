@@ -177,8 +177,14 @@ class Settings(BaseSettings):
 
     @property
     def has_google(self) -> bool:
+        # The refresh token is exchanged for an access token using the client id
+        # and secret, so they belong in this check. Without them a deployment
+        # reads as configured, receives a live client rather than the sandbox,
+        # and fails on its first call with campaigns already depending on it.
         return bool(
             self.google_developer_token
+            and self.google_client_id
+            and self.google_client_secret
             and self.google_refresh_token
             and self.google_customer_id
         )
