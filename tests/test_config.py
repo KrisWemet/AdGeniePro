@@ -47,3 +47,29 @@ def test_postgres_recycles_connections_before_a_provider_closes_them():
     kwargs = _engine_kwargs("postgresql+psycopg://user@host/db")
     assert kwargs["pool_pre_ping"] is True
     assert kwargs["pool_recycle"] < 300
+
+
+def test_a_proxied_click_records_the_visitor_not_the_proxy():
+    """Every deployment here puts something in front of the API — Caddy in the
+    Compose file, the platform edge on a PaaS — and the API publishes no port
+    of its own. Reading the socket peer therefore records the proxy on every
+    click, so the whole table shares one ip_hash: uniform, plausible-looking
+    garbage rather than an error anyone would notice."""
+    from adgenie.core.tracking import client_ip
+
+    assert client_ip("10.0.0.7", "203.0.113.9", trust_proxy=True) == "203.0.113.9"
+    # Client, then each proxy it passed through. The visitor is leftmost.
+    assert client_ip("10.0.0.7", "203.0.113.9, 10.0.0.1", trust_proxy=True) == "203.0.113.9"
+
+
+def test_the_forwarded_header_is_ignored_unless_a_proxy_is_declared():
+    """X-Forwarded-For is a request header. Anywhere the API can be reached
+    directly, trusting it lets a caller choose what gets recorded, so it stays
+    off until the deployment says a proxy is genuinely in front."""
+    from adgenie.core.tracking import client_ip
+
+    assert client_ip("198.51.100.4", "203.0.113.9", trust_proxy=False) == "198.51.100.4"
+    # Declared, but the proxy sent nothing usable: fall back to the peer.
+    assert client_ip("198.51.100.4", "", trust_proxy=True) == "198.51.100.4"
+    assert client_ip("198.51.100.4", " , ", trust_proxy=True) == "198.51.100.4"
+    assert client_ip(None, None, trust_proxy=True) is None

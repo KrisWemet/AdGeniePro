@@ -17,6 +17,7 @@ from ..config import get_settings
 from ..core.tracking import (
     PLATFORM_CLICK_PARAM,
     build_final_url,
+    client_ip,
     record_click,
     record_conversion,
     secret_is_placeholder,
@@ -58,7 +59,11 @@ def redirect_click(
         session,
         s,
         user_agent=request.headers.get("user-agent"),
-        ip=request.client.host if request.client else None,
+        ip=client_ip(
+            request.client.host if request.client else None,
+            request.headers.get("x-forwarded-for"),
+            get_settings().trust_proxy_headers,
+        ),
         referrer=request.headers.get("referer"),
         country=request.headers.get("cf-ipcountry") or request.headers.get("x-country"),
         query_params=params,

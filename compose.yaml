@@ -25,6 +25,8 @@ services:
       PUBLIC_BASE_URL: https://${PUBLIC_HOSTNAME:?Set a public hostname}
       CORS_ORIGINS: '["https://${PUBLIC_HOSTNAME}"]'
       MEDIA_STORAGE_DIR: /data/media
+      # Caddy is in front and the api service publishes no port of its own.
+      TRUST_PROXY_HEADERS: "true"
     volumes:
       - media:/data
     depends_on:

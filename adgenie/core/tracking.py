@@ -348,6 +348,32 @@ def looks_like_bot(user_agent: str | None) -> bool:
     return any(marker in ua for marker in _BOT_MARKERS)
 
 
+def client_ip(
+    peer: str | None, forwarded_for: str | None, trust_proxy: bool
+) -> str | None:
+    """The visitor's address, as seen from behind a reverse proxy.
+
+    Every deployment here puts something in front of the API — Caddy in the
+    Compose file, the platform edge on a PaaS — and the API publishes no port
+    of its own. So the socket peer is the proxy, and without this every click
+    in the table gets the *same* ip_hash: uniform, plausible-looking garbage
+    rather than an error.
+
+    `trust_proxy` must stay off unless a proxy is genuinely in front, because
+    X-Forwarded-For is a request header and anyone reaching the API directly
+    can write whatever they like in it. Where it is on, the leftmost entry is
+    used: it is the original client and it is also client-controlled, which is
+    acceptable here because the value is only ever a salted hash used for
+    coarse traffic sanity, and a caller who wants to vary it can rotate
+    addresses anyway.
+    """
+    if trust_proxy and forwarded_for:
+        first = forwarded_for.split(",")[0].strip()
+        if first:
+            return first
+    return peer
+
+
 def hash_ip(ip: str | None, salt: str | None = None) -> str | None:
     """Store a salted hash rather than the address itself."""
     if not ip:

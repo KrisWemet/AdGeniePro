@@ -37,6 +37,12 @@ class Settings(BaseSettings):
     # Browser origins allowed to call the API. "*" is only safe while api_key
     # is unset and the server is bound to localhost.
     cors_origins: list[str] = Field(default_factory=lambda: ["*"])
+    # Read the visitor's address from X-Forwarded-For rather than the socket
+    # peer. On every deployment here something sits in front of the API and the
+    # API publishes no port, so leaving this off makes every click record the
+    # proxy's address and share one ip_hash. Leave it off anywhere the API is
+    # reachable directly: the header is caller-supplied.
+    trust_proxy_headers: bool = False
 
     # --- safety rails ---
     # When true no live mutation is sent to Meta/Google; actions are recorded

@@ -474,6 +474,36 @@ def test_clickbank_redirects_to_the_offer_with_a_tid(api_client, created_offer):
     assert "fbclid=IwAR9" in location
 
 
+def test_a_proxied_click_stores_the_visitor_rather_than_the_proxy(
+    api_client, created_offer, settings, session
+):
+    """End to end through /r, because the helper being right is not the same as
+    the route using it. Behind Caddy or a platform edge the socket peer is the
+    proxy, so without this every click in the table shares one ip_hash and the
+    only per-visitor signal recorded is uniform garbage."""
+    from sqlalchemy import select
+
+    from adgenie.core.tracking import hash_ip
+    from adgenie.models import Click
+
+    launched = _launch(api_client, created_offer["id"])
+    creative = api_client.get(f"/api/creatives/{launched['creative_ids'][0]}").json()
+    subid = creative["final_url"].split("s=")[1].split("&")[0]
+
+    settings.trust_proxy_headers = True
+    response = api_client.get(
+        f"/r?s={subid}",
+        headers={"x-forwarded-for": "203.0.113.9, 10.0.0.1"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 302
+
+    click = session.scalars(
+        select(Click).order_by(Click.id.desc()).limit(1)
+    ).one()
+    assert click.ip_hash == hash_ip("203.0.113.9", salt=settings.secret_key)
+
+
 def test_click_on_an_unknown_offer_is_404(api_client):
     assert api_client.get("/r?s=o9999", follow_redirects=False).status_code == 404
 
