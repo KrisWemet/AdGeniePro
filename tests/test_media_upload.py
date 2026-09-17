@@ -300,9 +300,7 @@ def test_an_ad_is_not_built_on_a_video_that_is_still_processing(meta_settings):
         )
 
 
-def test_the_asset_feed_carries_hashes_never_urls(meta_settings):
-    """Meta's own asset-level test takes hashes and ids only, so imagery that
-    was not uploaded cannot take part in it."""
+def _capture_creative(settings, **spec_kwargs) -> dict:
     captured = {}
 
     def handler(request):
@@ -310,22 +308,80 @@ def test_the_asset_feed_carries_hashes_never_urls(meta_settings):
             captured.update(_creative_payload(None, request))
         return httpx.Response(200, json={"id": "obj"})
 
-    client = _mock_meta(handler, meta_settings)
-    client.create_creative(
-        CreativeSpec(
-            ad_group_external_id="adset_1", name="ad",
-            final_url="https://track.test/r",
-            headlines=["One", "Two"], primary_texts=["A", "B"],
-            media_urls=["https://cdn.test/a.png"],
-            media=[
-                MediaHandle(kind="image", handle="h1"),
-                MediaHandle(kind="image", handle="h2"),
-            ],
-        )
+    fields = dict(
+        ad_group_external_id="adset_1", name="ad",
+        final_url="https://track.test/r",
+        headlines=["One", "Two"], primary_texts=["A", "B"],
+    )
+    fields.update(spec_kwargs)
+    _mock_meta(handler, settings).create_creative(CreativeSpec(**fields))
+    return captured
+
+
+def test_the_asset_feed_carries_hashes_never_urls(meta_settings):
+    """Meta's own asset-level test takes hashes and ids only, so imagery that
+    was not uploaded cannot take part in it."""
+    meta_settings.meta_dynamic_creative = True
+    captured = _capture_creative(
+        meta_settings,
+        media_urls=["https://cdn.test/a.png"],
+        media=[
+            MediaHandle(kind="image", handle="h1"),
+            MediaHandle(kind="image", handle="h2"),
+        ],
     )
     feed = json.loads(captured["asset_feed_spec"])
     assert feed["images"] == [{"hash": "h1"}, {"hash": "h2"}]
     assert "cdn.test" not in json.dumps(feed)
+
+
+def test_a_feed_creative_puts_only_the_page_in_its_story_spec(meta_settings):
+    """Meta rejects a creative carrying both an asset feed and a story spec
+    with content: each one fully describes the ad, and they can disagree.
+
+    This adapter sent both on every creative with more than one headline, which
+    the copywriter produces almost always — so first contact would have failed
+    on essentially every ad.
+    """
+    meta_settings.meta_dynamic_creative = True
+    captured = _capture_creative(
+        meta_settings, media=[MediaHandle(kind="image", handle="h1")]
+    )
+
+    story = json.loads(captured["object_story_spec"])
+    assert story == {"page_id": "page1"}
+    assert "link_data" not in story and "video_data" not in story
+    # A feed with no declared format is rejected.
+    assert json.loads(captured["asset_feed_spec"])["ad_formats"] == ["SINGLE_IMAGE"]
+
+
+def test_the_default_creative_is_a_single_ad_with_no_feed(meta_settings):
+    """Off by default, and not only because the feed is unverified against a
+    live account. A feed lets Meta choose the headline, body and image and then
+    reports delivery for the creative as a whole. This optimizer scales and
+    kills per creative, so it would be deciding about content it cannot see.
+    """
+    captured = _capture_creative(
+        meta_settings, media=[MediaHandle(kind="image", handle="h1")]
+    )
+
+    assert "asset_feed_spec" not in captured
+    story = json.loads(captured["object_story_spec"])
+    assert story["page_id"] == "page1"
+    assert story["link_data"]["name"] == "One"
+    assert story["link_data"]["image_hash"] == "h1"
+
+
+def test_a_feed_is_not_built_without_uploaded_media(meta_settings):
+    """The feed addresses images by hash and videos by id, never by URL. Built
+    from copy alone it would describe an ad with no imagery at all."""
+    meta_settings.meta_dynamic_creative = True
+    captured = _capture_creative(
+        meta_settings, media_urls=["https://cdn.test/a.png"], media=[]
+    )
+
+    assert "asset_feed_spec" not in captured
+    assert "link_data" in json.loads(captured["object_story_spec"])
 
 
 # --- Google says no --------------------------------------------------------

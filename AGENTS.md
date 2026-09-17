@@ -150,3 +150,16 @@ Roughly in the order they block getting real ads running:
 3. First contact with the live Meta and Google APIs has not happened.
 4. `preflight` performs read-only checks, but cannot prove write permissions,
    policy approval or successful affiliate sale attribution.
+5. Meta's asset feed (`META_DYNAMIC_CREATIVE`) is unverified against a live
+   account and off by default. It is also a poor fit on purpose: it lets Meta
+   pick the headline, body and image and then reports delivery for the creative
+   as a whole, while the optimizer scales and kills per creative. Leave the
+   variant testing in AdGenie, where the winner is attributable.
+6. Nothing runs on a schedule. `sync`, `optimize`, `landing --sweep`,
+   `push-conversions`, `rotate` and `portfolio` are all manual, `run_cycle`
+   does not call `sync_metrics`, and two overlapping runs would both read the
+   same budget headroom. Deliberate for the first trial; revisit after revenue
+   reconciles.
+7. Bred variants are created paused and no optimizer rule ever proposes
+   `RESUME`, so creative fatigue produces ads nothing starts. Compliance-blocked
+   creatives reach `PENDING_REVIEW` with no list endpoint, override path or UI.

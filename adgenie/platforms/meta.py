@@ -281,23 +281,42 @@ class MetaAdsClient(AdPlatform):
             elif spec.media_urls:
                 story_body["picture"] = spec.media_urls[0]
 
-        creative_data = {
-            "name": spec.name,
-            "object_story_spec": json.dumps(
-                {"page_id": page_id, story_field: story_body}
-            ),
-        }
-        # Hand Meta the extra variants so it can run its own asset-level test.
-        if len(spec.headlines) > 1 or len(spec.primary_texts) > 1:
+        # `asset_feed_spec` and a content-carrying `object_story_spec` are
+        # mutually exclusive: Meta rejects a creative that sends both, because
+        # each one fully describes the ad and they can disagree. A feed
+        # creative's story spec carries the Page and nothing else.
+        #
+        # Sending both is what this adapter did, on every creative with more
+        # than one headline — which the copywriter produces almost always. It
+        # would have failed at first contact on essentially every ad.
+        #
+        # The feed is off by default for a second, larger reason: it hands the
+        # choice of headline, body and image to Meta, which then reports
+        # delivery for the creative as a whole rather than per combination.
+        # This optimizer attributes performance to a specific creative and
+        # decides what to scale and kill from that, so a creative whose content
+        # Meta is silently varying is a creative it cannot reason about. Angle
+        # and execution testing happens here instead, where the result is
+        # measurable — see `creatives_per_angle` in core/launcher.py.
+        use_feed = (
+            self.settings.meta_dynamic_creative
+            and (len(spec.headlines) > 1 or len(spec.primary_texts) > 1)
+            # The feed addresses media by hash or id, never by URL, so it needs
+            # assets already uploaded into this ad account. A feed without them
+            # would describe an ad with no imagery.
+            and (images or videos)
+        )
+
+        if use_feed:
             feed: dict = {
                 "titles": [{"text": h} for h in spec.headlines[:5]],
                 "bodies": [{"text": p} for p in spec.primary_texts[:5]],
                 "descriptions": [{"text": d} for d in spec.descriptions[:5]],
                 "link_urls": [{"website_url": spec.final_url}],
                 "call_to_action_types": [spec.call_to_action],
+                # Required. A feed with no declared format is rejected.
+                "ad_formats": ["SINGLE_VIDEO" if videos else "SINGLE_IMAGE"],
             }
-            # The asset feed takes hashes and ids, never URLs, so only uploaded
-            # media can take part in Meta's own asset-level test.
             if images:
                 feed["images"] = [{"hash": m.handle} for m in images[:10]]
             if videos:
@@ -308,7 +327,18 @@ class MetaAdsClient(AdPlatform):
                     }
                     for m in videos[:10]
                 ]
-            creative_data["asset_feed_spec"] = json.dumps(feed)
+            creative_data = {
+                "name": spec.name,
+                "object_story_spec": json.dumps({"page_id": page_id}),
+                "asset_feed_spec": json.dumps(feed),
+            }
+        else:
+            creative_data = {
+                "name": spec.name,
+                "object_story_spec": json.dumps(
+                    {"page_id": page_id, story_field: story_body}
+                ),
+            }
         creative = self._request(
             "POST", f"act_{self.account_id}/adcreatives", data=creative_data
         )

@@ -63,6 +63,12 @@ class Settings(BaseSettings):
     # Keep first contact on a currently-supported Marketing API version. v21
     # was the old prototype default and is no longer usable for ad creation.
     meta_api_version: str = "v26.0"
+    # Let Meta assemble the ad from several headlines, bodies and images and
+    # test the combinations itself. Off, because it reports delivery for the
+    # creative rather than per combination, and this optimizer scales and kills
+    # per creative — it would be deciding about content it cannot see. Turning
+    # it on has not been verified against a live ad account.
+    meta_dynamic_creative: bool = False
 
     # --- Google Ads ---
     google_developer_token: str | None = None
