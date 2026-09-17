@@ -84,6 +84,34 @@ Named volumes are persistence, not a backup. Do not use `docker compose down -v`
 against a deployment whose records you need. The schema change is a new receipt
 table; existing columns are unchanged and `init_db` creates the table on startup.
 
+## Deployed on Railway instead of Compose
+
+The Compose section above describes a single Linux server, and it remains the
+reference for that path. This trial is deployed on Railway, where three things
+differ:
+
+- **No Caddy and no `compose.yaml`.** Railway terminates TLS at its own edge, so
+  the `proxy` service and the `Caddyfile` are unused. `compose.yaml` is still the
+  right file for a VPS; it is simply not what is running.
+- **Managed Postgres.** `DATABASE_URL` must name the `psycopg` driver
+  explicitly — `postgresql+psycopg://...`. Railway's own `DATABASE_URL` uses the
+  bare `postgresql://` scheme, which SQLAlchemy resolves to psycopg2, which is
+  not installed. It is built from the Postgres service's `PGUSER`, `PGPASSWORD`,
+  `RAILWAY_PRIVATE_DOMAIN` and `PGDATABASE` over the private network.
+- **The platform assigns the port.** Railway sets `PORT` (8080 in practice), and
+  the container honours it. A container that hardcodes 8000 binds a port nothing
+  routes to and receives no traffic while looking healthy.
+
+`TRUST_PROXY_HEADERS=true` is set for the same reason Compose sets it: the API is
+only reachable through the platform edge, so without it every click records the
+edge's address and the whole `clicks` table shares one `ip_hash`.
+
+Commands in the sections below that begin `docker compose exec api` become
+`railway run --service api` from a linked checkout, or the equivalent in
+Railway's dashboard shell. Volumes, backups and the `pg_dump` advice still apply;
+Railway's Postgres has its own backup settings, and a named volume is still
+persistence rather than a backup.
+
 ## Offer and preflight
 
 Use `/docs` with the admin `X-API-Key` to create an offer, or `offer-add` inside
