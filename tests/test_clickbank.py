@@ -227,6 +227,28 @@ def test_a_sale_reported_only_in_extclid_credits_the_clicked_creative(
     assert revenue(session, creative).revenue_micros == 40_250_000
 
 
+@pytest.mark.parametrize("key", ["extClid", "EXTCLID", "extclid", "tId"])
+def test_the_click_id_field_name_is_read_case_insensitively(
+    api_client, setup_click, session, key
+):
+    """v8 reports these fields in camelCase, e.g. `trafficSource`, `affSub1`.
+
+    So the click id may arrive as `extClid`. A field we fail to read is a sale
+    credited to no creative.
+    """
+    payload, creative = setup_click
+    click_id = payload["trackingCodes"][0]
+    payload["affiliateTrackingParameters"] = {key: click_id}
+    payload["trackingCodes"] = []
+
+    assert post(api_client, payload).json()["matched"] is True
+
+    conversion = session.scalar(select(Conversion).where(Conversion.click_id == click_id))
+    assert conversion is not None
+    assert conversion.creative_id == creative
+    assert revenue(session, creative).revenue_micros == 40_250_000
+
+
 @pytest.mark.parametrize("field", ["trackingCodes", "extclid"])
 def test_an_upper_cased_click_id_still_matches_the_click(
     api_client, setup_click, session, field

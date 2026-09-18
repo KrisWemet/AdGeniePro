@@ -116,11 +116,11 @@ class TrackingContext:
 
 _B36 = "0123456789abcdefghijklmnopqrstuvwxyz"
 
-# ClickBank truncates a HopLink `tid` past 24 characters and drops one
-# carrying a hyphen or an uppercase letter. A truncated or dropped id comes
-# back on the sale as something that matches no click, so the sale is revenue
-# no creative is credited for. Lowercase base-36 inside 24 characters keeps
-# the id inside every one of those limits.
+# Older ClickBank documentation caps a HopLink `tid` at 24 letters and
+# numbers. Current behaviour on a longer or mixed-case id has not been
+# verified here, and an id that comes back altered matches no click, which
+# makes the sale revenue no creative is credited for. Lowercase base-36
+# inside 24 characters stays within the documented limit either way.
 CLICK_ID_LENGTH = 24
 
 

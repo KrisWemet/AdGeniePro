@@ -85,7 +85,14 @@ def _click_id(session: Session, payload: dict) -> str | None:
         candidates = [candidates]
     fields = payload.get("affiliateTrackingParameters") or {}
     if isinstance(fields, dict):
-        candidates = [fields.get("extclid"), fields.get("tid"), *candidates]
+        # Key names are matched case-insensitively: v8 reports these fields in
+        # camelCase (`trafficSource`, `affSub1`), so the click id may arrive as
+        # `extClid` rather than `extclid`, and an unread field is a sale
+        # credited to no creative.
+        folded = {
+            key.lower(): value for key, value in fields.items() if isinstance(key, str)
+        }
+        candidates = [folded.get("extclid"), folded.get("tid"), *candidates]
     candidates = list(dict.fromkeys(
         c for c in candidates if isinstance(c, str) and 0 < len(c) <= 100
     ))
