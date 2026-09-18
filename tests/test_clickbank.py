@@ -60,7 +60,10 @@ def setup_click(api_client, settings, session):
     params = parse_qs(urlparse(response.headers["location"]).query)
     assert "subid" not in params
     assert params["cbpage"] == ["guide"]
-    assert re.fullmatch("[a-z0-9_]{32}", params["tid"][0])
+    # Within ClickBank's 24-character TID limit, lowercase alphanumeric only,
+    # and carried in both parameters the INS payload can report it back in.
+    assert re.fullmatch("[a-z0-9]{1,24}", params["tid"][0])
+    assert params["extclid"] == params["tid"]
     click_id = params["tid"][0]
     # Use yesterday so the normal performance endpoint includes the fixture.
     when = datetime.now(timezone.utc) - timedelta(days=1)
@@ -201,3 +204,107 @@ def test_other_networks_keep_generic_subid(api_client):
     response = api_client.get(f"/r?s=o{offer['id']}", follow_redirects=False)
     assert "subid=" in response.headers["location"]
     assert "?tid=" not in response.headers["location"]
+
+
+def test_a_sale_reported_only_in_extclid_credits_the_clicked_creative(
+    api_client, setup_click, session
+):
+    """The whole point of sending `extclid` as well as `tid`.
+
+    A seller's order form that forwards only `extclid` must still join the sale
+    to the creative that bought the click, or the winning ad reads as a loser.
+    """
+    payload, creative = setup_click
+    click_id = payload["trackingCodes"][0]
+    payload["affiliateTrackingParameters"] = {"extclid": click_id}
+    payload["trackingCodes"] = []
+
+    assert post(api_client, payload).json()["matched"] is True
+
+    conversion = session.scalar(select(Conversion).where(Conversion.click_id == click_id))
+    assert conversion is not None
+    assert conversion.creative_id == creative
+    assert revenue(session, creative).revenue_micros == 40_250_000
+
+
+@pytest.mark.parametrize("key", ["extClid", "EXTCLID", "extclid", "tId"])
+def test_the_click_id_field_name_is_read_case_insensitively(
+    api_client, setup_click, session, key
+):
+    """v8 reports these fields in camelCase, e.g. `trafficSource`, `affSub1`.
+
+    So the click id may arrive as `extClid`. A field we fail to read is a sale
+    credited to no creative.
+    """
+    payload, creative = setup_click
+    click_id = payload["trackingCodes"][0]
+    payload["affiliateTrackingParameters"] = {key: click_id}
+    payload["trackingCodes"] = []
+
+    assert post(api_client, payload).json()["matched"] is True
+
+    conversion = session.scalar(select(Conversion).where(Conversion.click_id == click_id))
+    assert conversion is not None
+    assert conversion.creative_id == creative
+    assert revenue(session, creative).revenue_micros == 40_250_000
+
+
+@pytest.mark.parametrize("field", ["trackingCodes", "extclid"])
+def test_an_upper_cased_click_id_still_matches_the_click(
+    api_client, setup_click, session, field
+):
+    """A precaution: ids are issued lowercase, but a network that upper-cases
+    one in transit would otherwise credit the sale to nothing."""
+    payload, creative = setup_click
+    click_id = payload["trackingCodes"][0]
+    shouted = click_id.upper()
+    assert shouted != click_id
+    if field == "extclid":
+        payload["affiliateTrackingParameters"] = {"extclid": shouted}
+        payload["trackingCodes"] = []
+    else:
+        payload["trackingCodes"] = [shouted]
+
+    assert post(api_client, payload).json()["matched"] is True
+
+    # Stored against the click's own spelling, so the conversion joins the row.
+    conversion = session.scalar(select(Conversion).where(Conversion.click_id == click_id))
+    assert conversion is not None
+    assert conversion.creative_id == creative
+    assert revenue(session, creative).revenue_micros == 40_250_000
+
+
+def test_an_unknown_click_id_is_still_not_credited_to_a_creative(
+    api_client, setup_click, session
+):
+    """Case-insensitive matching must not turn into matching anything."""
+    payload, _ = setup_click
+    payload["trackingCodes"] = ["zzzznotaclickzzzz"]
+    payload["affiliateTrackingParameters"] = {}
+
+    assert post(api_client, payload).json()["matched"] is False
+
+    conversion = session.scalar(
+        select(Conversion).where(Conversion.click_id == "zzzznotaclickzzzz")
+    )
+    assert conversion is None or conversion.creative_id is None
+
+
+def test_a_mixed_case_legacy_click_id_still_matches(api_client, setup_click, session):
+    """Ids issued before 2026-09-13 are mixed case and must keep attributing.
+
+    They are matched as received. Folding the stored side instead would drop
+    the unique index on click_id and scan every click ever served.
+    """
+    payload, creative = setup_click
+    click = session.scalar(select(Click).where(Click.click_id == payload["trackingCodes"][0]))
+    legacy = "AbC123LegacyMixedCase99"
+    click.click_id = legacy
+    session.commit()
+    payload["trackingCodes"] = [legacy]
+
+    assert post(api_client, payload).json()["matched"] is True
+
+    conversion = session.scalar(select(Conversion).where(Conversion.click_id == legacy))
+    assert conversion is not None
+    assert conversion.creative_id == creative

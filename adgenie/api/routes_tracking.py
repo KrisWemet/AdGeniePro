@@ -38,9 +38,18 @@ _STATUS_MAP = {
 }
 
 
-def _network_click_id_param(network: str) -> str:
-    """INS returns HopLink tid values in trackingCodes."""
-    return "tid" if network.lower() == "clickbank" else "subid"
+# Affiliate networks do not agree on the name of a third-party click id.
+# ClickBank reports `tid` in INS `trackingCodes` and the newer `extclid` in
+# `affiliateTrackingParameters`. Both carry the same id, so a sale still
+# attributes if the seller's order form drops one of them. Other networks keep
+# the generic `subid` convention.
+_NETWORK_CLICK_ID_PARAMS = {
+    "clickbank": ("tid", "extclid"),
+}
+
+
+def _network_click_id_params(network: str | None) -> tuple[str, ...]:
+    return _NETWORK_CLICK_ID_PARAMS.get((network or "").strip().lower(), ("subid",))
 
 
 @router.get("/r", include_in_schema=False)
@@ -84,10 +93,13 @@ def redirect_click(
     passthrough = {
         key: params[key] for key in PLATFORM_CLICK_PARAM.values() if key in params
     }
+    id_params = _network_click_id_params(offer.network)
     destination = build_final_url(
         offer.destination_url, click.click_id,
-        subid_param=_network_click_id_param(offer.network),
-        extra=passthrough,
+        subid_param=id_params[0],
+        # Platform passthrough wins a name collision: it carries a distinct
+        # value, while the extra id params are all the same click id.
+        extra={**{p: click.click_id for p in id_params[1:]}, **passthrough},
     )
     session.commit()
     # 302, not 301: a permanent redirect would be cached and the click never
