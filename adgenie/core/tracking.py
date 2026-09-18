@@ -114,9 +114,23 @@ class TrackingContext:
     platform: Platform | None = None
 
 
+_B36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+# ClickBank truncates a HopLink `tid` past 24 characters and drops one
+# carrying a hyphen or an uppercase letter. A truncated or dropped id comes
+# back on the sale as something that matches no click, so the sale is revenue
+# no creative is credited for. Lowercase base-36 inside 24 characters keeps
+# the id inside every one of those limits.
+CLICK_ID_LENGTH = 24
+
+
 def new_click_id() -> str:
-    """128 random bits, encoded with ClickBank-compatible lowercase digits."""
-    return secrets.token_hex(16)
+    """24 lowercase base-36 characters (~124 bits). Opaque and non-enumerable.
+
+    Base-36 rather than URL-safe base64 because networks restrict the alphabet
+    of the id they hand back; see `CLICK_ID_LENGTH`.
+    """
+    return "".join(secrets.choice(_B36) for _ in range(CLICK_ID_LENGTH))
 
 
 # --------------------------------------------------------------------------
@@ -124,7 +138,6 @@ def new_click_id() -> str:
 # --------------------------------------------------------------------------
 
 
-_B36 = "0123456789abcdefghijklmnopqrstuvwxyz"
 _PLATFORM_FLAGS = {"m": Platform.META, "g": Platform.GOOGLE}
 
 

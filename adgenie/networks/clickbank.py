@@ -91,7 +91,19 @@ def _click_id(session: Session, payload: dict) -> str | None:
     ))
     if not candidates:
         return None
-    known = list(session.scalars(select(Click.click_id).where(Click.click_id.in_(candidates))))
+    # Each id is looked up as received and lowercased, as a precaution against
+    # a network upper-casing one in transit: an id that matches no click is a
+    # sale credited to no creative. Both forms are literal values, so the
+    # unique index on click_id is still used — wrapping the column in lower()
+    # would turn this per-sale lookup into a scan of every click ever served.
+    #
+    # This does not fold the stored side. Ids issued before 2026-09-13 are
+    # mixed case, and one of those returned in a different case than it was
+    # issued still will not match.
+    lookup = list(dict.fromkeys([*candidates, *(c.lower() for c in candidates)]))
+    known = list(session.scalars(
+        select(Click.click_id).where(Click.click_id.in_(lookup))
+    ))
     if len(known) > 1:
         raise ValueError("ambiguous ClickBank tracking identifiers")
     return known[0] if known else candidates[0]
