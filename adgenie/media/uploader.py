@@ -91,6 +91,9 @@ class MediaUploader:
             )
             return None
 
+        if self.settings.dry_run or getattr(client, "dry_run", False):
+            return None
+
         account = client.account_key
         record = self.session.execute(
             select(PlatformAsset).where(
@@ -100,7 +103,12 @@ class MediaUploader:
             )
         ).scalar_one_or_none()
 
-        if record is not None and record.handle:
+        if (
+            record is not None
+            and record.handle
+            and not record.handle.startswith("dryrun_")
+            and not (record.thumbnail_handle or "").startswith("dryrun_")
+        ):
             handle = _to_handle(record)
             if not handle.ready:
                 # A video that was still transcoding last time. Ask again
@@ -131,21 +139,27 @@ class MediaUploader:
                 content_hash=asset.content_hash,
             )
         )
-        self.session.add(
-            PlatformAsset(
-                media_asset_id=asset.id,
+        if (
+            handle.handle.startswith("dryrun_")
+            or handle.thumbnail_handle.startswith("dryrun_")
+        ):
+            return None
+        if record is None:
+            record = PlatformAsset(
                 platform=client.platform,
                 account_id=account,
                 content_hash=asset.content_hash,
-                kind=asset.kind,
-                handle=handle.handle,
-                ready=handle.ready,
-                thumbnail_url=handle.thumbnail_url or None,
-                thumbnail_handle=handle.thumbnail_handle or None,
-                width=handle.width or asset.width,
-                height=handle.height or asset.height,
             )
-        )
+            self.session.add(record)
+        record.media_asset_id = asset.id
+        record.kind = asset.kind
+        record.handle = handle.handle
+        record.ready = handle.ready
+        record.thumbnail_url = handle.thumbnail_url or None
+        record.thumbnail_handle = handle.thumbnail_handle or None
+        record.width = handle.width or asset.width
+        record.height = handle.height or asset.height
+        record.error = None
         self.session.flush()
         logger.info(
             "Uploaded %s asset %s to %s as %s",

@@ -57,8 +57,13 @@ def library_settings() -> Settings:
 
 
 def _client(handler, settings, **kw):
+    def authenticated(request):
+        assert request.headers["authorization"] == f"Bearer {settings.meta_access_token}"
+        assert "access_token" not in request.url.params
+        return handler(request)
+
     return AdLibraryClient(
-        settings, client=httpx.Client(transport=httpx.MockTransport(handler)), **kw
+        settings, client=httpx.Client(transport=httpx.MockTransport(authenticated)), **kw
     )
 
 
@@ -161,7 +166,7 @@ def test_results_are_parsed_and_paginated(library_settings):
                             "eu_total_reach": 55000,
                         }
                     ],
-                    "paging": {"next": "https://graph.facebook.com/v21.0/ads_archive?after=X"},
+                    "paging": {"next": "https://graph.facebook.com/v21.0/ads_archive?after=X&access_token=tok"},
                 },
             )
         return httpx.Response(200, json={"data": []})

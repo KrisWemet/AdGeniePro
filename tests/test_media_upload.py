@@ -51,8 +51,13 @@ def meta_settings() -> Settings:
 
 
 def _mock_meta(handler, settings) -> MetaAdsClient:
+    def authenticated(request):
+        assert request.headers["authorization"] == f"Bearer {settings.meta_access_token}"
+        assert "access_token" not in request.url.params
+        return handler(request)
+
     return MetaAdsClient(
-        settings, client=httpx.Client(transport=httpx.MockTransport(handler)),
+        settings, client=httpx.Client(transport=httpx.MockTransport(authenticated)),
         dry_run=False,
     )
 
@@ -439,6 +444,102 @@ def _asset(session, creative, path, content_hash, kind=MediaKind.IMAGE) -> Media
     return asset
 
 
+@pytest.mark.parametrize("dry_run_source", ["settings", "client"])
+@pytest.mark.parametrize("cached", [False, True])
+def test_dry_run_upload_never_calls_the_client_or_changes_cached_handles(
+    session, creative, image_file, settings, dry_run_source, cached, monkeypatch
+):
+    from unittest.mock import Mock
+
+    asset = _asset(session, creative, image_file, "a" * 64)
+    client = SandboxPlatform(Platform.META)
+    client.dry_run = dry_run_source == "client"
+    settings.dry_run = dry_run_source == "settings"
+    if cached:
+        session.add(PlatformAsset(
+            media_asset_id=asset.id, platform=Platform.META,
+            account_id=client.account_key, content_hash=asset.content_hash,
+            kind=MediaKind.VIDEO, handle="existing_video", ready=False,
+        ))
+        session.commit()
+    upload = Mock(wraps=client.upload_media)
+    refresh = Mock(wraps=client.refresh_media)
+    monkeypatch.setattr(client, "upload_media", upload)
+    monkeypatch.setattr(client, "refresh_media", refresh)
+
+    assert MediaUploader(session, settings).handles_for_creative(creative, client) == []
+    session.commit()
+    session.expire_all()
+
+    upload.assert_not_called()
+    refresh.assert_not_called()
+    assert session.query(PlatformAsset).count() == int(cached)
+    if cached:
+        record = session.query(PlatformAsset).one()
+        assert record.handle == "existing_video"
+        assert record.ready is False
+
+
+@pytest.mark.parametrize("dry_run_source", ["settings", "client"])
+def test_upload_route_previews_then_uploads_without_a_fake_cache_entry(
+    api_client, session, creative, image_file, settings, dry_run_source, monkeypatch
+):
+    from unittest.mock import Mock
+
+    from adgenie.core.orchestrator import Orchestrator
+
+    asset = _asset(session, creative, image_file, "a" * 64)
+    client = SandboxPlatform(Platform.META)
+    client.dry_run = dry_run_source == "client"
+    settings.dry_run = dry_run_source == "settings"
+    upload = Mock(wraps=client.upload_media)
+    monkeypatch.setattr(client, "upload_media", upload)
+    monkeypatch.setattr(Orchestrator, "client", lambda self, platform: client)
+
+    response = api_client.post(f"/api/media/upload/{creative.id}")
+
+    assert response.status_code == 200
+    preview = response.json()
+    assert preview["dry_run"] is True
+    assert preview["applied"] is False
+    assert preview["pending_asset_ids"] == [asset.id]
+    assert preview["uploaded"] == []
+    upload.assert_not_called()
+    assert session.query(PlatformAsset).count() == 0
+
+    settings.dry_run = False
+    client.dry_run = False
+    response = api_client.post(f"/api/media/upload/{creative.id}")
+
+    assert response.status_code == 200
+    result = response.json()
+    assert result["dry_run"] is False
+    assert result["applied"] is True
+    assert result["pending_asset_ids"] == []
+    assert len(result["uploaded"]) == 1
+    upload.assert_called_once()
+    session.expire_all()
+    record = session.query(PlatformAsset).one()
+    assert record.handle == result["uploaded"][0]["handle"]
+    assert not record.handle.startswith("dryrun_")
+    api_client.post(f"/api/media/upload/{creative.id}")
+    upload.assert_called_once()
+
+
+def test_a_simulated_upload_response_is_not_returned_or_persisted(
+    session, creative, image_file, settings, monkeypatch
+):
+    asset = _asset(session, creative, image_file, "a" * 64)
+    client = SandboxPlatform(Platform.META)
+    monkeypatch.setattr(
+        client, "upload_media", lambda upload: MediaHandle(kind="image", handle="dryrun_x")
+    )
+
+    assert MediaUploader(session, settings).ensure_uploaded(asset, client) is None
+    session.commit()
+    assert session.query(PlatformAsset).count() == 0
+
+
 def test_an_asset_is_uploaded_once_and_reused(session, creative, image_file, settings):
     """The same bytes going to the same account should cost one call."""
     sandbox = SandboxPlatform(Platform.META)
@@ -451,6 +552,73 @@ def test_an_asset_is_uploaded_once_and_reused(session, creative, image_file, set
     assert [h.handle for h in first] == [h.handle for h in second]
     assert sum(1 for c in sandbox.calls if c[0] == "upload_media") == 1
     assert session.query(PlatformAsset).count() == 1
+
+
+@pytest.mark.parametrize("stale_handle", ["dryrun_image_old", ""])
+def test_a_live_upload_replaces_a_dry_run_cache_row_in_place(
+    session, creative, image_file, meta_settings, stale_handle
+):
+    asset = _asset(session, creative, image_file, "a" * 64)
+    requests = []
+
+    def handler(request):
+        requests.append(request.url.path)
+        assert request.url.path.endswith("/adimages")
+        return httpx.Response(200, json={"images": {"image": {"hash": "live_hash"}}})
+
+    client = _mock_meta(handler, meta_settings)
+    record = PlatformAsset(
+        media_asset_id=asset.id, platform=Platform.META,
+        account_id=client.account_key, content_hash=asset.content_hash,
+        kind=MediaKind.IMAGE, handle=stale_handle, ready=False,
+        thumbnail_handle="dryrun_thumbnail", thumbnail_url="https://stale.test/thumb",
+    )
+    session.add(record)
+    session.commit()
+    record_id = record.id
+
+    uploader = MediaUploader(session, settings=meta_settings)
+    first = uploader.ensure_uploaded(asset, client)
+    session.commit()
+    session.expire_all()
+    second = uploader.ensure_uploaded(asset, client)
+
+    assert first.handle == second.handle == "live_hash"
+    assert len(requests) == 1
+    persisted = session.query(PlatformAsset).one()
+    assert persisted.id == record_id
+    assert persisted.handle == "live_hash"
+    assert persisted.ready is True
+    assert persisted.thumbnail_handle is None
+    assert persisted.thumbnail_url is None
+
+
+@pytest.mark.parametrize("file_present", [False, True])
+def test_an_unrecoverable_dry_run_cache_handle_is_never_reused(
+    session, creative, image_file, meta_settings, file_present
+):
+    path = image_file if file_present else image_file.with_name("missing.png")
+    asset = _asset(session, creative, path, "a" * 64)
+    requests = []
+
+    def handler(request):
+        requests.append(request.url.path)
+        assert request.url.path.endswith("/adimages")
+        return httpx.Response(400, json={"error": {"message": "upload rejected"}})
+
+    client = _mock_meta(handler, meta_settings)
+    session.add(PlatformAsset(
+        media_asset_id=asset.id, platform=Platform.META,
+        account_id=client.account_key, content_hash=asset.content_hash,
+        kind=MediaKind.IMAGE, handle="dryrun_old", ready=False,
+    ))
+    session.commit()
+
+    assert MediaUploader(session, meta_settings).handles_for_creative(creative, client) == []
+    session.commit()
+    session.expire_all()
+    assert len(requests) == int(file_present)
+    assert session.query(PlatformAsset).one().handle == "dryrun_old"
 
 
 def test_the_same_file_in_a_second_account_is_a_second_upload(

@@ -12,7 +12,7 @@ from ..config import get_settings
 from ..core.metrics import default_window
 from ..core.orchestrator import Orchestrator
 from ..platforms.base import PlatformError
-from ..db import get_session
+from ..db import get_session, lock_budget_mutations
 from ..models import (
     ActionStatus,
     AdGroup,
@@ -116,6 +116,7 @@ def approve_action(
     action_id: int, session: Session = Depends(get_session)
 ) -> ActionOut:
     """Approve and immediately apply a proposal that was held for review."""
+    lock_budget_mutations(session)
     action = session.get(OptimizationAction, action_id)
     if action is None:
         raise HTTPException(404, f"action {action_id} not found")
@@ -131,6 +132,7 @@ def approve_action(
             "DRY_RUN is on, so approving would change this database without "
             "changing the ad account. Set DRY_RUN=false first.",
         )
+    action.status = ActionStatus.APPROVED
     orchestrator = Orchestrator(session, settings=settings)
     applied = orchestrator.apply_action(action, actor="human")
     session.commit()
@@ -145,6 +147,7 @@ def reject_action(
     reason: str = Query(default=""),
     session: Session = Depends(get_session),
 ) -> ActionOut:
+    lock_budget_mutations(session)
     action = session.get(OptimizationAction, action_id)
     if action is None:
         raise HTTPException(404, f"action {action_id} not found")

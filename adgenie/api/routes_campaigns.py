@@ -12,7 +12,8 @@ from ..config import get_settings
 from ..core.launcher import CampaignLauncher, LaunchPlan
 from ..core.metrics import load_performance
 from ..core.orchestrator import Orchestrator
-from ..db import get_session
+from ..db import get_session, lock_budget_mutations
+from ..platforms.base import PlatformError
 from ..models import (
     AdGroup,
     Campaign,
@@ -136,15 +137,24 @@ def set_campaign_status(
     session: Session = Depends(get_session),
 ) -> dict:
     """Turn a campaign on or off, including on the ad platform itself."""
+    lock_budget_mutations(session)
     campaign = session.get(Campaign, campaign_id)
     if campaign is None:
         raise HTTPException(404, f"campaign {campaign_id} not found")
 
     settings = get_settings()
     if settings.dry_run:
-        return {"campaign_id": campaign_id, "status": campaign.status.value,
-                "requested_status": "active" if active else "paused",
-                "applied": False, "dry_run": True}
+        # The live adapter drops the mutation in a dry run. Recording the
+        # campaign as active anyway would show a running campaign that the ad
+        # account still has paused, and the optimizer would act on that.
+        return {
+            "campaign_id": campaign_id,
+            "status": campaign.status.value,
+            "requested_status": "active" if active else "paused",
+            "would_set": "active" if active else "paused",
+            "applied": False,
+            "dry_run": True,
+        }
     if active and campaign.external_id and campaign.external_id.startswith("dryrun_"):
         raise HTTPException(409, "Dry-run campaign has no real platform objects; create a new paused campaign")
     if active and settings.environment == "prod":
@@ -152,8 +162,16 @@ def set_campaign_status(
             raise HTTPException(409, "Create and inspect a real paused campaign before production activation")
         if errors := settings.production_errors():
             raise HTTPException(409, "; ".join(errors))
+
+    # Activating is a budget decision: this campaign joins the committed
+    # total, and it is checked here as well as in the optimizer so no API
+    # path can route around the global cap.
     orchestrator = Orchestrator(session, settings=settings)
     if active:
+        # Checked before the platform client is ever built, so a refusal
+        # costs no API call. `set_status` checks again under the budget lock
+        # and against the exact cascade; this one keeps the refusal cheap.
+        lock_budget_mutations(session)
         groups = list(session.scalars(select(AdGroup).where(AdGroup.campaign_id == campaign.id)))
         eligible = [g for g in groups if g.status in (EntityStatus.ACTIVE, EntityStatus.PAUSED)]
         target = max(campaign.daily_budget_micros, sum(g.daily_budget_micros for g in eligible))
@@ -163,32 +181,19 @@ def set_campaign_status(
                           sum(g.daily_budget_micros for g in groups if g.status is EntityStatus.ACTIVE))
         projected = orchestrator._committed_daily_micros() - current + target
         if projected > usd_to_micros(settings.global_daily_budget_cap_usd):
-            raise HTTPException(422, "Activating this campaign would exceed the global daily budget cap")
-    if campaign.external_id:
-        orchestrator.client(campaign.platform).set_status(
-            "campaign", campaign.external_id, active
-        )
-    campaign.status = EntityStatus.ACTIVE if active else EntityStatus.PAUSED
-
+            raise HTTPException(
+                422,
+                "global daily budget cap leaves insufficient headroom for activation",
+            )
     # Children follow the parent so the account state matches what is stored.
-    for group in session.execute(
-        select(AdGroup).where(AdGroup.campaign_id == campaign_id)
-    ).scalars():
-        if group.status in (EntityStatus.ACTIVE, EntityStatus.PAUSED):
-            group.status = EntityStatus.ACTIVE if active else EntityStatus.PAUSED
-            if group.external_id:
-                orchestrator.client(campaign.platform).set_status(
-                    "ad_group", group.external_id, active
-                )
-        for creative in session.execute(
-            select(Creative).where(Creative.ad_group_id == group.id)
-        ).scalars():
-            if creative.status in (EntityStatus.ACTIVE, EntityStatus.PAUSED):
-                creative.status = EntityStatus.ACTIVE if active else EntityStatus.PAUSED
-                if creative.external_id:
-                    orchestrator.client(campaign.platform).set_status(
-                        "creative", creative.external_id, active
-                    )
+    # A child the optimizer paused on its own merits — a losing creative, a
+    # throttled ad set — keeps that decision when the campaign is turned back
+    # on: reactivating it would re-fund a verdict the optimizer already made.
+    try:
+        orchestrator.set_status(campaign.platform, EntityLevel.CAMPAIGN, campaign, active)
+    except PlatformError as exc:
+        session.commit()
+        raise HTTPException(409, str(exc)) from exc
     session.commit()
     return {"campaign_id": campaign_id, "status": campaign.status.value, "applied": True}
 

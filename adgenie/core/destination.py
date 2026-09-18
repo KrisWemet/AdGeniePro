@@ -173,7 +173,7 @@ class DestinationMonitor:
         not the platform, not the database. A sweep run against live
         credentials must not be able to pause production by accident.
         """
-        apply = (not self.settings.dry_run) if apply is None else apply
+        apply = not self.settings.dry_run and apply is not False
         affected: list[int] = []
         for entry in summary.get("blocking", []):
             campaigns = list(

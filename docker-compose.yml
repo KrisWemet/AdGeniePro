@@ -1,0 +1,63 @@
+# One server: PostgreSQL, the API, and Caddy for HTTPS.
+# Fill in .env from deployment.env.example first. Only Caddy binds host ports.
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: adgenie
+      POSTGRES_USER: adgenie
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U adgenie -d adgenie"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      ENVIRONMENT: prod
+      DATABASE_URL: postgresql+psycopg2://adgenie:${POSTGRES_PASSWORD}@db:5432/adgenie
+      PUBLIC_BASE_URL: https://${TRACKING_HOST:?set TRACKING_HOST in .env}
+      MEDIA_STORAGE_DIR: /data/media
+    volumes:
+      - media:/data/media
+    expose:
+      - "8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      TRACKING_HOST: ${TRACKING_HOST}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  db-data:
+  media:
+  caddy-data:
+  caddy-config:

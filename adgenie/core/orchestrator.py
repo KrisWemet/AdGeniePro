@@ -22,6 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..config import Settings, get_settings
+from ..db import lock_budget_mutations
 from ..models import (
     ActionStatus,
     ActionType,
@@ -252,7 +253,7 @@ class Orchestrator:
         now: datetime | None = None,
     ) -> dict:
         lookback_days = lookback_days or self.settings.optimizer_lookback_days
-        apply = (not self.settings.dry_run) if apply is None else apply
+        apply = not self.settings.dry_run and apply is not False
         since, until = default_window(lookback_days, today)
 
         run_id = uuid.uuid4().hex[:16]
@@ -271,7 +272,7 @@ class Orchestrator:
         decisions: list[tuple[Decision, object]] = []
         decisions += self._evaluate_creatives(since, until, now)
         decisions += self._evaluate_ad_groups(since, until, now)
-        decisions += self._evaluate_segments(since, until)
+        decisions += self._evaluate_segments(since, until, now=now)
 
         actions: list[OptimizationAction] = []
         for decision, _entity in decisions:
@@ -471,7 +472,8 @@ class Orchestrator:
     }
 
     def _evaluate_segments(
-        self, since: date, until: date, dimension: str | None = None
+        self, since: date, until: date, dimension: str | None = None,
+        now: datetime | None = None,
     ) -> list[tuple[Decision, AdGroup]]:
         """Look inside each ad group for a segment that is wasting budget.
 
@@ -526,12 +528,13 @@ class Orchestrator:
             grouped = group_rows(rows)
             for group in platform_groups:
                 out += self._segment_decisions(
-                    group, grouped.get(group.external_id or "", []), slice_by
+                    group, grouped.get(group.external_id or "", []), slice_by, now=now
                 )
         return out
 
     def _segment_decisions(
-        self, group: AdGroup, rows: list, dimension: str
+        self, group: AdGroup, rows: list, dimension: str,
+        now: datetime | None = None,
     ) -> list[tuple[Decision, AdGroup]]:
         campaign = self.session.get(Campaign, group.campaign_id)
         offer = self.session.get(Offer, campaign.offer_id) if campaign else None
@@ -545,7 +548,9 @@ class Orchestrator:
             return []
 
         report = analyse_segments(
-            rows, EntityLevel.AD_GROUP, group.id, dimension, payout
+            rows, EntityLevel.AD_GROUP, group.id, dimension, payout,
+            lag_model=self._lag_for_entity(EntityLevel.AD_GROUP, group.id),
+            as_of=now,
         )
         return [
             (
@@ -633,7 +638,17 @@ class Orchestrator:
         actor: str = "optimizer",
         now: datetime | None = None,
     ) -> bool:
-        entity = self.session.get(_LEVEL_TO_ATTR[action.level], action.entity_id)
+        if self.settings.dry_run:
+            action.error = "DRY_RUN: action was not applied"
+            return False
+        lock_budget_mutations(self.session)
+        if action.status not in (ActionStatus.PROPOSED, ActionStatus.APPROVED):
+            return False
+        if action.applied_at is not None:
+            action.error = "action has already been applied"
+            return False
+        model = _LEVEL_TO_ATTR.get(action.level)
+        entity = self.session.get(model, action.entity_id) if model else None
         if entity is None:
             action.status = ActionStatus.FAILED
             action.error = "entity no longer exists"
@@ -644,10 +659,17 @@ class Orchestrator:
             # Resolving the parent chain can fail on an orphaned row, so it has
             # to sit inside the guard or it would abort the whole run.
             platform = self._platform_of(action.level, entity)
+            if getattr(self.client(platform), "dry_run", False):
+                action.error = "DRY_RUN: platform client cannot apply this action"
+                return False
+            self._validate_action(action, entity)
+            if action.requires_approval and action.status is not ActionStatus.APPROVED:
+                action.error = "approval required before applying this action"
+                return False
             if action.action is ActionType.PAUSE:
-                self._set_status(platform, action.level, entity, active=False)
+                self.set_status(platform, action.level, entity, active=False)
             elif action.action is ActionType.RESUME:
-                self._set_status(platform, action.level, entity, active=True)
+                self.set_status(platform, action.level, entity, active=True)
             elif action.action in (
                 ActionType.INCREASE_BUDGET,
                 ActionType.DECREASE_BUDGET,
@@ -688,6 +710,7 @@ class Orchestrator:
             return False
 
         action.status = ActionStatus.APPLIED
+        action.error = None
         action.applied_at = now or datetime.now(timezone.utc)
         self.session.add(
             AuditLog(
@@ -703,6 +726,102 @@ class Orchestrator:
         )
         self.session.flush()
         return True
+
+    def _current_budget(self, entity) -> int:
+        if isinstance(entity, AdGroup) and not entity.daily_budget_micros:
+            campaign = self.session.get(Campaign, entity.campaign_id)
+            return campaign.daily_budget_micros if campaign else 0
+        return getattr(entity, "daily_budget_micros", 0)
+
+    def _validate_action(self, action: OptimizationAction, entity) -> None:
+        budget_action = action.action in (
+            ActionType.INCREASE_BUDGET, ActionType.DECREASE_BUDGET
+        )
+        if budget_action and isinstance(entity, Creative):
+            raise PlatformError("cannot set a budget on an individual ad", code="INVALID_LEVEL")
+        if action.action is ActionType.RESUME:
+            eligible = entity.status is EntityStatus.PAUSED
+            if isinstance(entity, Creative) and entity.compliance_verdict not in (
+                ComplianceVerdict.PASS, ComplianceVerdict.WARN
+            ):
+                eligible = False
+        else:
+            eligible = entity.status is EntityStatus.ACTIVE
+        if not eligible:
+            raise PlatformError("entity status is not eligible for this action", code="INELIGIBLE")
+        campaign = entity if isinstance(entity, Campaign) else None
+        if isinstance(entity, Creative):
+            group = self.session.get(AdGroup, entity.ad_group_id)
+            if group is None or group.status is not EntityStatus.ACTIVE:
+                raise PlatformError("parent ad group is not active", code="INELIGIBLE")
+            campaign = self.session.get(Campaign, group.campaign_id)
+        elif isinstance(entity, AdGroup):
+            campaign = self.session.get(Campaign, entity.campaign_id)
+        if not isinstance(entity, Campaign) and campaign.status is not EntityStatus.ACTIVE:
+            raise PlatformError("parent campaign is not active", code="INELIGIBLE")
+        if budget_action:
+            current = self._current_budget(entity)
+            target = int(action.payload["to_micros"])
+            if target <= 0:
+                raise PlatformError("daily budget must be positive", code="INVALID_BUDGET")
+            if (action.action is ActionType.INCREASE_BUDGET and target <= current) or (
+                action.action is ActionType.DECREASE_BUDGET and target >= current
+            ):
+                raise PlatformError("stale budget proposal: target no longer matches direction", code="STALE")
+            if abs(target - current) > int(self.settings.auto_apply_budget_ceiling_usd * 1_000_000):
+                action.requires_approval = True
+        if action.action is ActionType.REALLOCATE:
+            if not isinstance(entity, Campaign):
+                raise PlatformError("reallocation requires a campaign", code="INVALID_LEVEL")
+            changes = []
+            for group_id, amount in action.payload.get("allocation_micros", {}).items():
+                group = self.session.get(AdGroup, int(group_id))
+                if group is None or group.campaign_id != entity.id or group.status is not EntityStatus.ACTIVE:
+                    raise PlatformError("reallocation contains an ineligible ad group", code="INELIGIBLE")
+                amount = int(amount)
+                if amount <= 0 or (group.max_daily_budget_micros and amount > group.max_daily_budget_micros):
+                    raise PlatformError("invalid ad group budget", code="INVALID_BUDGET")
+                changes.append((group, amount))
+            moved = sum(abs(amount - group.daily_budget_micros) for group, amount in changes)
+            if moved > int(self.settings.auto_apply_budget_ceiling_usd * 1_000_000):
+                action.requires_approval = True
+            before = self._committed_daily_micros()
+            originals = [(group, group.daily_budget_micros) for group, _ in changes]
+            try:
+                for group, amount in changes:
+                    group.daily_budget_micros = amount
+                self.session.flush()
+                after = self._committed_daily_micros()
+                self._validate_entity_caps()
+            finally:
+                for group, amount in originals:
+                    group.daily_budget_micros = amount
+                self.session.flush()
+            if after > max(before, int(self.settings.global_daily_budget_cap_usd * 1_000_000)):
+                raise PlatformError("global daily budget cap prevents reallocation", code="BUDGET_CAP")
+        if action.action is ActionType.EXCLUDE_SEGMENT:
+            action.requires_approval = True
+            marker = f"{action.payload['dimension']}:{action.payload['segment']}"
+            if marker in entity.targeting.get("excluded_segments", []):
+                raise PlatformError("segment already excluded", code="DUPLICATE")
+        previous = self.session.execute(
+            select(OptimizationAction.applied_at)
+            .where(
+                OptimizationAction.level == action.level,
+                OptimizationAction.entity_id == action.entity_id,
+                OptimizationAction.id != action.id,
+                OptimizationAction.status == ActionStatus.APPLIED,
+                # A proposal created earlier that was applied since this one
+                # was drafted supersedes it; the reverse order is not stale.
+                OptimizationAction.applied_at >= action.created_at,
+            )
+            .limit(1)
+        ).scalar_one_or_none()
+        if previous is not None:
+            raise PlatformError(
+                "stale proposal: a newer action on this entity was already applied",
+                code="STALE",
+            )
 
     def _platform_of(self, level: EntityLevel, entity) -> Platform:
         if level is EntityLevel.CAMPAIGN:
@@ -728,12 +847,91 @@ class Orchestrator:
             )
         return campaign.platform
 
-    def _set_status(
+    def set_status(
         self, platform: Platform, level: EntityLevel, entity, active: bool
     ) -> None:
-        if entity.external_id:
-            self.client(platform).set_status(level.value, entity.external_id, active)
-        entity.status = EntityStatus.ACTIVE if active else EntityStatus.PAUSED
+        if self.settings.dry_run or getattr(self.client(platform), "dry_run", False):
+            raise PlatformError("DRY_RUN: status was not changed", code="DRY_RUN")
+        lock_budget_mutations(self.session)
+        if entity.status not in (EntityStatus.ACTIVE, EntityStatus.PAUSED):
+            raise PlatformError("entity status is not eligible for activation", code="INELIGIBLE")
+        changes = [(level, entity)]
+        if isinstance(entity, Campaign):
+            for group in self.session.scalars(select(AdGroup).where(AdGroup.campaign_id == entity.id)):
+                if group.status not in (EntityStatus.ACTIVE, EntityStatus.PAUSED):
+                    continue
+                if active and not self._cascade_eligible(EntityLevel.AD_GROUP, group):
+                    continue
+                changes.append((EntityLevel.AD_GROUP, group))
+                for creative in self.session.scalars(select(Creative).where(Creative.ad_group_id == group.id)):
+                    if creative.status not in (EntityStatus.ACTIVE, EntityStatus.PAUSED):
+                        continue
+                    if active and not self._cascade_eligible(EntityLevel.CREATIVE, creative):
+                        continue
+                    changes.append((EntityLevel.CREATIVE, creative))
+        if active:
+            if isinstance(entity, Creative) and entity.compliance_verdict not in (
+                ComplianceVerdict.PASS, ComplianceVerdict.WARN
+            ):
+                raise PlatformError("creative is not compliant", code="INELIGIBLE")
+            originals = [(child, child.status) for _, child in changes]
+            try:
+                for _, child in changes:
+                    child.status = EntityStatus.ACTIVE
+                self.session.flush()
+                if self._committed_daily_micros() > int(self.settings.global_daily_budget_cap_usd * 1_000_000):
+                    raise PlatformError("global daily budget cap leaves insufficient headroom for activation", code="BUDGET_CAP")
+                self._validate_entity_caps()
+            finally:
+                for child, status in originals:
+                    child.status = status
+                self.session.flush()
+        for child_level, child in changes:
+            target = EntityStatus.ACTIVE if active else EntityStatus.PAUSED
+            if child.status is target:
+                continue
+            if child.external_id:
+                self.client(platform).set_status(child_level.value, child.external_id, active)
+            child.status = target
+            self.session.add(AuditLog(
+                actor="status_control", platform=platform,
+                operation="resume" if active else "pause",
+                target=f"{child_level.value}:{child.id}",
+                request={}, response={"pause_source": "direct" if child is entity else "cascade"},
+                ok=True, dry_run=False,
+            ))
+            self.session.flush()
+
+    def _cascade_eligible(self, level: EntityLevel, entity) -> bool:
+        if isinstance(entity, Creative) and entity.compliance_verdict not in (
+            ComplianceVerdict.PASS, ComplianceVerdict.WARN
+        ):
+            return False
+        if entity.status is EntityStatus.ACTIVE:
+            return True
+        if entity.last_error:
+            return False
+        latest = self.session.scalars(
+            select(AuditLog).where(
+                AuditLog.target == f"{level.value}:{entity.id}",
+                AuditLog.operation.in_(("pause", "resume")),
+                AuditLog.ok.is_(True), AuditLog.dry_run.is_(False),
+            ).order_by(AuditLog.id.desc()).limit(1)
+        ).first()
+        return latest is None or (
+            latest.operation == "pause" and latest.response.get("pause_source") == "cascade"
+        )
+
+    def _validate_entity_caps(self) -> None:
+        for campaign in self.session.scalars(select(Campaign).where(Campaign.status == EntityStatus.ACTIVE)):
+            groups = list(self.session.scalars(select(AdGroup).where(
+                AdGroup.campaign_id == campaign.id, AdGroup.status == EntityStatus.ACTIVE,
+            )))
+            commitment = max(campaign.daily_budget_micros, sum(g.daily_budget_micros for g in groups))
+            if campaign.max_daily_budget_micros and commitment > campaign.max_daily_budget_micros:
+                raise PlatformError("campaign maximum budget exceeded", code="BUDGET_CAP")
+            if any(g.max_daily_budget_micros and g.daily_budget_micros > g.max_daily_budget_micros for g in groups):
+                raise PlatformError("ad group maximum budget exceeded", code="BUDGET_CAP")
 
     def _set_budget(
         self, platform: Platform, action: OptimizationAction, entity
@@ -751,8 +949,8 @@ class Orchestrator:
         # push total committed daily spend past the global cap. The comparison
         # is on the *increase*, not the entity's new absolute budget, because
         # the money it already spends is part of the committed total either way.
-        if action.action is ActionType.INCREASE_BUDGET:
-            current = int(action.payload["from_micros"])
+        current = self._current_budget(entity)
+        if target > current:
             headroom = self._budget_headroom_micros()
             delta = target - current
             if delta > headroom:
@@ -772,6 +970,30 @@ class Orchestrator:
         if cap and target > cap:
             target = cap
 
+        if target <= 0 or (target <= current and action.action is ActionType.INCREASE_BUDGET):
+            raise PlatformError("entity maximum leaves no headroom to scale", code="BUDGET_CAP")
+        campaign = entity if isinstance(entity, Campaign) else self.session.get(Campaign, entity.campaign_id)
+        originals = [(entity, entity.daily_budget_micros)]
+        campaign_target = None
+        if isinstance(entity, AdGroup) and platform is Platform.GOOGLE:
+            campaign_target = campaign.daily_budget_micros + target - current
+            if campaign.max_daily_budget_micros and campaign_target > campaign.max_daily_budget_micros:
+                raise PlatformError("campaign maximum budget exceeded", code="BUDGET_CAP")
+            originals.append((campaign, campaign.daily_budget_micros))
+        before = self._committed_daily_micros()
+        try:
+            entity.daily_budget_micros = target
+            if campaign_target is not None:
+                campaign.daily_budget_micros = campaign_target
+            self.session.flush()
+            if self._committed_daily_micros() > max(before, int(self.settings.global_daily_budget_cap_usd * 1_000_000)):
+                raise PlatformError("global daily budget cap prevents budget change", code="BUDGET_CAP")
+            self._validate_entity_caps()
+        finally:
+            for item, amount in originals:
+                item.daily_budget_micros = amount
+            self.session.flush()
+
         if action.level is EntityLevel.AD_GROUP and platform is Platform.GOOGLE:
             # Google holds the budget on the campaign, shared by every ad group
             # under it. Writing this ad group's new amount onto the campaign
@@ -784,10 +1006,7 @@ class Orchestrator:
                     platform=platform,
                     code="NOT_FOUND",
                 )
-            # The baseline is the decision's own `from_micros`, not the ad
-            # group's stored budget: under campaign budget optimisation that is
-            # zero, which would turn a 20% step into the entire target amount.
-            delta = target - int(action.payload["from_micros"])
+            delta = target - current
             campaign_target = max(1, campaign.daily_budget_micros + delta)
             if campaign.max_daily_budget_micros:
                 campaign_target = min(campaign_target, campaign.max_daily_budget_micros)
@@ -1099,7 +1318,7 @@ class Orchestrator:
         offer = self.session.get(Offer, offer_id)
         if offer is None:
             raise PlatformError(f"offer {offer_id} not found", code="NOT_FOUND")
-        apply = (not self.settings.dry_run) if apply is None else apply
+        apply = not self.settings.dry_run and apply is not False
         plan = analyse_rotation(self.session, offer, policy=policy, now=now)
 
         paused: list[int] = []
@@ -1205,7 +1424,10 @@ class Orchestrator:
 
         allocation = action.payload.get("allocation_micros", {})
         applied: dict[str, int] = {}
-        for group_id, budget_micros in allocation.items():
+        for group_id, budget_micros in sorted(
+            allocation.items(),
+            key=lambda item: int(item[1]) - self.session.get(AdGroup, int(item[0])).daily_budget_micros,
+        ):
             group = self.session.get(AdGroup, int(group_id))
             if group is None or group.campaign_id != entity.id:
                 continue
@@ -1241,7 +1463,8 @@ class Orchestrator:
             "ad_group", since, until, dimension, [group.external_id]
         )
         return analyse_segments(
-            rows, EntityLevel.AD_GROUP, group.id, dimension, payout
+            rows, EntityLevel.AD_GROUP, group.id, dimension, payout,
+            lag_model=self._lag_for_entity(EntityLevel.AD_GROUP, group.id),
         ).as_dict()
 
     def rebalance_ad_group(self, ad_group_id: int, since: date, until: date) -> dict:

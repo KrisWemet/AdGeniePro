@@ -19,6 +19,16 @@ from adgenie.core.stats import (
 )
 
 
+@pytest.mark.parametrize("successes,trials", [(12, 4), (12.5, 4.5), (4, 0), (0, 0), (-2, -5)])
+def test_multistep_funnel_sales_cannot_abort_the_comparison(successes, trials):
+    probability = prob_b_beats_a(successes, trials, 3, 10, rng=random.Random(11))
+    expected = prob_b_beats_a(
+        max(0, successes), max(0, successes, trials), 3, 10, rng=random.Random(11)
+    )
+    assert 0 <= probability <= 1
+    assert probability == expected
+
+
 def test_beta_cdf_uniform_case():
     # Beta(1, 1) is the uniform distribution, so its CDF is the identity.
     for x in (0.0, 0.1, 0.25, 0.5, 0.75, 0.99, 1.0):

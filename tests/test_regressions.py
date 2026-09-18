@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 from datetime import date, datetime, time, timedelta, timezone
 
 import httpx
@@ -30,6 +31,7 @@ from adgenie.models import (
     ActionType,
     AdGroup,
     Campaign,
+    ComplianceVerdict,
     Conversion,
     ConversionStatus,
     Creative,
@@ -40,6 +42,7 @@ from adgenie.models import (
     Platform,
 )
 from adgenie.money import usd_to_micros
+from tests.test_portfolio import _campaign
 from adgenie.platforms.base import AdGroupSpec, CampaignSpec, CreativeSpec, PlatformError
 from adgenie.platforms.google import GoogleAdsClient
 from adgenie.platforms.meta import MetaAdsClient
@@ -979,6 +982,7 @@ def test_global_cap_still_clamps_an_increase_that_exceeds_it(
     )
     session.add(action)
     session.flush()
+    action.status = ActionStatus.APPROVED
 
     assert orchestrator.apply_action(action) is True
     assert campaign.daily_budget_micros == usd_to_micros(100)
@@ -1435,6 +1439,14 @@ def test_an_offer_with_no_payout_is_not_killed_on_a_fabricated_interval():
     decision = Optimizer(OptimizerPolicy()).evaluate(w)
     assert decision.action is ActionType.NO_ACTION
     assert decision.rule == "no_payout_configured"
+
+
+def test_zero_matured_clicks_do_not_turn_into_evidence_against_a_young_ad():
+    window = _window(1000, 0, 1000, budget_usd=25)
+    window.effective_clicks = 0.0
+    window.maturity = 0.0
+    assert window.trials() == 0.0
+    assert window.cvr_interval().mean == pytest.approx(0.5)
 
 
 def test_payout_falls_back_to_observed_revenue_per_conversion():
@@ -2290,3 +2302,720 @@ def test_a_landing_page_needs_only_the_postback_secret(api_client, settings):
 
     # The configuration surface still requires the admin key.
     assert api_client.get("/api/funnel/leads").status_code == 401
+
+
+# --- gates and caps -----------------------------------------------------------
+
+
+def _meta_budget_setup(session, offer, budgets):
+    """One Meta campaign whose ad groups carry the given budgets."""
+    campaign = Campaign(
+        offer_id=offer.id, platform=Platform.META, name="m", external_id="c",
+        daily_budget_micros=0, status=EntityStatus.ACTIVE,
+    )
+    session.add(campaign)
+    session.flush()
+    groups = []
+    for i, budget in enumerate(budgets):
+        group = AdGroup(
+            campaign_id=campaign.id, name=f"g{i}", external_id=f"a{i}",
+            daily_budget_micros=usd_to_micros(budget), status=EntityStatus.ACTIVE,
+        )
+        session.add(group)
+        groups.append(group)
+    session.commit()
+    return campaign, groups
+
+
+def test_an_unapproved_action_is_refused_centrally(session, settings, offer):
+    """requires_approval is a gate in apply_action, not a hint for callers.
+
+    An action flagged for approval used to apply wherever apply_action was
+    called, so any caller that never read the flag bypassed the human.
+    """
+    campaign, groups = _meta_budget_setup(session, offer, [400])
+    orchestrator = Orchestrator(
+        session, settings=settings, platform_clients={Platform.META: _NullPlatform()}
+    )
+    action = OptimizationAction(
+        level=EntityLevel.AD_GROUP, entity_id=groups[0].id,
+        action=ActionType.INCREASE_BUDGET, rule="scale_winner", reason="t",
+        payload={"from_micros": usd_to_micros(400), "to_micros": usd_to_micros(460)},
+    )
+    session.add(action)
+    session.flush()
+
+    assert orchestrator.apply_action(action) is False
+    assert "approval" in action.error
+    assert groups[0].daily_budget_micros == usd_to_micros(400)
+    assert action.status is ActionStatus.PROPOSED
+
+
+def test_an_action_flagged_for_approval_is_refused_even_when_pre_approved_is_absent(
+    session, settings, offer
+):
+    """The flag set on the action itself cannot be argued away downstream."""
+    campaign, groups = _meta_budget_setup(session, offer, [400])
+    orchestrator = Orchestrator(
+        session, settings=settings, platform_clients={Platform.META: _NullPlatform()}
+    )
+    action = OptimizationAction(
+        level=EntityLevel.AD_GROUP, entity_id=groups[0].id,
+        action=ActionType.INCREASE_BUDGET, rule="scale_winner", reason="t",
+        requires_approval=True,
+        payload={"from_micros": usd_to_micros(400), "to_micros": usd_to_micros(420)},
+    )
+    session.add(action)
+    session.flush()
+
+    assert orchestrator.apply_action(action) is False
+    assert "approval" in action.error
+
+
+def test_the_approve_endpoint_applies_an_action_held_for_review(
+    api_client, session, settings
+):
+    """A proposal flagged for approval applies exactly through approval.
+
+    The endpoint builds its own orchestrator and platform client, so the
+    entity has to exist on the platform the way the API creates it. The
+    expected budget is captured before approving: the session expires and
+    re-reads the row the mutation changed, so reading it afterwards would
+    compare the new value against itself plus five dollars.
+    """
+    created = api_client.post(
+        "/api/offers",
+        json={
+            "name": "CalmLeaf Sleep Support",
+            "destination_url": "https://offer.test/calmleaf",
+            "payout_usd": 40.0,
+        },
+    ).json()
+    launched = api_client.post(
+        "/api/campaigns/launch",
+        json={
+            "offer_id": created["id"], "platform": "meta",
+            "daily_budget_usd": 20.0, "angle_count": 1, "start_paused": False,
+        },
+    ).json()
+    session.expire_all()
+    group = session.get(AdGroup, launched["ad_group_ids"][0])
+    initial = group.daily_budget_micros
+    target = initial + usd_to_micros(5)
+
+    action = OptimizationAction(
+        level=EntityLevel.AD_GROUP, entity_id=group.id,
+        action=ActionType.INCREASE_BUDGET, rule="scale_winner", reason="t",
+        requires_approval=True,
+        payload={"from_micros": initial, "to_micros": target},
+    )
+    session.add(action)
+    session.commit()
+
+    body = api_client.post(f"/api/optimizer/actions/{action.id}/approve").json()
+    assert body["status"] == "applied"
+    session.expire_all()
+    assert session.get(AdGroup, group.id).daily_budget_micros == target
+
+
+def test_a_stale_budget_proposal_is_refused(session, settings, offer):
+    """A proposal drafted against yesterday's budget must not apply today.
+
+    The delta was computed from `from_micros` when the proposal was made; if
+    the stored budget has moved since, that delta is no longer the decision
+    anyone reviewed. The action is refused rather than re-based silently.
+    """
+    campaign, groups = _meta_budget_setup(session, offer, [200])
+    orchestrator = Orchestrator(
+        session, settings=settings, platform_clients={Platform.META: _NullPlatform()}
+    )
+    action = OptimizationAction(
+        level=EntityLevel.AD_GROUP, entity_id=groups[0].id,
+        action=ActionType.INCREASE_BUDGET, rule="scale_winner", reason="t",
+        payload={"from_micros": usd_to_micros(150), "to_micros": usd_to_micros(180)},
+    )
+    session.add(action)
+    session.flush()
+    # The budget moved after the proposal was drafted.
+    groups[0].daily_budget_micros = usd_to_micros(220)
+    session.commit()
+
+    action.status = ActionStatus.APPROVED
+    assert orchestrator.apply_action(action) is False
+    assert "stale" in action.error.lower()
+    assert groups[0].daily_budget_micros == usd_to_micros(220)
+
+
+def test_the_global_cap_is_measured_against_the_current_budget_not_the_proposal(
+    session, settings, offer
+):
+    """A proposal whose from_micros is stale would compute the wrong delta.
+
+    $450 is committed. The proposal says from $150 to $400, but the group
+    already spends $450 — reading the proposal's baseline would see a $250
+    rise against $50 of headroom and refuse; reading the live budget sees the
+    group is already at its number and the increase is $0.
+    """
+    settings.global_daily_budget_cap_usd = 500.0
+    campaign = Campaign(
+        offer_id=offer.id, platform=Platform.META, name="m", external_id="c",
+        daily_budget_micros=0, status=EntityStatus.ACTIVE,
+    )
+    session.add(campaign)
+    session.flush()
+    group = AdGroup(
+        campaign_id=campaign.id, name="g", external_id="a",
+        daily_budget_micros=usd_to_micros(450), status=EntityStatus.ACTIVE,
+    )
+    session.add(group)
+    session.commit()
+
+    orchestrator = Orchestrator(
+        session, settings=settings, platform_clients={Platform.META: _NullPlatform()}
+    )
+    action = OptimizationAction(
+        level=EntityLevel.AD_GROUP, entity_id=group.id,
+        action=ActionType.INCREASE_BUDGET, rule="scale_winner", reason="t",
+        payload={"from_micros": usd_to_micros(150), "to_micros": usd_to_micros(400)},
+    )
+    session.add(action)
+    session.flush()
+    action.status = ActionStatus.APPROVED
+
+    # from_micros is stale by $300; the current budget says no increase at all.
+    assert orchestrator.apply_action(action) is False
+    assert "stale" in action.error.lower()
+    assert group.daily_budget_micros == usd_to_micros(450)
+
+
+def test_an_applied_action_cannot_be_replayed(session, settings, offer):
+    """A second call on an applied action must move nothing twice."""
+    campaign, groups = _meta_budget_setup(session, offer, [100])
+    orchestrator = Orchestrator(
+        session, settings=settings, platform_clients={Platform.META: _NullPlatform()}
+    )
+    action = OptimizationAction(
+        level=EntityLevel.AD_GROUP, entity_id=groups[0].id,
+        action=ActionType.INCREASE_BUDGET, rule="scale_winner", reason="t",
+        payload={"from_micros": usd_to_micros(100), "to_micros": usd_to_micros(120)},
+    )
+    session.add(action)
+    session.flush()
+    action.status = ActionStatus.APPROVED
+
+    assert orchestrator.apply_action(action) is True
+    assert groups[0].daily_budget_micros == usd_to_micros(120)
+
+    applied_at = action.applied_at
+    assert orchestrator.apply_action(action) is False
+    assert groups[0].daily_budget_micros == usd_to_micros(120)
+    assert action.applied_at == applied_at
+
+
+def test_a_rejected_action_is_not_reapplied(session, settings, offer):
+    """A human said no; apply_action must not relitigate that."""
+    campaign, groups = _meta_budget_setup(session, offer, [100])
+    orchestrator = Orchestrator(
+        session, settings=settings, platform_clients={Platform.META: _NullPlatform()}
+    )
+    action = OptimizationAction(
+        level=EntityLevel.AD_GROUP, entity_id=groups[0].id,
+        action=ActionType.INCREASE_BUDGET, rule="scale_winner", reason="t",
+        payload={"from_micros": usd_to_micros(100), "to_micros": usd_to_micros(120)},
+    )
+    session.add(action)
+    session.flush()
+    action.status = ActionStatus.REJECTED
+
+    assert orchestrator.apply_action(action) is False
+    assert groups[0].daily_budget_micros == usd_to_micros(100)
+
+
+def test_dry_run_injected_client_refuses_a_mutation(session, settings, offer):
+    """A client that is itself in dry run must not become a mutation path."""
+    campaign, groups = _meta_budget_setup(session, offer, [100])
+
+    class DryClient:
+        platform = Platform.META
+        dry_run = True
+
+        def set_budget(self, *a, **k):  # pragma: no cover - must not be reached
+            raise AssertionError("a dry-run client was used to change a budget")
+
+    orchestrator = Orchestrator(
+        session, settings=settings, platform_clients={Platform.META: DryClient()}
+    )
+    action = OptimizationAction(
+        level=EntityLevel.AD_GROUP, entity_id=groups[0].id,
+        action=ActionType.INCREASE_BUDGET, rule="scale_winner", reason="t",
+        payload={"from_micros": usd_to_micros(100), "to_micros": usd_to_micros(120)},
+    )
+    session.add(action)
+    session.flush()
+    action.status = ActionStatus.APPROVED
+
+    assert orchestrator.apply_action(action) is False
+    assert "DRY_RUN" in action.error
+    assert groups[0].daily_budget_micros == usd_to_micros(100)
+
+
+def test_resume_of_a_compliant_paused_creative_still_applies(
+    session, settings, offer
+):
+    """The eligibility gate must not block the ordinary resume path."""
+    campaign = Campaign(
+        offer_id=offer.id, platform=Platform.META, name="m", external_id="c",
+        status=EntityStatus.ACTIVE,
+    )
+    session.add(campaign)
+    session.flush()
+    group = AdGroup(campaign_id=campaign.id, name="g", external_id="a",
+                    status=EntityStatus.ACTIVE)
+    session.add(group)
+    session.flush()
+    creative = Creative(
+        ad_group_id=group.id, name="ad", external_id="x",
+        compliance_verdict=ComplianceVerdict.PASS,
+        status=EntityStatus.PAUSED,
+    )
+    session.add(creative)
+    session.commit()
+
+    orchestrator = Orchestrator(
+        session, settings=settings, platform_clients={Platform.META: _NullPlatform()}
+    )
+    action = OptimizationAction(
+        level=EntityLevel.CREATIVE, entity_id=creative.id,
+        action=ActionType.RESUME, rule="resume", reason="t",
+    )
+    session.add(action)
+    session.flush()
+
+    assert orchestrator.apply_action(action) is True
+    assert creative.status is EntityStatus.ACTIVE
+
+
+def test_resume_does_not_reactivate_a_compliance_blocked_creative(
+    session, settings, offer
+):
+    """A blocked ad must not be turned back on by a resume action."""
+    campaign = Campaign(
+        offer_id=offer.id, platform=Platform.META, name="m", external_id="c",
+        status=EntityStatus.ACTIVE,
+    )
+    session.add(campaign)
+    session.flush()
+    group = AdGroup(campaign_id=campaign.id, name="g", external_id="a",
+                    status=EntityStatus.ACTIVE)
+    session.add(group)
+    session.flush()
+    creative = Creative(
+        ad_group_id=group.id, name="ad", external_id="x",
+        compliance_verdict=ComplianceVerdict.BLOCK,
+        status=EntityStatus.PAUSED,
+    )
+    session.add(creative)
+    session.commit()
+
+    orchestrator = Orchestrator(
+        session, settings=settings, platform_clients={Platform.META: _NullPlatform()}
+    )
+    action = OptimizationAction(
+        level=EntityLevel.CREATIVE, entity_id=creative.id,
+        action=ActionType.RESUME, rule="resume", reason="t",
+    )
+    session.add(action)
+    session.flush()
+
+    assert orchestrator.apply_action(action) is False
+    assert creative.status is EntityStatus.PAUSED
+
+
+def test_activation_refuses_when_headroom_is_insufficient(api_client, session, settings):
+    """The API activation path is gated by the same global cap as the optimizer."""
+    created = api_client.post(
+        "/api/offers",
+        json={
+            "name": "CalmLeaf Sleep Support",
+            "destination_url": "https://offer.test/calmleaf",
+            "payout_usd": 40.0,
+        },
+    ).json()
+    launched = api_client.post(
+        "/api/campaigns/launch",
+        json={
+            "offer_id": created["id"], "platform": "meta",
+            "daily_budget_usd": 20.0, "angle_count": 1,
+        },
+    ).json()
+    campaign_id = launched["campaign_id"]
+    settings.global_daily_budget_cap_usd = 10.0
+
+    response = api_client.post(f"/api/campaigns/{campaign_id}/status?active=true")
+    # 422, matching the activation cap refusal the preflight suite pins.
+    assert response.status_code == 422
+    assert "headroom" in response.json()["detail"]
+
+    detail = api_client.get(f"/api/campaigns/{campaign_id}").json()
+    assert detail["campaign"]["status"] == "paused"
+
+
+def test_reactivating_a_campaign_keeps_an_optimizer_paused_loser_paused(
+    api_client, session, settings
+):
+    """Turning a campaign back on must not re-fund a verdict the optimizer made.
+
+    A creative the optimizer paused for losing money stays paused; a sibling
+    that was paused only because the campaign came down follows it back up.
+    """
+    created = api_client.post(
+        "/api/offers",
+        json={
+            "name": "CalmLeaf Sleep Support",
+            "destination_url": "https://offer.test/calmleaf",
+            "payout_usd": 40.0,
+        },
+    ).json()
+    launched = api_client.post(
+        "/api/campaigns/launch",
+        json={
+            "offer_id": created["id"], "platform": "meta",
+            "daily_budget_usd": 20.0, "angle_count": 1,
+        },
+    ).json()
+    campaign_id = launched["campaign_id"]
+    creative_id = launched["creative_ids"][0]
+
+    # One loser the optimizer paused on its merits, left with a reason.
+    assert api_client.post(f"/api/campaigns/{campaign_id}/status?active=true").status_code == 200
+    session.expire_all()
+    loser = session.get(Creative, creative_id)
+    action = OptimizationAction(
+        level=EntityLevel.CREATIVE, entity_id=loser.id,
+        action=ActionType.PAUSE, rule="kill_loser", reason="unprofitable",
+    )
+    session.add(action)
+    assert Orchestrator(session, settings=settings).apply_action(action)
+    assert loser.last_error is None
+    session.commit()
+
+    api_client.post(f"/api/campaigns/{campaign_id}/status?active=false")
+    api_client.post(f"/api/campaigns/{campaign_id}/status?active=true")
+
+    session.expire_all()
+    assert session.get(Creative, creative_id).status is EntityStatus.PAUSED
+    detail = api_client.get(f"/api/campaigns/{campaign_id}").json()
+    assert detail["campaign"]["status"] == "active"
+
+
+def test_reactivating_a_campaign_follows_children_that_were_only_caught_in_the_sweep(
+    api_client, session, settings
+):
+    """A child paused merely because its parent went down comes back with it."""
+    created = api_client.post(
+        "/api/offers",
+        json={
+            "name": "CalmLeaf Sleep Support",
+            "destination_url": "https://offer.test/calmleaf",
+            "payout_usd": 40.0,
+        },
+    ).json()
+    launched = api_client.post(
+        "/api/campaigns/launch",
+        json={
+            "offer_id": created["id"], "platform": "meta",
+            "daily_budget_usd": 20.0, "angle_count": 1,
+        },
+    ).json()
+    campaign_id = launched["campaign_id"]
+    creative_id = launched["creative_ids"][0]
+
+    api_client.post(f"/api/campaigns/{campaign_id}/status?active=false")
+    session.expire_all()
+    assert session.get(Creative, creative_id).status is EntityStatus.PAUSED
+
+    api_client.post(f"/api/campaigns/{campaign_id}/status?active=true")
+    session.expire_all()
+    assert session.get(Creative, creative_id).status is EntityStatus.ACTIVE
+
+
+def test_a_portfolio_plan_over_the_cap_is_refused(session, offer, settings):
+    """apply() is a second gate; plan() clamping is not the only defence."""
+    from adgenie.core.portfolio import (
+        OfferAllocation,
+        PortfolioPlan,
+        PortfolioAllocator,
+    )
+
+    allocator = PortfolioAllocator(session, settings=settings)
+    plan = PortfolioPlan(
+        total_micros=usd_to_micros(settings.global_daily_budget_cap_usd + 100),
+        allocations=[
+            OfferAllocation(
+                offer_id=1, name="x", verdict="fund", reason="t",
+                current_micros=0,
+                target_micros=usd_to_micros(settings.global_daily_budget_cap_usd),
+            )
+        ],
+    )
+    class Exploding:
+        def client(self, platform):  # pragma: no cover - must never be called
+            raise AssertionError("a refused plan reached the platform")
+
+    result = allocator.apply(plan, orchestrator=Exploding(), apply=True)
+    assert result["applied"] is False
+    assert "cap" in result["error"]
+
+
+@pytest.mark.parametrize("campaign_status", [EntityStatus.ACTIVE, EntityStatus.PAUSED])
+def test_campaign_activation_counts_the_complete_cascade(session, settings, offer, monkeypatch, campaign_status):
+    from adgenie.api import routes_campaigns
+    from fastapi import HTTPException
+    from unittest.mock import Mock
+
+    campaign, groups = _meta_budget_setup(session, offer, [600])
+    campaign.status = campaign_status
+    groups[0].status = EntityStatus.PAUSED
+    session.commit()
+    client = Mock(dry_run=False)
+    monkeypatch.setattr(routes_campaigns, "get_settings", lambda: settings)
+    monkeypatch.setattr(Orchestrator, "client", lambda *args: client)
+    with pytest.raises(HTTPException, match="headroom"):
+        routes_campaigns.set_campaign_status(campaign.id, True, session)
+    assert client.mock_calls == []
+    assert groups[0].status is EntityStatus.PAUSED
+    assert campaign.status is campaign_status
+
+
+@pytest.mark.parametrize("level", [EntityLevel.AD_GROUP, EntityLevel.CREATIVE])
+def test_child_resume_checks_existing_global_exposure(session, settings, offer, level):
+    from unittest.mock import Mock
+
+    campaign, groups = _meta_budget_setup(session, offer, [600])
+    entity = groups[0]
+    if level is EntityLevel.CREATIVE:
+        entity = Creative(ad_group_id=groups[0].id, status=EntityStatus.PAUSED,
+                          compliance_verdict=ComplianceVerdict.PASS, external_id="ad")
+        session.add(entity)
+    else:
+        entity.status = EntityStatus.PAUSED
+    session.commit()
+    client = Mock(dry_run=False)
+    action = OptimizationAction(level=level, entity_id=entity.id, action=ActionType.RESUME)
+    session.add(action)
+    runner = Orchestrator(session, settings=settings, platform_clients={Platform.META: client})
+    assert not runner.apply_action(action)
+    assert "cap" in action.error
+    assert client.mock_calls == []
+
+
+@pytest.mark.parametrize("budget,success", [(2, False), (3, True)])
+def test_meta_launch_budget_floor_is_checked_before_platform_calls(session, settings, offer, budget, success):
+    from adgenie.core.launcher import CampaignLauncher, LaunchPlan
+    from unittest.mock import Mock
+
+    client = Mock(wraps=SandboxPlatform(Platform.META), dry_run=False)
+    result = CampaignLauncher(session, settings=settings, platform_client=client).launch(
+        LaunchPlan(offer_id=offer.id, platform=Platform.META, daily_budget_usd=budget, angle_count=3)
+    )
+    assert result.ok is success
+    if success:
+        assert len(result.ad_group_ids) == 3
+        assert [call.args[0].daily_budget_micros for call in client.create_ad_group.call_args_list] == [1_000_000] * 3
+    else:
+        assert client.mock_calls == []
+        assert "minimum" in result.errors[0]
+
+
+def test_budget_lock_refreshes_stale_entities_and_keeps_pending_actions(tmp_path, settings):
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+    from adgenie.db import Base
+    from adgenie.models import Offer
+    from unittest.mock import Mock
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'budget.db'}")
+    Base.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as first, Session(engine) as second:
+        offer = Offer(name="offer", destination_url="https://offer.test")
+        first.add(offer)
+        first.flush()
+        campaign = Campaign(offer_id=offer.id, platform=Platform.META, name="campaign",
+                            status=EntityStatus.ACTIVE, daily_budget_micros=usd_to_micros(100))
+        first.add(campaign)
+        first.commit()
+        other = second.get(Campaign, campaign.id)
+        other.daily_budget_micros = usd_to_micros(400)
+        second.commit()
+        assert campaign.daily_budget_micros == usd_to_micros(100)
+        action = OptimizationAction(level=EntityLevel.CAMPAIGN, entity_id=campaign.id,
+                                    action=ActionType.INCREASE_BUDGET,
+                                    payload={"from_micros": usd_to_micros(100), "to_micros": usd_to_micros(120)})
+        first.add(action)
+        runner = Orchestrator(first, settings=settings, platform_clients={Platform.META: Mock(dry_run=False)})
+        assert not runner.apply_action(action)
+        assert campaign.daily_budget_micros == usd_to_micros(400)
+        assert action.id is not None
+        assert action.status is ActionStatus.FAILED
+        assert "stale" in action.error
+    engine.dispose()
+
+
+def test_a_pending_optimization_action_survives_a_budget_lock_refresh(tmp_path, settings):
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+    from adgenie.db import Base
+    from adgenie.models import Offer
+    from unittest.mock import Mock
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'pending.db'}")
+    Base.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as first:
+        offer = Offer(name="offer", destination_url="https://offer.test")
+        first.add(offer)
+        first.flush()
+        campaign = Campaign(offer_id=offer.id, platform=Platform.META, name="campaign",
+                            status=EntityStatus.ACTIVE, daily_budget_micros=usd_to_micros(100))
+        first.add(campaign)
+        first.commit()
+        action = OptimizationAction(level=EntityLevel.CAMPAIGN, entity_id=campaign.id,
+                                    action=ActionType.INCREASE_BUDGET,
+                                    payload={"from_micros": usd_to_micros(100), "to_micros": usd_to_micros(120)})
+        first.add(action)
+        first.flush()
+        runner = Orchestrator(first, settings=settings, platform_clients={Platform.META: Mock(dry_run=False)})
+        assert runner.apply_action(action)
+        assert first.get(OptimizationAction, action.id).status is ActionStatus.APPLIED
+        assert campaign.daily_budget_micros == usd_to_micros(120)
+    engine.dispose()
+
+
+def test_portfolio_plan_excluding_untouched_campaigns_cannot_overcommit(session, settings, offer):
+    from adgenie.core.portfolio import PortfolioAllocator, PortfolioPlan, OfferAllocation
+    from adgenie.models import Offer
+    from unittest.mock import Mock
+
+    untouched = _meta_budget_setup(session, offer, [300])[0]
+    other = Offer(name="planned", destination_url="https://offer.test")
+    session.add(other)
+    session.flush()
+    planned = _campaign(session, other, "planned", 100)
+    plan = PortfolioPlan(total_micros=usd_to_micros(500), allocations=[
+        OfferAllocation(other.id, "planned", "fund", "test", usd_to_micros(100), usd_to_micros(300)),
+    ])
+    client = Mock(dry_run=False)
+    runner = Orchestrator(session, settings=settings, platform_clients={Platform.META: client})
+    result = PortfolioAllocator(session, settings=settings).apply(plan, orchestrator=runner)
+    assert result["applied"] is False
+    assert "cap" in result["error"]
+    assert client.mock_calls == []
+    assert runner._committed_daily_micros() == usd_to_micros(400)
+    assert planned.daily_budget_micros == usd_to_micros(100)
+    assert untouched.status is EntityStatus.ACTIVE
+
+
+@pytest.mark.parametrize("reduction", ["applied", "failed", "approval"])
+def test_a_portfolio_plan_reduces_before_it_increases(session, settings, offer, reduction):
+    from adgenie.core.portfolio import PortfolioAllocator, PortfolioPlan, OfferAllocation
+    from adgenie.models import Offer
+    from unittest.mock import Mock
+
+    other = Offer(name="other", destination_url="https://offer.test")
+    session.add(other)
+    session.flush()
+    rich = _campaign(session, offer, "rich", 400)
+    poor = _campaign(session, other, "poor", 100)
+    settings.auto_apply_budget_ceiling_usd = 50 if reduction == "approval" else 500
+    plan = PortfolioPlan(usd_to_micros(500), [
+        OfferAllocation(other.id, "poor", "fund", "grow", usd_to_micros(100), usd_to_micros(150)),
+        OfferAllocation(offer.id, "rich", "fund", "reduce", usd_to_micros(400), usd_to_micros(300)),
+    ])
+    client = Mock(dry_run=False)
+    calls = []
+    def set_budget(level, external_id, amount):
+        calls.append((external_id, amount))
+        if reduction == "failed" and external_id == rich.external_id:
+            raise PlatformError("reduction failed")
+    client.set_budget.side_effect = set_budget
+    runner = Orchestrator(session, settings=settings, platform_clients={Platform.META: client})
+    result = PortfolioAllocator(session, settings=settings).apply(plan, orchestrator=runner)
+    assert runner._committed_daily_micros() <= usd_to_micros(500)
+    if reduction == "applied":
+        assert result["applied"] is True
+        assert calls == [(rich.external_id, usd_to_micros(300)), (poor.external_id, usd_to_micros(150))]
+        assert poor.daily_budget_micros == usd_to_micros(150)
+    else:
+        assert result["applied"] is False
+        assert poor.daily_budget_micros == usd_to_micros(100)
+        assert rich.daily_budget_micros == usd_to_micros(400)
+        assert calls == ([(rich.external_id, usd_to_micros(300))] if reduction == "failed" else [])
+        if reduction == "approval":
+            action = session.scalars(select(OptimizationAction).where(OptimizationAction.entity_id == rich.id)).one()
+            assert action.status is ActionStatus.PROPOSED
+            assert action.requires_approval
+
+
+def test_portfolio_budget_moves_are_recorded_as_reviewable_actions(session, settings, offer):
+    from adgenie.core.portfolio import PortfolioAllocator, PortfolioPlan, OfferAllocation
+    from unittest.mock import Mock
+
+    campaign = _campaign(session, offer, "meta", 100)
+    campaign.max_daily_budget_micros = usd_to_micros(150)
+    session.commit()
+    client = Mock(dry_run=False)
+    runner = Orchestrator(session, settings=settings, platform_clients={Platform.META: client})
+    plan = PortfolioPlan(usd_to_micros(500), [
+        OfferAllocation(offer.id, offer.name, "fund", "winner", usd_to_micros(100), usd_to_micros(300)),
+    ])
+    result = PortfolioAllocator(session, settings=settings).apply(plan, orchestrator=runner, apply=True)
+    assert result["applied"] is False
+    assert client.mock_calls == []
+    assert campaign.daily_budget_micros == usd_to_micros(100)
+    action = session.scalars(select(OptimizationAction)).one()
+    assert action.status is ActionStatus.PROPOSED
+    assert action.requires_approval
+    action.status = ActionStatus.APPROVED
+    assert runner.apply_action(action)
+    assert campaign.daily_budget_micros == usd_to_micros(150)
+    client.set_budget.assert_called_once_with("campaign", campaign.external_id, usd_to_micros(150))
+
+
+def test_portfolio_plan_includes_active_campaigns_of_inactive_offers(session, settings, offer):
+    from adgenie.core.portfolio import PortfolioAllocator
+
+    campaign = _campaign(session, offer, "active", 300)
+    offer.status = EntityStatus.PAUSED
+    session.commit()
+    plan = PortfolioAllocator(session, settings=settings).plan(
+        date(2026, 3, 1), date(2026, 3, 1), total_micros=usd_to_micros(1000),
+        check_creative_supply=False,
+    )
+    assert plan.total_micros == usd_to_micros(500)
+    assert len(plan.allocations) == 1
+    assert plan.allocations[0].offer_id == offer.id
+    assert plan.allocations[0].current_micros == campaign.daily_budget_micros
+
+
+@pytest.mark.parametrize("platform", [Platform.META, Platform.GOOGLE])
+def test_group_budget_changes_honor_the_parent_campaign_maximum(session, settings, offer, platform):
+    from unittest.mock import Mock
+
+    campaign, groups = _meta_budget_setup(session, offer, [100])
+    campaign.platform = platform
+    campaign.max_daily_budget_micros = usd_to_micros(150)
+    if platform is Platform.GOOGLE:
+        campaign.daily_budget_micros = usd_to_micros(100)
+    session.commit()
+    client = Mock(dry_run=False)
+    action = OptimizationAction(
+        level=EntityLevel.AD_GROUP, entity_id=groups[0].id,
+        action=ActionType.INCREASE_BUDGET, status=ActionStatus.APPROVED,
+        payload={"to_micros": usd_to_micros(200)},
+    )
+    session.add(action)
+    runner = Orchestrator(session, settings=settings, platform_clients={platform: client})
+    assert not runner.apply_action(action)
+    assert "maximum" in action.error
+    assert client.mock_calls == []
+    assert groups[0].daily_budget_micros == usd_to_micros(100)
+

@@ -41,6 +41,7 @@ from ..models import (
 )
 from ..money import micros_to_usd, safe_div
 from .angles import ANGLES, angles_for, get_angle
+from .lag import MIN_MATURITY_TO_JUDGE, LagModel, fit_lag_model
 from .stats import beta_interval, prob_b_beats_a
 
 # Verdicts that mean the angle is genuinely earning its place. "last_resort"
@@ -112,10 +113,16 @@ class AngleStat:
     verdict: str = "hold"
     reason: str = ""
     rest_until: date | None = None
+    delivered_creative_ids: list[int] | None = None
+    effective_clicks: float | None = None
+    maturity: float = 1.0
+
+    def trials(self) -> float:
+        return self.effective_clicks if self.effective_clicks is not None else self.clicks * self.maturity
 
     @property
     def executions(self) -> int:
-        return len(self.creative_ids)
+        return len(self.creative_ids if self.delivered_creative_ids is None else self.delivered_creative_ids)
 
     @property
     def ctr(self) -> float:
@@ -277,10 +284,13 @@ def analyse_rotation(
     policy: RotationPolicy | None = None,
     now: datetime | None = None,
     opening_days: int = 7,
+    lag_model: LagModel | None = None,
 ) -> RotationPlan:
     """Decide, per angle, whether to keep it, rest it, or stop using it."""
     policy = policy or RotationPolicy()
-    today = (now or datetime.now(timezone.utc)).date()
+    now = now or datetime.now(timezone.utc)
+    today = now.date()
+    lag_model = lag_model or fit_lag_model(session, offer.id, as_of=now)
     plan = RotationPlan(offer_id=offer.id, offer_name=offer.name)
 
     creatives = _creatives_for_offer(session, offer.id)
@@ -290,6 +300,14 @@ def analyse_rotation(
             continue
         by_angle.setdefault(creative.angle, []).append(creative)
 
+    delivered_ids = set(session.execute(
+        select(MetricSnapshot.entity_id).where(
+            MetricSnapshot.level == EntityLevel.CREATIVE,
+            MetricSnapshot.entity_id.in_([c.id for c in creatives]),
+            MetricSnapshot.impressions > 0,
+            MetricSnapshot.day <= today,
+        ).distinct()
+    ).scalars())
     stats: list[AngleStat] = []
     for key, members in sorted(by_angle.items()):
         angle = get_angle(key)
@@ -297,11 +315,15 @@ def analyse_rotation(
             key=key,
             name=angle.name,
             creative_ids=[c.id for c in members],
+            delivered_creative_ids=[c.id for c in members if c.id in delivered_ids],
             live_creative_ids=[
                 c.id for c in members if c.status is EntityStatus.ACTIVE
             ],
         )
-        days = _delivery_by_day(session, stat.creative_ids)
+        days = [row for row in _delivery_by_day(session, stat.creative_ids) if row[0] <= today]
+        daily_clicks = [(row[0], row[2]) for row in days]
+        stat.effective_clicks = lag_model.effective_clicks(daily_clicks, now)
+        stat.maturity = lag_model.window_maturity(daily_clicks, now)
         stat.impressions = sum(row[1] for row in days)
         stat.clicks = sum(row[2] for row in days)
         stat.spend_micros = sum(row[3] for row in days)
@@ -339,18 +361,20 @@ def _judge(stats: list[AngleStat], policy: RotationPolicy, today: date) -> None:
     tested = max(1, len(stats))
     adjusted = 1.0 - (1.0 - policy.confidence) / tested
 
-    total_clicks = sum(s.clicks for s in stats)
-    total_conversions = sum(s.conversions for s in stats)
+    mature = [s for s in stats if s.maturity >= MIN_MATURITY_TO_JUDGE]
+    total_clicks = sum(s.trials() for s in mature)
+    total_conversions = sum(s.conversions for s in mature)
 
     for stat in stats:
         # Compared against its peers pooled, leaving itself out. Pooling over a
         # group that includes this angle shrinks it toward its own result and
         # makes a bad angle look like the average it is dragging down.
-        peer_clicks = total_clicks - stat.clicks
+        peer_clicks = total_clicks - stat.trials()
         peer_conversions = total_conversions - stat.conversions
-        if peer_clicks > 0 and stat.clicks > 0:
+        stat.prob_worse = 0.0
+        if stat.maturity >= MIN_MATURITY_TO_JUDGE and peer_clicks > 0 and stat.trials() > 0:
             stat.prob_worse = prob_b_beats_a(
-                stat.conversions, stat.clicks, peer_conversions, peer_clicks
+                stat.conversions, stat.trials(), peer_conversions, peer_clicks
             )
 
         resting_until = (
@@ -360,7 +384,8 @@ def _judge(stats: list[AngleStat], policy: RotationPolicy, today: date) -> None:
         )
         judged = (
             stat.executions >= policy.min_executions_to_judge
-            and stat.clicks >= policy.min_clicks_to_judge
+            and stat.trials() >= policy.min_clicks_to_judge
+            and stat.maturity >= MIN_MATURITY_TO_JUDGE
         )
 
         if judged and stat.prob_worse >= adjusted:
@@ -402,10 +427,12 @@ def _judge(stats: list[AngleStat], policy: RotationPolicy, today: date) -> None:
                     f"{policy.min_executions_to_judge - stat.executions} more "
                     f"execution(s)"
                 )
-            if stat.clicks < policy.min_clicks_to_judge:
+            if stat.trials() < policy.min_clicks_to_judge:
                 missing.append(
-                    f"{policy.min_clicks_to_judge - stat.clicks} more clicks"
+                    f"{policy.min_clicks_to_judge - stat.trials():.0f} more matured clicks"
                 )
+            if stat.maturity < MIN_MATURITY_TO_JUDGE:
+                missing.append("the conversion window to mature")
             stat.reason = (
                 "Not enough evidence to judge the argument rather than the ad: "
                 "needs " + " and ".join(missing) + "."
@@ -413,7 +440,7 @@ def _judge(stats: list[AngleStat], policy: RotationPolicy, today: date) -> None:
         else:
             stat.verdict = "scale"
             interval = beta_interval(
-                stat.conversions, stat.clicks, policy.credible_level
+                stat.conversions, stat.trials(), policy.credible_level
             )
             stat.reason = (
                 f"Converting at {stat.cvr:.2%} (90% range "

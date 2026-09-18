@@ -20,7 +20,7 @@ import logging
 import time
 from datetime import date
 from pathlib import Path
-from urllib.parse import parse_qsl, urlparse
+from urllib.parse import parse_qsl, quote, quote_plus, urlparse
 
 import httpx
 
@@ -89,6 +89,9 @@ class MetaAdsClient(AdPlatform):
     def _url(self, path: str) -> str:
         return f"{GRAPH_BASE}/{self.api_version}/{path.lstrip('/')}"
 
+    def _redact(self, value):
+        return _redact_token(value, self.settings.meta_access_token)
+
     def _request(
         self,
         method: str,
@@ -100,12 +103,19 @@ class MetaAdsClient(AdPlatform):
     ) -> dict:
         payload = dict(data or {})
         query = dict(params or {})
-        query["access_token"] = self.settings.meta_access_token
+        query.pop("access_token", None)
+        headers = {"Authorization": f"Bearer {self.settings.meta_access_token or ''}"}
 
         if self.dry_run and method.upper() == "POST":
             self.calls.append((f"DRY {method} {path}", payload))
-            logger.info("[dry-run] meta %s %s %s", method, path, _preview(payload))
-            return {"id": f"dryrun_{abs(hash(json.dumps(payload, sort_keys=True, default=str))) % 10**12}"}
+            logger.info(
+                "[dry-run] meta %s %s %s", method, self._redact(path),
+                _preview(self._redact(payload)),
+            )
+            digest = hashlib.sha256(
+                json.dumps(payload, sort_keys=True, default=str).encode()
+            ).hexdigest()
+            return {"id": f"dryrun_{int(digest, 16) % 10**12}"}
 
         last_error: PlatformError | None = None
         for attempt in range(4):
@@ -115,11 +125,12 @@ class MetaAdsClient(AdPlatform):
                     self._url(path),
                     data=payload or None,
                     params=query,
+                    headers=headers,
                     files=files or None,
                 )
             except httpx.HTTPError as exc:
                 last_error = PlatformError(
-                    f"network error calling Meta: {exc}",
+                    f"network error calling Meta: {self._redact(str(exc))}",
                     platform=self.platform,
                     retryable=True,
                 )
@@ -135,10 +146,11 @@ class MetaAdsClient(AdPlatform):
         raise last_error  # pragma: no cover - loop always raises or returns
 
     def _to_error(self, response: httpx.Response) -> PlatformError:
+        text = self._redact(response.text)
         try:
-            body = response.json()
+            body = self._redact(response.json())
         except ValueError:
-            body = {"error": {"message": response.text[:500]}}
+            body = {"error": {"message": text[:500]}}
         err = body.get("error", {}) if isinstance(body, dict) else {}
         code = err.get("code")
         retryable = (
@@ -148,7 +160,7 @@ class MetaAdsClient(AdPlatform):
         )
         return PlatformError(
             f"Meta API error {response.status_code}: "
-            f"{err.get('message', response.text[:300])}",
+            f"{err.get('message', text[:300])}",
             platform=self.platform,
             code=code or response.status_code,
             retryable=retryable,
@@ -401,7 +413,7 @@ class MetaAdsClient(AdPlatform):
             # that failed to "upload" would make every dry-run launch report
             # media it could not attach.
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
-            logger.info("[dry-run] meta upload %s %s", upload.kind, name)
+            logger.info("[dry-run] meta upload %s %s", upload.kind, self._redact(name))
             return MediaHandle(
                 kind=upload.kind,
                 handle=f"dryrun_{digest[:24]}",
@@ -438,6 +450,7 @@ class MetaAdsClient(AdPlatform):
         if entry is None and body.get("hash"):
             entry = body
         if not entry or not entry.get("hash"):
+            body = self._redact(body)
             raise PlatformError(
                 f"Meta accepted the image but returned no hash: {_preview(body)}",
                 platform=self.platform,
@@ -460,6 +473,7 @@ class MetaAdsClient(AdPlatform):
         )
         video_id = str(body.get("id") or "")
         if not video_id:
+            body = self._redact(body)
             raise PlatformError(
                 f"Meta accepted the video but returned no id: {_preview(body)}",
                 platform=self.platform,
@@ -482,8 +496,9 @@ class MetaAdsClient(AdPlatform):
             if phase == "ready":
                 return True
             if phase == "error":
+                body = self._redact(body)
                 raise PlatformError(
-                    f"Meta could not process video {video_id}: {_preview(body)}",
+                    f"Meta could not process video {self._redact(video_id)}: {_preview(body)}",
                     platform=self.platform,
                     code="VIDEO_PROCESSING_FAILED",
                     payload=body,
@@ -495,7 +510,7 @@ class MetaAdsClient(AdPlatform):
                 logger.warning(
                     "Video %s is still processing after %ss; it is uploaded but "
                     "not usable yet.",
-                    video_id,
+                    self._redact(video_id),
                     VIDEO_READY_TIMEOUT_SECONDS,
                 )
                 return False
@@ -879,6 +894,22 @@ class MetaAdsClient(AdPlatform):
             "timezone": body.get("timezone_name"),
             "dry_run": self.dry_run,
         }
+
+
+def _redact_token(value, token: str | None):
+    if isinstance(value, str):
+        if token:
+            for secret in {token, quote(token, safe=""), quote_plus(token)}:
+                value = value.replace(secret, "[REDACTED]")
+        return value
+    if isinstance(value, dict):
+        return {
+            _redact_token(key, token): _redact_token(item, token)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_token(item, token) for item in value]
+    return value
 
 
 def _preview(payload: dict) -> str:

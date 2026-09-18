@@ -19,11 +19,12 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timezone
 
 from ..models import EntityLevel
 from ..money import micros_to_usd, safe_div
 from ..platforms.base import BreakdownRow
+from .lag import MIN_MATURITY_TO_JUDGE, LagModel
 from .stats import beta_interval, prob_b_beats_a
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,8 @@ class SegmentStat:
     share_of_spend: float = 0.0
     verdict: str = "keep"
     reason: str = ""
+    effective_clicks: float = 0.0
+    maturity: float = 1.0
 
     @property
     def cvr(self) -> float:
@@ -120,6 +123,8 @@ def analyse_segments(
     confidence: float = 0.95,
     max_exclusions: int = 2,
     keep_minimum_segments: int = 2,
+    lag_model: LagModel | None = None,
+    as_of: datetime | None = None,
 ) -> SegmentReport:
     """Decide which segments, if any, are worth cutting.
 
@@ -132,6 +137,8 @@ def analyse_segments(
       how many segments were examined;
     * and it must not be the last one standing.
     """
+    lag_model = lag_model or LagModel()
+    as_of = as_of or datetime.now(timezone.utc)
     by_segment: dict[str, SegmentStat] = {}
     for row in rows:
         stat = by_segment.get(row.segment)
@@ -142,6 +149,7 @@ def analyse_segments(
             by_segment[row.segment] = stat
         stat.impressions += row.impressions
         stat.clicks += row.clicks
+        stat.effective_clicks += row.clicks * lag_model.maturity_for_day(row.day, as_of)
         stat.spend_micros += row.spend_micros
         stat.conversions += row.conversions
 
@@ -152,8 +160,11 @@ def analyse_segments(
         return report
 
     total_spend = sum(s.spend_micros for s in stats)
-    total_clicks = sum(s.clicks for s in stats)
-    total_conversions = sum(s.conversions for s in stats)
+    for stat in stats:
+        stat.maturity = stat.effective_clicks / stat.clicks if stat.clicks else 1.0
+    mature = [s for s in stats if s.maturity >= MIN_MATURITY_TO_JUDGE]
+    total_clicks = sum(s.effective_clicks for s in mature)
+    total_conversions = sum(s.conversions for s in mature)
     report.total_spend_micros = total_spend
 
     for stat in stats:
@@ -161,11 +172,13 @@ def analyse_segments(
         # Compared against everything else pooled, not against the best
         # performer: the question is whether this segment drags the entity down,
         # not whether it is the strongest.
-        rest_clicks = total_clicks - stat.clicks
+        if stat.maturity < MIN_MATURITY_TO_JUDGE:
+            continue
+        rest_clicks = total_clicks - stat.effective_clicks
         rest_conversions = total_conversions - stat.conversions
-        if stat.clicks and rest_clicks:
+        if stat.effective_clicks > 0 and rest_clicks > 0:
             stat.prob_worse = prob_b_beats_a(
-                stat.conversions, stat.clicks, rest_conversions, rest_clicks
+                stat.conversions, stat.effective_clicks, rest_conversions, rest_clicks
             )
 
     # With N segments examined, the chance of one looking bad by luck grows with
@@ -176,10 +189,14 @@ def analyse_segments(
 
     candidates: list[SegmentStat] = []
     for stat in sorted(stats, key=lambda s: s.wasted_micros, reverse=True):
-        if stat.clicks < min_clicks:
+        if stat.maturity < MIN_MATURITY_TO_JUDGE:
+            stat.verdict = "keep"
+            stat.reason = "Conversion window has not matured; awaiting sales."
+            continue
+        if stat.effective_clicks < min_clicks:
             stat.verdict = "keep"
             stat.reason = (
-                f"Only {stat.clicks} clicks; too little to tell it apart from "
+                f"Only {stat.effective_clicks:.0f} matured clicks; too little to tell it apart from "
                 "the rest."
             )
             continue
@@ -199,12 +216,12 @@ def analyse_segments(
             )
             continue
 
-        lower_bound = beta_interval(stat.conversions, stat.clicks, 0.9).upper
+        lower_bound = beta_interval(stat.conversions, stat.effective_clicks, 0.9).upper
         stat.verdict = "exclude"
         stat.reason = (
             f"Takes {stat.share_of_spend:.0%} of spend at a "
             f"{stat.cvr:.2%} conversion rate against "
-            f"{safe_div(total_conversions - stat.conversions, total_clicks - stat.clicks):.2%} "
+            f"{safe_div(total_conversions - stat.conversions, total_clicks - stat.effective_clicks):.2%} "
             f"elsewhere, {stat.prob_worse:.0%} likely to be genuinely worse. "
             f"Roughly {micros_to_usd(stat.wasted_micros):.2f} USD lost here; its "
             f"conversion rate is below {lower_bound:.2%} with 95% confidence."

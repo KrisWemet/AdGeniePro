@@ -99,6 +99,87 @@ def test_launch_writes_an_audit_trail(launched, session):
     assert operations.count("create_creative") == 3
 
 
+@pytest.mark.parametrize("platform", [Platform.META, Platform.GOOGLE])
+@pytest.mark.parametrize("start_paused", [True, False])
+@pytest.mark.parametrize("dry_run_source", ["settings", "client"])
+def test_dry_run_launch_keeps_drafts_separate_from_a_later_live_launch(
+    session, offer, settings, platform, start_paused, dry_run_source, tmp_path,
+    monkeypatch,
+):
+    from unittest.mock import Mock
+
+    from adgenie.models import MediaAsset, PlatformAsset
+
+    client = SandboxPlatform(platform)
+    client.dry_run = dry_run_source == "client"
+    settings.dry_run = dry_run_source == "settings"
+    settings.media_storage_dir = str(tmp_path / "media")
+    mutations = []
+    for name in ("create_campaign", "create_ad_group", "create_creative", "upload_media"):
+        mutation = Mock(wraps=getattr(client, name))
+        monkeypatch.setattr(client, name, mutation)
+        mutations.append(mutation)
+    launcher = CampaignLauncher(session, settings=settings, platform_client=client)
+    plan = LaunchPlan(
+        offer_id=offer.id, platform=platform, daily_budget_usd=20.0,
+        angle_count=1, start_paused=start_paused, generate_media=True,
+    )
+
+    preview = launcher.launch(plan)
+    session.expire_all()
+
+    assert preview.ok and not preview.errors
+    assert preview.dry_run and not preview.applied
+    assert preview.campaign_external_id is None
+    assert preview.as_dict()["launched"] == 0
+    assert preview.as_dict()["drafted"] == len(preview.creative_ids) == 1
+    assert preview.as_dict()["applied"] is False
+    for mutation in mutations:
+        mutation.assert_not_called()
+    drafts = (
+        [session.get(Campaign, preview.campaign_id)]
+        + [session.get(AdGroup, gid) for gid in preview.ad_group_ids]
+        + [session.get(Creative, cid) for cid in preview.creative_ids]
+    )
+    assert all(row.status is EntityStatus.DRAFT for row in drafts)
+    assert all(row.external_id is None for row in drafts)
+    creative = session.get(Creative, preview.creative_ids[0])
+    assert creative.headlines and creative.final_url and creative.compliance_report
+    audits = session.query(AuditLog).all()
+    assert len(audits) == 3
+    assert all(row.dry_run for row in audits)
+    assert all(row.response["external_id"] is None for row in audits)
+    assert all(row.response["status"] == "draft" for row in audits)
+    assert session.query(PlatformAsset).count() == 0
+    if platform is Platform.META:
+        assert preview.media_asset_ids
+        assert session.query(MediaAsset).count() == len(preview.media_asset_ids)
+
+    settings.dry_run = False
+    client.dry_run = False
+    live = launcher.launch(plan)
+    session.expire_all()
+
+    assert live.applied and not live.dry_run and not live.errors
+    assert live.campaign_id != preview.campaign_id
+    assert live.campaign_external_id in client.entities
+    assert live.as_dict()["launched"] == 1
+    assert live.as_dict()["drafted"] == 0
+    for model, ids in (
+        (Campaign, [live.campaign_id]),
+        (AdGroup, live.ad_group_ids),
+        (Creative, live.creative_ids),
+    ):
+        for entity_id in ids:
+            row = session.get(model, entity_id)
+            assert row.external_id in client.entities
+            assert row.status is (
+                EntityStatus.PAUSED if start_paused else EntityStatus.ACTIVE
+            )
+    assert all(row.status is EntityStatus.DRAFT for row in drafts)
+    assert all(row.external_id is None for row in drafts)
+
+
 def test_launch_starts_paused_by_default(session, offer, settings, sandbox_meta):
     result = CampaignLauncher(
         session, settings=settings, platform_client=sandbox_meta
@@ -108,10 +189,12 @@ def test_launch_starts_paused_by_default(session, offer, settings, sandbox_meta)
     assert session.get(Campaign, result.campaign_id).status is EntityStatus.PAUSED
 
 
+@pytest.mark.parametrize("dry_run", [False, True])
 def test_blocked_copy_never_reaches_the_platform(
-    session, offer, settings, sandbox_meta
+    session, offer, settings, sandbox_meta, dry_run
 ):
     """A policy-violating creative is stored for review, not launched."""
+    settings.dry_run = dry_run
 
     class BlockedGenerator:
         name = "stub"
@@ -384,7 +467,7 @@ def test_applying_actions_reaches_the_platform_and_the_database(
 def test_a_paused_creative_stops_delivering(simulated, session, sandbox_meta):
     orchestrator, _, until = simulated
     creative = session.execute(select(Creative)).scalars().first()
-    orchestrator._set_status(Platform.META, EntityLevel.CREATIVE, creative, active=False)
+    orchestrator.set_status(Platform.META, EntityLevel.CREATIVE, creative, active=False)
     session.commit()
 
     rows = sandbox_meta.simulate_day(until + timedelta(days=1))
@@ -419,6 +502,7 @@ def test_global_budget_cap_stops_runaway_scaling(simulated, session, settings):
     )
     session.add(action)
     session.flush()
+    action.status = ActionStatus.APPROVED
 
     assert orchestrator.apply_action(action) is False
     assert action.status is ActionStatus.FAILED

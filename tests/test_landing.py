@@ -533,7 +533,8 @@ def test_offenders_can_be_paused(session, offer, settings):
     assert "landing page" in campaign.last_error
 
 
-def test_a_dry_run_sweep_pauses_nothing(session, offer, settings):
+@pytest.mark.parametrize("apply", [None, True, False])
+def test_a_dry_run_sweep_pauses_nothing(session, offer, settings, apply):
     """A sweep against live credentials must not stop production by accident."""
     campaign = _blocking_campaign(session, offer)
     dry = settings.model_copy(update={"dry_run": True})
@@ -547,7 +548,7 @@ def test_a_dry_run_sweep_pauses_nothing(session, offer, settings):
         def client(self, platform):  # pragma: no cover - must never be called
             raise AssertionError("a dry run reached the platform")
 
-    result = monitor.pause_offenders(summary, orchestrator=Exploding())
+    result = monitor.pause_offenders(summary, orchestrator=Exploding(), apply=apply)
 
     assert result["applied"] is False
     # It still says which campaigns it would have stopped.

@@ -646,7 +646,7 @@ class Optimizer:
         for window in windows:
             sample = thompson_sample_beta(
                 window.conversions,
-                window.clicks,
+                window.trials(),
                 prior_a=window.prior_a,
                 prior_b=window.prior_b,
                 rng=self.rng,
@@ -661,9 +661,9 @@ class Optimizer:
         """Probability the variant genuinely beats the control."""
         probability = prob_b_beats_a(
             control.conversions,
-            control.clicks,
+            control.trials(),
             variant.conversions,
-            variant.clicks,
+            variant.trials(),
             prior_a=control.prior_a,
             prior_b=control.prior_b,
             rng=self.rng,
@@ -674,7 +674,10 @@ class Optimizer:
             "control_cvr": round(control.cvr, 5),
             "variant_cvr": round(variant.cvr, 5),
             "prob_variant_better": round(probability, 4),
-            "decisive": probability >= 0.95 or probability <= 0.05,
+            "decisive": (
+                control.is_mature and variant.is_mature
+                and (probability >= 0.95 or probability <= 0.05)
+            ),
         }
 
 
@@ -707,7 +710,7 @@ def allocate_budget(
         for window in windows:
             sample = thompson_sample_beta(
                 window.conversions,
-                window.clicks,
+                window.trials(),
                 prior_a=window.prior_a,
                 prior_b=window.prior_b,
                 rng=rng,

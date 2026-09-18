@@ -36,6 +36,14 @@ from adgenie.models import (
 )
 from adgenie.money import usd_to_micros
 
+@pytest.fixture(autouse=True)
+def portfolio_clients(monkeypatch):
+    from adgenie.core import orchestrator
+    from tests.test_regressions import _NullPlatform
+
+    monkeypatch.setattr(orchestrator, "get_platform", lambda *args: _NullPlatform())
+
+
 SINCE = date(2026, 1, 1)
 UNTIL = date(2026, 1, 14)
 
@@ -123,6 +131,15 @@ def test_allocation_ranks_by_return_per_dollar_not_per_click():
     )
     allocations = by_id(plan)
     assert allocations[2].target_micros > allocations[1].target_micros
+
+
+@pytest.mark.parametrize("committed", [0, 30])
+def test_an_uncertain_offer_cannot_take_new_funding_merely_for_not_being_a_loser(committed):
+    uncertain = position(1, "uncertain", 200, 6, 200, 40, committed_usd=committed)
+    allocation = allocate_portfolio([uncertain], usd_to_micros(500)).allocations[0]
+    assert allocation.roas_lower < 1 < allocation.roas_upper
+    assert allocation.verdict == "hold"
+    assert allocation.target_micros == uncertain.committed_micros
 
 
 def test_a_confident_loser_gets_nothing_not_a_floor():
@@ -468,7 +485,8 @@ def test_applying_a_plan_moves_campaign_budgets(session, offer, settings):
     assert campaign.daily_budget_micros == usd_to_micros(60)
 
 
-def test_a_dry_run_moves_nothing(session, offer, settings):
+@pytest.mark.parametrize("apply", [None, True, False])
+def test_a_dry_run_moves_nothing(session, offer, settings, apply):
     campaign = _campaign(session, offer, "meta", 40)
     day = date(2026, 3, 1)
     _deliver(session, campaign, day, clicks=3000, spend_usd=600)
@@ -482,7 +500,7 @@ def test_a_dry_run_moves_nothing(session, offer, settings):
         def client(self, platform):  # pragma: no cover - must never be called
             raise AssertionError("a dry run reached the platform")
 
-    result = allocator.apply(plan, orchestrator=Exploding())
+    result = allocator.apply(plan, orchestrator=Exploding(), apply=apply)
     assert result["applied"] is False
     session.refresh(campaign)
     assert campaign.daily_budget_micros == usd_to_micros(40)

@@ -42,7 +42,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..config import Settings, get_settings
-from ..models import AdGroup, Campaign, EntityLevel, EntityStatus, Offer
+from ..models import ActionStatus, ActionType, AdGroup, Campaign, EntityLevel, EntityStatus, Offer, OptimizationAction
 from ..money import micros_to_usd
 from .lag import LagModel
 from .ltv import LeadValueModel
@@ -327,6 +327,13 @@ def allocate_portfolio(
         elif not measurable:
             position.verdict = "explore"
             unproven.append(position)
+        elif interval.lower <= policy.retire_below_roas:
+            position.verdict = "hold"
+            position.reason = (
+                f"Lower credible return {interval.lower:.2f}x has not cleared "
+                "breakeven. Held at its current budget until profitability is established."
+            )
+            waiting.append(position)
         else:
             position.verdict = "fund"
             candidates.append(position)
@@ -672,21 +679,18 @@ def load_offer_positions(
     """Every offer currently spending, with its aggregate performance."""
     offers = list(
         session.execute(
-            select(Offer).where(Offer.status == EntityStatus.ACTIVE)
+            select(Offer)
         ).scalars()
     )
     positions: list[OfferPosition] = []
     for offer in offers:
-        campaigns = list(
-            session.execute(
-                select(Campaign).where(
-                    Campaign.offer_id == offer.id,
-                    Campaign.status == EntityStatus.ACTIVE,
-                )
-            ).scalars()
-        )
+        campaigns = list(session.scalars(select(Campaign).where(
+            Campaign.offer_id == offer.id,
+            Campaign.status == EntityStatus.ACTIVE,
+        )))
         if not campaigns:
             continue
+        committed_micros = sum(_campaign_commitment(session, c) for c in campaigns)
         window = load_performance(
             session,
             EntityLevel.OFFER,
@@ -703,9 +707,7 @@ def load_offer_positions(
                 name=offer.name,
                 window=window,
                 campaign_ids=[c.id for c in campaigns],
-                committed_micros=sum(
-                    _campaign_commitment(session, c) for c in campaigns
-                ),
+                committed_micros=committed_micros,
             )
         )
     return positions
@@ -800,7 +802,7 @@ class PortfolioAllocator:
             annotate_creative_supply(self.session, positions, now=now)
         return allocate_portfolio(
             positions,
-            total_micros if total_micros is not None else self.total_budget_micros(),
+            min(total_micros, self.total_budget_micros()) if total_micros is not None else self.total_budget_micros(),
             policy=self.policy,
             rng=self.rng,
         )
@@ -816,7 +818,26 @@ class PortfolioAllocator:
         this allocator does not have. A target of zero pauses them: that is
         the only case where the campaign objects themselves change state.
         """
-        apply = (not self.settings.dry_run) if apply is None else apply
+        apply = not self.settings.dry_run and apply is not False
+        cap = self.total_budget_micros()
+        if plan.total_micros > cap:
+            return {"applied": False, "changes": [], "error": "plan exceeds the daily budget cap"}
+        if plan.allocated_micros > min(plan.total_micros, cap):
+            return {"applied": False, "changes": [], "error": "plan exceeds the daily budget cap"}
+        if any(a.target_micros < 0 for a in plan.allocations):
+            return {"applied": False, "changes": [], "error": "plan contains a negative allocation"}
+        if len({a.offer_id for a in plan.allocations}) != len(plan.allocations):
+            return {"applied": False, "changes": [], "error": "plan allocates one offer twice"}
+
+        if apply:
+            # Serialise concurrent allocators before reading what is committed,
+            # so the per-campaign targets are computed from a state no other
+            # run is about to overwrite. SQLite's single-writer lock plus the
+            # deferred BEGIN this triggers orders the writers; on PostgreSQL
+            # the same call takes a transaction-scoped advisory lock.
+            from ..db import lock_budget_mutations
+
+            lock_budget_mutations(self.session)
         changes: list[dict] = []
 
         for allocation in plan.allocations:
@@ -837,7 +858,7 @@ class PortfolioAllocator:
                 if allocation.target_micros <= 0:
                     target = 0
                 elif total_current > 0:
-                    target = int(allocation.target_micros * was / total_current)
+                    target = allocation.target_micros * was // total_current
                 else:
                     target = allocation.target_micros // len(campaigns)
                 if target == was:
@@ -849,21 +870,13 @@ class PortfolioAllocator:
                             "level": "campaign",
                             "entity_id": campaign.id,
                             "campaign_id": campaign.id,
+                            "from_micros": was,
+                            "to_micros": 0,
                             "from_usd": micros_to_usd(was),
                             "to_usd": 0.0,
                             "verdict": allocation.verdict,
                         }
                     )
-                    if not apply:
-                        continue
-                    campaign.status = EntityStatus.PAUSED
-                    campaign.last_error = (
-                        "Paused by portfolio allocation: " + allocation.reason
-                    )
-                    if orchestrator is not None and campaign.external_id:
-                        orchestrator.client(campaign.platform).set_status(
-                            "campaign", campaign.external_id, False
-                        )
                     continue
 
                 changes.extend(
@@ -873,9 +886,65 @@ class PortfolioAllocator:
                 )
 
         if apply:
-            self.session.commit()
-        return {"applied": apply, "changes": changes}
+            from .orchestrator import Orchestrator
 
+            runner = Orchestrator(self.session, settings=self.settings)
+            if orchestrator is not None:
+                runner.client = orchestrator.client
+            actions = []
+            for change in changes:
+                before = change["from_micros"]
+                target = change["to_micros"]
+                action = OptimizationAction(
+                    level=EntityLevel(change["level"]), entity_id=change["entity_id"],
+                    action=ActionType.PAUSE if target == 0 else (
+                        ActionType.INCREASE_BUDGET if target > before else ActionType.DECREASE_BUDGET
+                    ),
+                    rule="portfolio_allocation", reason=change["verdict"],
+                    payload={"from_micros": before, "to_micros": target},
+                    status=ActionStatus.PROPOSED,
+                )
+                self.session.add(action)
+                actions.append((change, action))
+            self.session.flush()
+            originals = []
+            try:
+                for _, action in actions:
+                    model = Campaign if action.level is EntityLevel.CAMPAIGN else AdGroup
+                    entity = self.session.get(model, action.entity_id)
+                    originals.append((entity, entity.status, entity.daily_budget_micros))
+                    if action.action is ActionType.PAUSE:
+                        entity.status = EntityStatus.PAUSED
+                    else:
+                        entity.daily_budget_micros = action.payload["to_micros"]
+                self.session.flush()
+                projected = runner._committed_daily_micros()
+            finally:
+                for entity, status, budget in originals:
+                    entity.status = status
+                    entity.daily_budget_micros = budget
+                self.session.flush()
+            if projected > cap:
+                for change, action in actions:
+                    action.status = ActionStatus.REJECTED
+                    action.error = "projected global commitments exceed the daily budget cap"
+                    change.update(applied=False, action_id=action.id, error=action.error)
+                self.session.commit()
+                return {"applied": False, "changes": changes, "error": "projected global commitments exceed the daily budget cap"}
+            for change, action in sorted(
+                actions,
+                key=lambda pair: (
+                    pair[1].action is not ActionType.PAUSE,
+                    pair[1].payload["to_micros"] - pair[1].payload["from_micros"],
+                ),
+            ):
+                change["applied"] = runner.apply_action(action, actor="portfolio")
+                change["action_id"] = action.id
+                change["status"] = action.status.value
+                change["error"] = action.error
+                change["applied_micros"] = action.payload.get("applied_micros")
+            self.session.commit()
+        return {"applied": apply and all(c.get("applied", False) for c in changes), "changes": changes}
     def _set_campaign_budget(
         self,
         campaign: Campaign,
@@ -920,16 +989,12 @@ class PortfolioAllocator:
                     **record,
                     "level": "campaign",
                     "entity_id": campaign.id,
+                    "from_micros": campaign.daily_budget_micros,
+                    "to_micros": target,
                     "from_usd": micros_to_usd(campaign.daily_budget_micros),
                     "to_usd": micros_to_usd(target),
                 }
             ]
-            if apply:
-                campaign.daily_budget_micros = target
-                if orchestrator is not None and campaign.external_id:
-                    orchestrator.client(campaign.platform).set_budget(
-                        "campaign", campaign.external_id, target
-                    )
             return changes
 
         if not funded:
@@ -957,15 +1022,10 @@ class PortfolioAllocator:
                     **record,
                     "level": "ad_group",
                     "entity_id": group.id,
+                    "from_micros": group.daily_budget_micros,
+                    "to_micros": share,
                     "from_usd": micros_to_usd(group.daily_budget_micros),
                     "to_usd": micros_to_usd(share),
                 }
             )
-            if not apply:
-                continue
-            group.daily_budget_micros = share
-            if orchestrator is not None and group.external_id:
-                orchestrator.client(campaign.platform).set_budget(
-                    "ad_group", group.external_id, share
-                )
         return changes
