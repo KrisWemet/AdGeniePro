@@ -98,9 +98,11 @@ differ:
   bare `postgresql://` scheme, which SQLAlchemy resolves to psycopg2, which is
   not installed. It is built from the Postgres service's `PGUSER`, `PGPASSWORD`,
   `RAILWAY_PRIVATE_DOMAIN` and `PGDATABASE` over the private network.
-- **The platform assigns the port.** Railway sets `PORT` (8080 in practice), and
-  the container honours it. A container that hardcodes 8000 binds a port nothing
-  routes to and receives no traffic while looking healthy.
+- **The platform assigns the port.** Railway sets `PORT` (8080 in practice) and
+  the container honours it, rather than hardcoding a port and relying on the
+  platform to detect it. Railway builds from the `Dockerfile` — the `RAILPACK`
+  builder setting is only a default, and buildkit uses the Dockerfile when one
+  is present — so its `CMD` is what runs, not the `Procfile`.
 
 `TRUST_PROXY_HEADERS=true` is set for the same reason Compose sets it: the API is
 only reachable through the platform edge, so without it every click records the
