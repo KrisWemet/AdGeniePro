@@ -51,6 +51,52 @@ def optimizer() -> Optimizer:
 # --- derived metrics -------------------------------------------------------
 
 
+@pytest.mark.parametrize("operation", ["rank", "compare", "allocate"])
+def test_unmatured_clicks_cannot_starve_a_four_day_old_creative(operation):
+    from copy import deepcopy
+
+    young = window(clicks=1000, conversions=2, spend_usd=500, entity_id=1)
+    young.maturity = 0.1
+    young.effective_clicks = 100.0
+    peer = window(clicks=1000, conversions=20, spend_usd=500, entity_id=2)
+    reference = deepcopy(young)
+    reference.clicks = 100
+
+    def result(candidate):
+        optimizer = Optimizer(rng=random.Random(19))
+        if operation == "rank":
+            return [(w.entity_id, value) for w, value in optimizer.rank_creatives([candidate, peer])]
+        if operation == "compare":
+            return optimizer.compare(peer, candidate)["prob_variant_better"]
+        return allocate_budget([candidate, peer], usd_to_micros(100), rng=random.Random(19))
+
+    assert result(young) == result(reference)
+
+
+def test_immature_peer_clicks_cannot_poison_the_leave_one_out_prior():
+    young = window(clicks=1000, conversions=5, entity_id=1)
+    young.effective_clicks = 100.0
+    mature = window(clicks=500, conversions=10, entity_id=2)
+    apply_pooled_prior([young, mature])
+    assert mature.prior_a == pytest.approx(1.25)
+    assert young.prior_a == pytest.approx(0.5)
+    assert pooled_prior([young]) == pooled_prior([window(clicks=100, conversions=5)])
+
+
+def test_no_matured_peer_evidence_uses_the_fallback_not_raw_click_failures():
+    young = window(clicks=10000)
+    young.effective_clicks = 0.0
+    assert pooled_prior([young]) == pooled_prior([])
+
+
+def test_a_comparison_cannot_declare_a_winner_before_both_windows_mature():
+    young = window(clicks=1000, conversions=50, entity_id=1)
+    young.maturity = 0.1
+    young.effective_clicks = 100.0
+    peer = window(clicks=1000, conversions=1, entity_id=2)
+    assert not Optimizer(rng=random.Random(3)).compare(peer, young)["decisive"]
+
+
 def test_roas_uses_network_revenue_not_platform_conversions():
     w = window(clicks=200, conversions=5, spend_usd=100)
     w.platform_conversions = 40.0

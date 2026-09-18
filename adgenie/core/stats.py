@@ -213,6 +213,12 @@ def prob_b_beats_a(
     Uses the exact closed form when the posterior counts are small integers,
     and Monte Carlo otherwise (the exact sum is O(alpha_b) terms).
     """
+    a_successes = max(0.0, float(a_successes))
+    b_successes = max(0.0, float(b_successes))
+    a_trials = max(a_successes, float(a_trials))
+    b_trials = max(b_successes, float(b_trials))
+    if prior_a <= 0 or prior_b <= 0 or samples <= 0:
+        raise ValueError("priors and samples must be positive")
     aa = prior_a + a_successes
     ab = prior_b + (a_trials - a_successes)
     ba = prior_a + b_successes

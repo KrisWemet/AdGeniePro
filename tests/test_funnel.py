@@ -238,6 +238,31 @@ def _seed_leads(session, offer, count, value_usd, age_days, start_txn=0, spread=
     session.flush()
 
 
+@pytest.mark.parametrize("horizon", [3, 30, 60, 120])
+def test_leads_cannot_be_priced_as_finished_before_the_configured_horizon(session, funnel_offer, horizon):
+    funnel_offer.lead_value_horizon_days = horizon
+    _seed_leads(session, funnel_offer, 25, value_usd=1, age_days=horizon - 1, spread=False)
+    before = fit_lead_value(session, funnel_offer.id, as_of=NOW)
+    after = fit_lead_value(session, funnel_offer.id, as_of=NOW + timedelta(days=1))
+    assert before.mature_sample_size == 0
+    assert not before.fitted
+    assert after.mature_sample_size == 25
+    assert after.fitted
+
+
+@pytest.mark.parametrize("age", [4, 65])
+def test_sustained_zero_revenue_cannot_keep_a_prior_funded_forever(session, funnel_offer, age):
+    prior = usd_to_micros(5)
+    _seed_leads(session, funnel_offer, 40, value_usd=0, age_days=age)
+    first = fit_lead_value(session, funnel_offer.id, prior_micros=prior, as_of=NOW)
+    _seed_leads(session, funnel_offer, 3960, value_usd=0, age_days=age, start_txn=40)
+    later = fit_lead_value(session, funnel_offer.id, prior_micros=prior, as_of=NOW)
+    assert 0 <= later.lower_micros <= later.mean_micros <= later.upper_micros
+    assert later.mean_micros < first.mean_micros / 20
+    assert later.lower_micros < first.lower_micros / 20
+    assert later.lower_micros < prior / 100
+
+
 def test_with_no_leads_the_prior_stands(session, funnel_offer):
     prior = offer_prior_micros(session, funnel_offer.id)
     model = fit_lead_value(session, funnel_offer.id, prior_micros=prior, as_of=NOW)
@@ -259,7 +284,7 @@ def test_young_leads_are_projected_not_averaged(session, funnel_offer):
 
 
 def test_mature_leads_are_measured(session, funnel_offer):
-    _seed_leads(session, funnel_offer, 60, value_usd=4.0, age_days=45, spread=False)
+    _seed_leads(session, funnel_offer, 60, value_usd=4.0, age_days=65, spread=False)
     session.commit()
 
     model = fit_lead_value(session, funnel_offer.id, as_of=NOW)
@@ -273,7 +298,7 @@ def test_mature_leads_are_measured(session, funnel_offer):
 def test_an_unstated_prior_does_not_drag_the_estimate_toward_zero(
     session, funnel_offer
 ):
-    _seed_leads(session, funnel_offer, 60, value_usd=4.0, age_days=45, spread=False)
+    _seed_leads(session, funnel_offer, 60, value_usd=4.0, age_days=65, spread=False)
     session.commit()
 
     unprimed = fit_lead_value(session, funnel_offer.id, as_of=NOW)
@@ -285,7 +310,7 @@ def test_an_unstated_prior_does_not_drag_the_estimate_toward_zero(
 
 def test_a_thin_sample_is_shrunk_toward_the_prior(session, funnel_offer):
     """A value fitted on five leads is noise wearing a number."""
-    _seed_leads(session, funnel_offer, 5, value_usd=50.0, age_days=45, spread=False)
+    _seed_leads(session, funnel_offer, 5, value_usd=50.0, age_days=65, spread=False)
     session.commit()
 
     prior = offer_prior_micros(session, funnel_offer.id)
@@ -297,7 +322,7 @@ def test_a_thin_sample_is_shrunk_toward_the_prior(session, funnel_offer):
 
 
 def test_a_large_sample_outweighs_the_prior(session, funnel_offer):
-    _seed_leads(session, funnel_offer, 400, value_usd=6.0, age_days=45, spread=False)
+    _seed_leads(session, funnel_offer, 400, value_usd=6.0, age_days=65, spread=False)
     session.commit()
 
     model = fit_lead_value(
@@ -307,7 +332,7 @@ def test_a_large_sample_outweighs_the_prior(session, funnel_offer):
 
 
 def test_the_lower_bound_is_what_gets_spent_against(session, funnel_offer):
-    _seed_leads(session, funnel_offer, 100, value_usd=5.0, age_days=45)
+    _seed_leads(session, funnel_offer, 100, value_usd=5.0, age_days=65)
     session.commit()
 
     model = fit_lead_value(session, funnel_offer.id, as_of=NOW)

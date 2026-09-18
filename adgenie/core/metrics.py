@@ -75,7 +75,7 @@ class PerformanceWindow:
     # How much of this window's conversion window has actually elapsed. Below
     # 1.0 the data is incomplete, not disappointing.
     maturity: float = 1.0
-    effective_clicks: float = 0.0
+    effective_clicks: float | None = None
     lag_median_hours: float | None = None
     # Funnel: leads earned, and what they are conservatively worth. Kept apart
     # from realised revenue because one is money received and the other is a
@@ -97,7 +97,9 @@ class PerformanceWindow:
         one of them has had its full conversion window, which for anything
         recent is false and reads as failure.
         """
-        return self.effective_clicks or float(self.clicks)
+        if self.effective_clicks is None:
+            return float(self.clicks) * self.maturity
+        return self.effective_clicks
 
     @property
     def is_mature(self) -> bool:
@@ -574,13 +576,21 @@ def load_performance(
     start_dt = datetime.combine(since, datetime.min.time(), tzinfo=timezone.utc)
     end_dt = datetime.combine(until, datetime.max.time(), tzinfo=timezone.utc)
     fk = _CONVERSION_FK[level]
+    observed_until = as_of or datetime.now(timezone.utc)
+    if observed_until.tzinfo is not None:
+        observed_until = observed_until.astimezone(timezone.utc).replace(tzinfo=None)
+    cohort_date = func.coalesce(Click.created_at, Lead.created_at, Conversion.occurred_at)
+    cohort_filters = (
+        fk == entity_id,
+        cohort_date >= start_dt.replace(tzinfo=None),
+        cohort_date <= end_dt.replace(tzinfo=None),
+        Conversion.occurred_at <= observed_until,
+    )
     conversion_rows = session.execute(
         select(Conversion.status, func.count(Conversion.id), func.sum(Conversion.revenue_micros))
-        .where(
-            fk == entity_id,
-            Conversion.occurred_at >= start_dt.replace(tzinfo=None),
-            Conversion.occurred_at <= end_dt.replace(tzinfo=None),
-        )
+        .outerjoin(Click, Conversion.click_id == Click.click_id)
+        .outerjoin(Lead, Conversion.lead_id == Lead.id)
+        .where(*cohort_filters)
         .group_by(Conversion.status)
     ).all()
     for status, count, revenue in conversion_rows:
@@ -613,12 +623,16 @@ def load_performance(
     # twice once the lead value is added.
     window.lead_revenue_micros = int(
         session.execute(
-            select(func.coalesce(func.sum(Conversion.revenue_micros), 0)).where(
-                fk == entity_id,
+            select(func.coalesce(func.sum(Conversion.revenue_micros), 0))
+            .outerjoin(Click, Conversion.click_id == Click.click_id)
+            .outerjoin(Lead, Conversion.lead_id == Lead.id)
+            .where(
+                *cohort_filters,
                 Conversion.lead_id.is_not(None),
-                Conversion.status == ConversionStatus.APPROVED,
-                Conversion.occurred_at >= start_dt.replace(tzinfo=None),
-                Conversion.occurred_at <= end_dt.replace(tzinfo=None),
+                Conversion.status.in_(
+                    [ConversionStatus.APPROVED, ConversionStatus.PENDING]
+                    if count_pending_as_revenue else [ConversionStatus.APPROVED]
+                ),
             )
         ).scalar_one()
         or 0
@@ -632,7 +646,8 @@ def load_performance(
                 from .ltv import fit_lead_value, offer_prior_micros
 
                 lead_value = fit_lead_value(
-                    session, offer.id, prior_micros=offer_prior_micros(session, offer.id)
+                    session, offer.id, prior_micros=offer_prior_micros(session, offer.id),
+                    as_of=as_of,
                 )
             window.lead_value_per_lead_micros = lead_value.lower_micros
             window.lead_value_micros = lead_value.value_of(window.leads)
@@ -676,7 +691,7 @@ def pooled_prior(
     dominates a creative with 10 clicks and is irrelevant to one with 500,
     which is exactly the behaviour a shrinkage prior should have.
     """
-    total_clicks = sum(w.clicks for w in windows)
+    total_clicks = sum(w.trials() for w in windows)
     total_conversions = sum(w.conversions for w in windows)
     rate = (total_conversions / total_clicks) if total_clicks >= 50 else fallback_cvr
     rate = min(0.5, max(0.0005, rate))

@@ -56,11 +56,6 @@ DEFAULT_LEAD_CURVE: tuple[tuple[float, float], ...] = (
 # Pseudo-leads of belief in the prior. A value fitted on eight leads is noise.
 _SHRINKAGE_LEADS = 40.0
 
-# Cohorts younger than this contribute to the curve but not to the value
-# estimate: they have not finished earning.
-_MIN_COHORT_AGE_DAYS = 7
-
-
 @dataclass
 class LeadValueModel:
     """Expected revenue from one lead, and how fast it arrives."""
@@ -160,7 +155,7 @@ def fit_lead_value(
         model.mean_micros = model.lower_micros = model.upper_micros = prior_micros or 0
         return model
 
-    cutoff = as_of - timedelta(days=_MIN_COHORT_AGE_DAYS)
+    cutoff = as_of - timedelta(days=max(1, horizon))
     mature = [lead for lead in leads if _aware(lead.created_at) <= cutoff]
     model.mature_sample_size = len(mature)
 
@@ -190,7 +185,7 @@ def fit_lead_value(
 
         model.mean_micros = int(blended)
         # Wide by construction: this is an extrapolation, not a measurement.
-        model.lower_micros = int(max(blended * 0.35, prior * 0.5))
+        model.lower_micros = int(max(0, blended * 0.35))
         model.upper_micros = int(max(blended * 2.0, prior))
         return model
 

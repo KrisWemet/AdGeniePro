@@ -124,6 +124,30 @@ def verdicts(plan) -> dict:
 # --- an angle is not an execution ------------------------------------------
 
 
+def test_a_four_day_old_angle_is_not_retired_before_its_sales_arrive(session, offer, ad_group):
+    from adgenie.core.lag import LagModel
+
+    run_angle(session, offer, ad_group, "problem_solution", 3, 0.02, 0.02, 0.04, days=4)
+    run_angle(session, offer, ad_group, "identity", 3, 0.02, 0.02, 0.0, days=4)
+    plan = analyse_rotation(
+        session, offer, now=datetime(2026, 1, 5, tzinfo=timezone.utc),
+        lag_model=LagModel(curve=((0.0, 0.0), (240.0, 0.1), (720.0, 1.0))),
+    )
+    assert all(s.verdict == "unproven" for s in plan.angles)
+    assert all(s.prob_worse == 0.0 for s in plan.angles)
+
+
+def test_undelivered_drafts_cannot_make_one_failed_ad_retire_an_argument(session, offer, ad_group):
+    run_angle(session, offer, ad_group, "problem_solution", 3, 0.02, 0.02, 0.04)
+    ids = run_angle(session, offer, ad_group, "identity", 1, 0.02, 0.02, 0.0)
+    for i in range(3):
+        session.add(Creative(ad_group_id=ad_group.id, name=f"draft-{i}", angle="identity"))
+    session.flush()
+    stat = next(s for s in analyse_rotation(session, offer, now=NOW).angles if s.key == "identity")
+    assert stat.executions == len(ids)
+    assert stat.verdict == "unproven"
+
+
 def test_one_bad_ad_does_not_retire_the_argument():
     """The most common outcome in advertising is a bad ad for a good idea."""
     policy = RotationPolicy(min_executions_to_judge=3)

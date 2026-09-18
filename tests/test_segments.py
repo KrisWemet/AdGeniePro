@@ -39,6 +39,20 @@ def analyse(rows, **kwargs):
 # --- finding the waste -----------------------------------------------------
 
 
+def test_a_four_day_old_segment_is_not_excluded_before_its_sales_arrive():
+    from datetime import datetime, timezone
+
+    from adgenie.core.lag import LagModel
+
+    report = analyse(
+        [row("a", 1000, 50, 500), row("b", 1000, 50, 500), row("young", 1000, 0, 500)],
+        lag_model=LagModel(curve=((0.0, 0.0), (240.0, 0.1), (720.0, 1.0))),
+        as_of=datetime(2026, 3, 5, 12, tzinfo=timezone.utc),
+    )
+    assert not report.exclusions
+    assert all(s.prob_worse == 0.0 for s in report.segments)
+
+
 def test_a_clearly_bad_segment_is_cut():
     report = analyse(
         [
@@ -443,7 +457,7 @@ def test_an_applied_exclusion_is_not_proposed_again(
 ):
     from adgenie.core.launcher import CampaignLauncher, LaunchPlan
     from adgenie.core.orchestrator import Orchestrator
-    from adgenie.models import OptimizationAction
+    from adgenie.models import ActionStatus, OptimizationAction
 
     launched = CampaignLauncher(
         session, settings=settings, platform_client=sandbox_meta
@@ -470,6 +484,7 @@ def test_an_applied_exclusion_is_not_proposed_again(
     )
     session.add(action)
     session.flush()
+    action.status = ActionStatus.APPROVED
     assert orchestrator.apply_action(action)
     session.commit()
 

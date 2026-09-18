@@ -339,12 +339,24 @@ def upload_media(creative_id: int, session: Session = Depends(get_session)) -> d
 
     settings = get_settings()
     client = Orchestrator(session, settings=settings).client(campaign.platform)
+    dry_run = settings.dry_run or getattr(client, "dry_run", False)
+    pending_asset_ids = []
+    if dry_run:
+        pending_asset_ids = list(session.scalars(
+            select(MediaAsset.id).where(
+                MediaAsset.creative_id == creative_id,
+                MediaAsset.status == MediaStatus.READY,
+            ).order_by(MediaAsset.id)
+        ))
     handles = MediaUploader(session, settings=settings).handles_for_creative(
         creative, client
     )
     session.commit()
     return {
         "creative_id": creative_id,
+        "dry_run": dry_run,
+        "applied": not dry_run and bool(handles),
+        "pending_asset_ids": pending_asset_ids,
         "platform": campaign.platform.value,
         "account": client.account_key,
         "uploaded": [

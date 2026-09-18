@@ -36,6 +36,7 @@ import httpx
 from ..config import Settings, get_settings
 from ..models import Platform
 from ..platforms.base import PlatformError
+from ..platforms.meta import _redact_token
 
 logger = logging.getLogger(__name__)
 
@@ -185,7 +186,6 @@ class AdLibraryClient:
             fields += list(POLITICAL_FIELDS)
 
         params: dict[str, str | int] = {
-            "access_token": self.settings.meta_access_token or "",
             "ad_reached_countries": ",".join(countries),
             "ad_type": ad_type,
             "ad_active_status": "ACTIVE" if active_only else "ALL",
@@ -257,14 +257,28 @@ class AdLibraryClient:
         )
         return warnings
 
+    def _redact(self, value):
+        return _redact_token(value, self.settings.meta_access_token)
+
     def _request(self, url: str, params: dict | None) -> dict:
+        url = httpx.URL(url).copy_remove_param("access_token")
+        if url.scheme != "https" or url.host != "graph.facebook.com":
+            raise PlatformError(
+                "Ad Library pagination returned an unexpected host",
+                platform=Platform.META,
+                code="BAD_RESPONSE",
+            )
+        params = dict(params) if params is not None else None
+        if params is not None:
+            params.pop("access_token", None)
+        headers = {"Authorization": f"Bearer {self.settings.meta_access_token or ''}"}
         last: PlatformError | None = None
         for attempt in range(4):
             try:
-                response = self._client.get(url, params=params)
+                response = self._client.get(url, params=params, headers=headers)
             except httpx.HTTPError as exc:
                 last = PlatformError(
-                    f"network error calling the Ad Library: {exc}",
+                    f"network error calling the Ad Library: {self._redact(str(exc))}",
                     platform=Platform.META,
                     retryable=True,
                 )
@@ -277,8 +291,7 @@ class AdLibraryClient:
             time.sleep(2**attempt)
         raise last  # pragma: no cover
 
-    @staticmethod
-    def _decode(response: httpx.Response) -> dict:
+    def _decode(self, response: httpx.Response) -> dict:
         """Parse a success body, turning malformed JSON into a PlatformError.
 
         A gateway or captcha page can answer 200 with HTML; letting the decode
@@ -294,18 +307,18 @@ class AdLibraryClient:
                 platform=Platform.META,
                 code="BAD_RESPONSE",
                 retryable=True,
-                payload={"body": response.text[:300]},
+                payload={"body": self._redact(response.text)[:300]},
             ) from exc
         return body if isinstance(body, dict) else {"data": body}
 
-    @staticmethod
-    def _to_error(response: httpx.Response) -> PlatformError:
+    def _to_error(self, response: httpx.Response) -> PlatformError:
+        text = self._redact(response.text)
         try:
-            body = response.json()
+            body = self._redact(response.json())
         except ValueError:
-            body = {"error": {"message": response.text[:400]}}
+            body = {"error": {"message": text[:400]}}
         err = body.get("error", {}) if isinstance(body, dict) else {}
-        message = err.get("message", response.text[:300])
+        message = err.get("message", text[:300])
         code = err.get("code")
         hint = ""
         if code == 190:

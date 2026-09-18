@@ -197,11 +197,13 @@ def lead_value(
     """
     if session.get(Offer, offer_id) is None:
         raise HTTPException(404, f"offer {offer_id} not found")
+    as_of = datetime.now(timezone.utc)
     model = fit_lead_value(
         session,
         offer_id,
         creative_id=creative_id,
         prior_micros=offer_prior_micros(session, offer_id),
+        as_of=as_of,
     )
     return {
         **model.as_dict(),

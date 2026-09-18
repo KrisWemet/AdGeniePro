@@ -283,6 +283,58 @@ def test_evidence_records_the_maturity_behind_the_decision():
 # --- through the metrics layer ---------------------------------------------
 
 
+@pytest.mark.parametrize("level", list(EntityLevel))
+def test_old_click_sales_cannot_make_the_current_cohort_look_profitable(session, offer, level):
+    from adgenie.models import Click, Conversion, ConversionStatus
+
+    session.add_all([
+        Click(click_id="old-cohort", offer_id=offer.id, created_at=datetime(2026, 2, 1)),
+        Click(click_id="current-cohort", offer_id=offer.id, created_at=datetime(2026, 3, 2)),
+    ])
+    for key, clicked, occurred in [
+        ("old-sale", "old-cohort", datetime(2026, 3, 3)),
+        ("late-sale", "current-cohort", datetime(2026, 3, 9)),
+        ("future-sale", "current-cohort", datetime(2026, 3, 20)),
+    ]:
+        session.add(Conversion(
+            network_txn_id=key, click_id=clicked, offer_id=offer.id,
+            campaign_id=1, ad_group_id=1, creative_id=1,
+            status=ConversionStatus.APPROVED, occurred_at=occurred,
+            revenue_micros=usd_to_micros(40),
+        ))
+    session.flush()
+    window = load_performance(
+        session, level, offer.id if level is EntityLevel.OFFER else 1,
+        date(2026, 3, 1), date(2026, 3, 7),
+        as_of=datetime(2026, 3, 10, tzinfo=timezone.utc),
+    )
+    assert window.conversions == 1
+    assert window.revenue_micros == usd_to_micros(40)
+
+
+def test_old_lead_sales_cannot_inflate_the_current_pipeline(session, offer):
+    from adgenie.models import Conversion, ConversionStatus, Lead
+
+    old = Lead(offer_id=offer.id, email_hash="old", created_at=datetime(2026, 2, 1))
+    current = Lead(offer_id=offer.id, email_hash="current", created_at=datetime(2026, 3, 2))
+    session.add_all([old, current])
+    session.flush()
+    for lead in [old, current]:
+        session.add(Conversion(
+            network_txn_id=f"lead-{lead.id}", lead_id=lead.id, offer_id=offer.id,
+            status=ConversionStatus.APPROVED, occurred_at=datetime(2026, 3, 9),
+            revenue_micros=usd_to_micros(40),
+        ))
+    session.flush()
+    window = load_performance(
+        session, EntityLevel.OFFER, offer.id, date(2026, 3, 1), date(2026, 3, 7),
+        as_of=datetime(2026, 3, 10, tzinfo=timezone.utc),
+    )
+    assert window.leads == 1
+    assert window.conversions == 1
+    assert window.lead_revenue_micros == window.revenue_micros == usd_to_micros(40)
+
+
 def test_load_performance_applies_the_lag_model(session, offer):
     for offset, clicks in ((0, 100), (5, 100)):
         session.add(

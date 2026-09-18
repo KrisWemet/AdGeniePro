@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from sqlalchemy.orm import Session
 
 from ..config import Settings, get_settings
+from ..db import lock_budget_mutations
 from ..models import (
     AdGroup,
     AuditLog,
@@ -108,6 +109,10 @@ class LaunchResult:
         """
         return self.campaign_id > 0
 
+    @property
+    def applied(self) -> bool:
+        return not self.dry_run and bool(self.campaign_external_id)
+
     def as_dict(self) -> dict:
         return {
             "campaign_id": self.campaign_id,
@@ -115,7 +120,9 @@ class LaunchResult:
             "ad_group_ids": self.ad_group_ids,
             "creative_ids": self.creative_ids,
             "blocked_creative_ids": self.blocked_creative_ids,
-            "launched": len(self.creative_ids),
+            "launched": 0 if self.dry_run else len(self.creative_ids),
+            "drafted": len(self.creative_ids) if self.dry_run else 0,
+            "applied": self.applied,
             "blocked": len(self.blocked_creative_ids),
             "media_asset_ids": self.media_asset_ids,
             "market_brief": self.market_brief,
@@ -189,6 +196,7 @@ class CampaignLauncher:
                                 dry_run=self.settings.dry_run, errors=errors)
 
         client = self._client(plan.platform)
+        self._dry_run = self.settings.dry_run or getattr(client, "dry_run", False)
         ad_format = plan.ad_format or DEFAULT_FORMAT[plan.platform]
         budget_micros = usd_to_micros(plan.daily_budget_usd)
         status = "PAUSED" if plan.start_paused else "ACTIVE"
@@ -209,23 +217,44 @@ class CampaignLauncher:
         if plan.research_market:
             market_notes, market_brief = self._research(offer, plan)
 
+        from .orchestrator import Orchestrator
+
+        angle_keys = plan.angles or [
+            a.key for a in angles_for(plan.platform.value, plan.angle_count)
+        ]
+        error = None
+        if not angle_keys or budget_micros < len(angle_keys) * 1_000_000:
+            error = "daily budget cannot fund every ad group at the $1 minimum"
+        elif budget_micros > usd_to_micros(self.settings.global_daily_budget_cap_usd):
+            error = "daily budget exceeds the global daily budget cap"
+        elif plan.max_daily_budget_usd is not None and budget_micros > usd_to_micros(plan.max_daily_budget_usd):
+            error = "daily budget exceeds the campaign maximum"
+        if error is None and not self._dry_run:
+            lock_budget_mutations(self.session)
+            if not plan.start_paused and budget_micros > Orchestrator(
+                self.session, settings=self.settings
+            )._budget_headroom_micros():
+                error = "global daily budget cap leaves insufficient headroom for launch"
+        if error:
+            return LaunchResult(
+                campaign_id=0, campaign_external_id=None,
+                errors=[error], dry_run=self._dry_run,
+            )
+
         campaign = self._create_campaign(offer, plan, client, budget_micros, status)
         result = LaunchResult(
             campaign_id=campaign.id,
             campaign_external_id=campaign.external_id,
-            dry_run=self.settings.dry_run,
+            dry_run=self._dry_run,
         )
         result.market_brief = market_brief
         if campaign.status is EntityStatus.FAILED:
             result.errors.append(campaign.last_error or "campaign creation failed")
             return result
 
-        angle_keys = plan.angles or [
-            a.key for a in angles_for(plan.platform.value, plan.angle_count)
-        ]
         # Split the campaign budget evenly so no angle is starved before it can
         # be measured.
-        per_group_micros = max(1_000_000, budget_micros // max(1, len(angle_keys)))
+        per_group_micros = budget_micros // len(angle_keys)
 
         for angle_key in angle_keys:
             group = self._create_ad_group(
@@ -253,14 +282,15 @@ class CampaignLauncher:
                     result.creative_ids.append(creative.id)
                     if creative.compliance_verdict is ComplianceVerdict.WARN:
                         result.warnings.append(
-                            f"{creative.name}: launched with policy warnings"
+                            f"{creative.name}: policy warnings"
                         )
 
         result.media_asset_ids = self._media_asset_ids
         result.landing_page = self._landing_report
         self.session.commit()
         logger.info(
-            "Launched campaign %s (%s): %s creatives live, %s blocked",
+            "%s campaign %s (%s): %s creatives, %s blocked",
+            "Drafted" if self._dry_run else "Launched",
             campaign.id,
             campaign.name,
             len(result.creative_ids),
@@ -317,10 +347,11 @@ class CampaignLauncher:
             },
         )
         try:
-            campaign.external_id = client.create_campaign(spec)
-            campaign.status = (
-                EntityStatus.PAUSED if plan.start_paused else EntityStatus.ACTIVE
-            )
+            if not self._dry_run:
+                campaign.external_id = client.create_campaign(spec)
+                campaign.status = (
+                    EntityStatus.PAUSED if plan.start_paused else EntityStatus.ACTIVE
+                )
         except PlatformError as exc:
             campaign.status = EntityStatus.FAILED
             campaign.last_error = str(exc)
@@ -371,10 +402,11 @@ class CampaignLauncher:
             extra={"match_type": "phrase"},
         )
         try:
-            group.external_id = client.create_ad_group(spec)
-            group.status = (
-                EntityStatus.PAUSED if plan.start_paused else EntityStatus.ACTIVE
-            )
+            if not self._dry_run:
+                group.external_id = client.create_ad_group(spec)
+                group.status = (
+                    EntityStatus.PAUSED if plan.start_paused else EntityStatus.ACTIVE
+                )
         except PlatformError as exc:
             group.status = EntityStatus.FAILED
             group.last_error = str(exc)
@@ -475,10 +507,11 @@ class CampaignLauncher:
             status=status,
         )
         try:
-            creative.external_id = client.create_creative(spec)
-            creative.status = (
-                EntityStatus.PAUSED if plan.start_paused else EntityStatus.ACTIVE
-            )
+            if not self._dry_run:
+                creative.external_id = client.create_creative(spec)
+                creative.status = (
+                    EntityStatus.PAUSED if plan.start_paused else EntityStatus.ACTIVE
+                )
         except PlatformError as exc:
             creative.status = EntityStatus.FAILED
             creative.last_error = str(exc)
@@ -549,7 +582,7 @@ class CampaignLauncher:
                     if f["severity"] == "block"
                 )
             ],
-            dry_run=self.settings.dry_run,
+            dry_run=self._dry_run,
         )
 
     def _research(self, offer: Offer, plan: LaunchPlan) -> tuple[list[str], dict | None]:
@@ -627,6 +660,6 @@ class CampaignLauncher:
                     "status": getattr(entity, "status").value,
                 },
                 ok=getattr(entity, "status") is not EntityStatus.FAILED,
-                dry_run=self.settings.dry_run,
+                dry_run=self._dry_run,
             )
         )

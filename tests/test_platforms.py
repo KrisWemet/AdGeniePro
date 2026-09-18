@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import traceback
 from datetime import date, timedelta
 
 import httpx
@@ -187,7 +189,12 @@ def meta_settings() -> Settings:
 
 
 def _mock_meta(handler, meta_settings) -> MetaAdsClient:
-    transport = httpx.MockTransport(handler)
+    def authenticated(request):
+        assert request.headers["authorization"] == f"Bearer {meta_settings.meta_access_token}"
+        assert "access_token" not in request.url.params
+        return handler(request)
+
+    transport = httpx.MockTransport(authenticated)
     return MetaAdsClient(
         meta_settings, client=httpx.Client(transport=transport), dry_run=False
     )
@@ -304,7 +311,7 @@ def test_meta_paginates_insights(meta_settings):
                     "data": [
                         {"ad_id": "a", "date_start": "2026-03-01", "impressions": "1"}
                     ],
-                    "paging": {"next": "https://graph.facebook.com/v21.0/act_123/insights?after=x"},
+                    "paging": {"next": "https://graph.facebook.com/v21.0/act_123/insights?after=x&access_token=tok"},
                 },
             )
         return httpx.Response(
@@ -331,6 +338,60 @@ def test_meta_does_not_retry_a_rejected_request(meta_settings):
         client.set_status("creative", "ad_1", True)
     assert not exc.value.retryable
     assert calls["n"] == 1
+
+
+@pytest.mark.parametrize("adapter", ["marketing", "library"])
+@pytest.mark.parametrize("failure", ["json", "text", "network"])
+def test_meta_error_never_exposes_the_token_in_urls_exceptions_or_logs(
+    meta_settings, monkeypatch, caplog, adapter, failure
+):
+    token = "ws4-test-secret-123456"
+    meta_settings.meta_access_token = token
+    monkeypatch.setattr("adgenie.platforms.meta.time.sleep", lambda _: None)
+    caplog.set_level(logging.DEBUG)
+    urls = []
+
+    def handler(request):
+        assert request.headers["authorization"] == f"Bearer {token}"
+        urls.append(str(request.url))
+        if failure == "network":
+            raise httpx.ConnectError(f"Rejected Bearer {token}", request=request)
+        if failure == "text":
+            return httpx.Response(500, text=f"Rejected Bearer {token}")
+        return httpx.Response(
+            500,
+            json={"error": {
+                "code": 2,
+                "message": f"Rejected Bearer {token}",
+                "details": [{"credential": token}],
+            }},
+        )
+
+    if adapter == "marketing":
+        client = _mock_meta(handler, meta_settings)
+        client.dry_run = True
+        call = lambda: client._request("GET", "act_123", params={"fields": "name"})
+    else:
+        from adgenie.research.ad_library import AdLibraryClient
+
+        client = AdLibraryClient(
+            meta_settings, client=httpx.Client(transport=httpx.MockTransport(handler))
+        )
+        call = lambda: client.search(search_terms="sleep", countries=["GB"])
+    with pytest.raises(PlatformError) as exc:
+        call()
+    logging.getLogger(__name__).error("%s %s", exc.value, exc.value.payload)
+
+    assert len(urls) == 4
+    assert all("access_token" not in url and token not in url for url in urls)
+    assert token not in str(exc.value)
+    assert token not in json.dumps(exc.value.payload)
+    assert token not in "".join(traceback.format_exception(exc.value))
+    assert token not in caplog.text
+    assert "access_token" not in caplog.text
+    assert "[REDACTED]" in str(exc.value)
+    assert exc.value.code == {"json": 2, "text": 500, "network": None}[failure]
+    assert exc.value.retryable
 
 
 def test_meta_dry_run_sends_nothing(meta_settings):
