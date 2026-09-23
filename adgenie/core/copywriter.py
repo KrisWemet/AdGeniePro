@@ -199,25 +199,33 @@ class TemplateCopywriter:
 
         headline_spec = spec.fields["headlines"]
         headlines: list[str] = []
+        # Fillers make no claim about the offer. Shipping, guarantees, speed and
+        # "official site" are facts only the brief can supply; a template that
+        # asserts them for every offer is inventing claims the landing page may
+        # contradict, which is a misrepresentation disapproval on both platforms.
         pool = list(angle.headline_patterns) + [
-            "{product_name} Official Site",
             "See How {product_name} Works",
+            "{product_name}",
             "{benefit}",
             "Compare Your Options",
-            "Start In Under 5 Minutes",
             "Real Answers, No Fluff",
             "What To Know First",
-            "Straightforward Pricing",
-            "Free Shipping Available",
             "Read The Details",
+            "See What Is Included",
+            "Is It Right For You?",
+            "Worth A Closer Look",
+            "Get The Full Picture",
             "Made For Everyday Use",
             "Try It This Week",
-            "Backed By A Guarantee",
-            "Ships In Two Days",
             "Questions Answered Here",
         ]
         for pattern in self._rotate(pool, nth):
-            text = truncate_to_spec(self._fill(pattern, subs), headline_spec.max_chars)
+            # A headline that does not fit is skipped, not cut: a headline has
+            # no sentence boundary to fall back on, so trimming one leaves a
+            # fragment ("CalmLeaf Sleep Support vs.") and the pool has spares.
+            text = self._fill(pattern, subs)
+            if len(text) > headline_spec.max_chars:
+                continue
             if text and text.lower() not in {h.lower() for h in headlines}:
                 headlines.append(text)
             if len(headlines) >= headline_spec.recommended_count:
@@ -236,13 +244,26 @@ class TemplateCopywriter:
                     subs,
                 ),
                 self._fill("{proof} Learn what is included. #ad", subs),
+                # Short enough for Meta's 60 characters, where the others
+                # usually are not.
+                self._fill("{mechanism}.", subs),
             ]
-            for cand in self._rotate(candidates, nth):
-                text = truncate_to_spec(cand, desc_spec.max_chars)
-                if text and text.lower() not in {d.lower() for d in descriptions}:
-                    descriptions.append(text)
+            trimmed = [
+                truncate_to_spec(c, desc_spec.max_chars)
+                for c in self._rotate(candidates, nth)
+            ]
+            # A description that ends mid-sentence reads as broken. Take whole
+            # sentences first and fall back to a trimmed one only when the
+            # platform's minimum would otherwise not be met.
+            whole = [t for t in trimmed if t.endswith((".", "!", "?", "#ad"))]
+            partial = [t for t in trimmed if t not in whole]
+            for text in whole + partial:
                 if len(descriptions) >= desc_spec.recommended_count:
                     break
+                if text in partial and len(descriptions) >= desc_spec.min_count:
+                    break
+                if text and text.lower() not in {d.lower() for d in descriptions}:
+                    descriptions.append(text)
 
         primary_texts: list[str] = []
         primary_spec = spec.fields.get("primary_texts")
@@ -296,7 +317,9 @@ class TemplateCopywriter:
         mechanism = f"helps you {primary.lower()}"
         return {
             "product_name": brief.product_name,
-            "benefit": primary.title()[:38],
+            # Whole, never sliced: a headline too long for the platform is
+            # skipped by the caller, where a slice ends mid-word.
+            "benefit": primary.title(),
             "benefit_line": (secondary[0].upper() + secondary[1:] + ".")
             if secondary
             else "",
@@ -305,7 +328,16 @@ class TemplateCopywriter:
             "friction": brief.friction(),
             "friction_title": brief.friction().title(),
             "proof": (brief.proof().rstrip(".") + ".") if brief.proof() else "",
-            "proof_short": (brief.proof() or "Trusted By Many")[:38],
+            # Empty without proof, so the headline is dropped rather than
+            # claiming a following the brief never mentioned.
+            "proof_short": brief.proof(),
+            # The remark only makes sense after a proof point; without one it
+            # is an orphan sentence opening the ad.
+            "proof_tell": (
+                brief.proof().rstrip(".") + ". That is usually the tell."
+                if brief.proof()
+                else ""
+            ),
             "objection": "does this actually work for people like me?",
             "aspiration": "stay consistent",
             "keyword": brief.keyword or brief.product_name,

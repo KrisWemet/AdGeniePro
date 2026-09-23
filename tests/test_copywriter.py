@@ -225,6 +225,80 @@ def test_invalid_cta_is_replaced(meta_brief, settings):
     assert draft.call_to_action == "LEARN_MORE"
 
 
+def _readme_offer(offer, **changes):
+    """The offer README.md tells a new user to create, whose benefit is longer
+    than the fixture's and longer than a headline."""
+    offer.key_benefits = ["wind down without next-morning grogginess"]
+    for key, value in changes.items():
+        setattr(offer, key, value)
+    return offer
+
+
+@pytest.mark.parametrize("platform", [Platform.GOOGLE, Platform.META])
+def test_a_long_benefit_is_never_cut_mid_word(offer, settings, platform):
+    """The benefit slot was sliced at 38 characters, so the README's own offer
+    launched a Meta headline reading "Next-Morning Groggin"."""
+    _readme_offer(offer)
+    studio = CopyStudio(generator=TemplateCopywriter(), settings=settings)
+    for angle in ANGLES:
+        draft = studio.write(build_brief(offer, platform, angle_key=angle.key))
+        for text in draft.headlines + draft.descriptions + draft.primary_texts:
+            assert "groggin" not in text.lower().replace("grogginess", ""), text
+
+
+def test_a_headline_too_long_for_the_platform_is_dropped_not_fragmented(
+    offer, settings
+):
+    """Trimming "CalmLeaf Sleep Support vs. The Usual Way" to Google's 30
+    characters produced "CalmLeaf Sleep Support vs.", which is a live ad that
+    reads as broken."""
+    studio = CopyStudio(generator=TemplateCopywriter(), settings=settings)
+    draft = studio.write(build_brief(offer, Platform.GOOGLE, angle_key="comparison"))
+    assert not any(h.endswith(" vs.") for h in draft.headlines)
+    assert "CalmLeaf Sleep Support" in draft.headlines
+    assert len(draft.headlines) >= get_spec(Platform.GOOGLE).fields["headlines"].min_count
+
+
+def test_template_descriptions_end_on_a_whole_sentence(offer, settings):
+    """Meta's 60-character description cut "...helps you wind down without
+    next-morning grogginess." to "...helps you wind down"."""
+    _readme_offer(offer)
+    studio = CopyStudio(generator=TemplateCopywriter(), settings=settings)
+    for platform in (Platform.GOOGLE, Platform.META):
+        for angle in ANGLES:
+            draft = studio.write(build_brief(offer, platform, angle_key=angle.key))
+            for text in draft.descriptions:
+                assert text.endswith((".", "?", "!", "#ad")), (platform, angle.key, text)
+
+
+@pytest.mark.parametrize("platform", [Platform.GOOGLE, Platform.META])
+def test_template_copy_invents_no_offer_terms(offer, settings, platform):
+    """Shipping, guarantees and "official site" are facts only the brief can
+    supply. Asserting them for every offer is a misrepresentation disapproval
+    whenever the landing page disagrees, and an affiliate is never the official
+    site."""
+    _readme_offer(offer, proof_points=[])
+    studio = CopyStudio(generator=TemplateCopywriter(), settings=settings)
+    invented = ("shipping", "ships in", "guarantee", "official", "minutes", "trusted by")
+    for angle in ANGLES:
+        brief = build_brief(offer, platform, angle_key=angle.key, keyword="sleep aid")
+        draft = studio.write(brief)
+        for text in draft.headlines + draft.descriptions + draft.primary_texts:
+            assert not any(word in text.lower() for word in invented), text
+
+
+def test_social_proof_without_proof_does_not_open_on_an_orphan_remark(
+    offer, settings
+):
+    """"That is usually the tell." follows a proof point. With none supplied it
+    was the opening line of the ad, referring to nothing."""
+    offer.proof_points = []
+    studio = CopyStudio(generator=TemplateCopywriter(), settings=settings)
+    draft = studio.write(build_brief(offer, Platform.META, angle_key="social_proof"))
+    for text in draft.primary_texts + draft.descriptions:
+        assert "usually the tell" not in text, text
+
+
 def test_truncation_prefers_a_sentence_boundary():
     text = "First sentence here. Second sentence runs on much longer than allowed."
     assert truncate_to_spec(text, 40) == "First sentence here."

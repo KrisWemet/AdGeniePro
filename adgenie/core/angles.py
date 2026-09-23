@@ -82,7 +82,7 @@ ANGLES: tuple[Angle, ...] = (
             "Join Them",
         ),
         body_pattern=(
-            "{proof} That is usually the tell. {product_name} {mechanism}. "
+            "{proof_tell} {product_name} {mechanism}. "
             "{benefit_line} {cta}"
         ),
     ),
@@ -207,7 +207,7 @@ ANGLES: tuple[Angle, ...] = (
         headline_patterns=(
             "{keyword}",
             "{keyword} - Compare",
-            "Official {keyword} Info",
+            "{keyword} Explained",
         ),
         body_pattern=(
             "Looking for {keyword}? {product_name} {mechanism}. {benefit_line} {cta}"
