@@ -959,7 +959,7 @@ adgenie/
   static/            dashboard
   cli.py             command line
   demo.py            end-to-end simulation
-tests/               956 tests
+tests/               961 tests
 legacy/              the original prototype scripts, kept for reference
 ```
 

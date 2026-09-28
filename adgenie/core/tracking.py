@@ -90,6 +90,14 @@ PLATFORM_CLICK_PARAM: dict[Platform, str] = {
 
 DEFAULT_ATTRIBUTION_DAYS = 30
 
+# The ad a visitor arrived from, kept in a first-party cookie on this domain
+# when the ad sends them on to a funnel builder's capture page. The sign-up
+# and thank-you pages belong to the builder, so the ad's token cannot travel
+# through them; back on /r from the thank-you button, the cookie can put it on
+# the HopLink. ClickBank does not give affiliates the buyer's email, so this is
+# the only link between a sale through that button and the ad.
+AD_COOKIE = "ag_s"
+
 _BOT_MARKERS = (
     "bot",
     "crawler",
@@ -180,6 +188,31 @@ def encode_subid(ctx: TrackingContext) -> str:
     # Base-36 digits include the segment letters, so the segments need an
     # explicit separator to stay unambiguous.
     return "-".join(parts)
+
+
+def names_an_ad(ctx: TrackingContext) -> bool:
+    """Whether a token says more than which offer it is for."""
+    return bool(ctx.creative_id or ctx.ad_group_id or ctx.campaign_id)
+
+
+def choose_subid(link: str, remembered: str | None) -> str:
+    """The token to credit a click to.
+
+    The link's own token, unless it names only the offer and the visitor's
+    cookie names an ad for that same offer. A link that names an ad is never
+    overridden: it is the more recent and more direct evidence.
+    """
+    if not remembered:
+        return link
+    here, before = decode_subid(link), decode_subid(remembered)
+    if (
+        here.offer_id
+        and before.offer_id == here.offer_id
+        and not names_an_ad(here)
+        and names_an_ad(before)
+    ):
+        return remembered
+    return link
 
 
 def decode_subid(token: str) -> TrackingContext:

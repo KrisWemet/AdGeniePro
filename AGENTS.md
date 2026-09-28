@@ -11,7 +11,7 @@ why; this explains what will bite you while changing it.
 
 ```bash
 pip install -r requirements.txt
-python3 -m pytest tests/          # 956 tests, ~75s, no credentials needed
+python3 -m pytest tests/          # 961 tests, ~75s, no credentials needed
 python3 -m adgenie.cli demo --days 21   # full pipeline against the simulator
 ```
 
@@ -153,7 +153,7 @@ adgenie/
   research/   Meta Ad Library
   api/        FastAPI routes
   cli.py      every capability has a command
-tests/        956 of them; start here to understand a subsystem
+tests/        961 of them; start here to understand a subsystem
 ```
 
 `README.md` has a fuller map and the reasoning behind each subsystem.
@@ -178,11 +178,13 @@ Roughly in the order they block getting real ads running:
    at every generated asset before starting one. Nothing collects a finished
    task by id either, so a timed-out or misread task has to be fetched by
    hand rather than resubmitted and paid for again.
-5. A ClickBank sale is matched to a click by `tid`, never to a lead. Behind a
-   capture page, a sale from the thank-you page or an email is credited to the
-   offer at best, so leads never show realised value and the measured value
-   per lead falls toward zero as cohorts mature, while ads are judged on it.
-   Matching the buyer's hashed email to the lead would close it.
+5. A ClickBank sale is matched to a click by `tid`, never to a lead:
+   ClickBank sends affiliates no buyer email. Behind a capture page, the
+   `ag_s` cookie credits a thank-you or email click made in the same browser
+   to the ad the visitor came from; one made elsewhere is credited to the
+   offer alone. Because no sale links to a lead, the measured value per lead
+   falls toward zero as cohorts mature, and a funnel campaign ends up judged
+   on the sales credited to its ads rather than on its leads.
 6. `preflight` performs read-only checks, but cannot prove write permissions,
    policy approval or successful affiliate sale attribution.
 7. Meta's asset feed (`META_DYNAMIC_CREATIVE`) is unverified against a live

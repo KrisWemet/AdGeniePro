@@ -11,11 +11,14 @@ from sqlalchemy.orm import Session
 
 from ..config import get_settings
 from ..core.tracking import (
+    AD_COOKIE,
+    DEFAULT_ATTRIBUTION_DAYS,
     PLATFORM_CLICK_PARAM,
     PLATFORM_MACROS,
     TrackingContext,
     decode_subid,
     encode_subid,
+    names_an_ad,
 )
 from ..db import get_session
 from ..models import Offer
@@ -123,11 +126,25 @@ def offer_landing(
     )
     settings = get_settings()
     if settings.systeme_capture_url:
-        return RedirectResponse(
+        response = RedirectResponse(
             _merge_query(settings.systeme_capture_url, params),
             status_code=302,
             headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
         )
+        # Sent back only to /r, and only for as long as a click is credited.
+        # A link naming just the offer adds nothing, and written over the
+        # cookie it would erase the ad the visitor first came from.
+        if names_an_ad(decode_subid(params["s"])):
+            response.set_cookie(
+                AD_COOKIE,
+                params["s"],
+                max_age=DEFAULT_ATTRIBUTION_DAYS * 24 * 3600,
+                path="/r",
+                httponly=True,
+                samesite="lax",
+                secure=settings.public_base_url.startswith("https://"),
+            )
+        return response
 
     cta = "/r?" + urlencode(params)
     html = (
@@ -159,6 +176,7 @@ def privacy() -> HTMLResponse:
     return _support_page(
         "Privacy",
         """<p>The offer page does not collect names, email addresses, or payment details. When a visitor chooses to continue, AdGenie Pro records campaign attribution, a random click identifier, request metadata, and a salted hash of the network address. It does not store the original network address.</p>
+<p>When the offer continues to a sign-up page, a cookie on this site keeps the code of the ad you came from for up to 30 days, so that a later click through to the offer is credited to the same ad. It holds no personal information.</p>
 <p>ClickBank and the product seller operate the destination and checkout under their own privacy terms. Do not submit sensitive information unless you have reviewed those terms.</p>""",
     )
 

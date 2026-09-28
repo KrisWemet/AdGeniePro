@@ -32,6 +32,15 @@ PUBLIC_BASE_URL/api/systeme/optin?offer_id=1
 
 Send `POSTBACK_SECRET` as `X-Webhook-Secret`. If Systeme cannot set the header, add the same value as a `secret` query parameter. The adapter stores the normalized email hash and attribution fields, not the raw body. Retries do not make a second lead.
 
+Use Systeme's Webhook service with the `CONTACT_OPT_IN` event. Its payload
+carries the contact's `sourceURL`, the capture page address with the ad's `s`
+token in it, which is how the lead is credited to the ad. It signs requests
+with `X-Webhook-Signature` rather than sending a custom header, and AdGenie
+does not verify that signature yet, so put the secret in the URL:
+`PUBLIC_BASE_URL/api/systeme/optin?offer_id=1&secret=POSTBACK_SECRET`. The
+older automation-rule webhook sends no `sourceURL`; with it, the lead is only
+credited to the ad if the form has a hidden field with the slug `s`.
+
 ClickBank INS remains the source of truth for sales, refunds and rebills.
 
 ## Before ads point here
@@ -50,5 +59,9 @@ Checked on 2026-09-28 against the live pages, read-only:
   `oa`). That records the click and sends the visitor to the offer's HopLink
   with a `tid`, which is how a ClickBank sale is matched. A sale through a bare
   HopLink carries no `tid` and is credited to nothing.
-- Even through that link, the sale is credited to the offer, not to the ad
-  that earned the lead: see the known gap in `AGENTS.md`.
+- That link names only the offer, and ClickBank sends affiliates no buyer
+  email to match a sale to a lead. What names the ad is a cookie: the ad link
+  sets `ag_s` on this domain before sending the visitor to Systeme, and `/r`
+  reads it, so a click from the thank-you page, or an email opened in the same
+  browser, is credited to the ad the visitor came from. A click from another
+  device or browser is credited to the offer alone.

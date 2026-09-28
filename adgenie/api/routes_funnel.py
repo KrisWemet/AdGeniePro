@@ -92,6 +92,21 @@ def _systeme_optin_fields(payload: dict[str, Any]) -> tuple[str | None, str | No
         ("data", "s"), ("data", "subid"),
     ))
     if not subid:
+        # A hidden form field named "s", for a webhook that sends no source URL.
+        for path in (("contact", "fields"), ("data", "contact", "fields"), ("fields",)):
+            fields = _nested(payload, *path)
+            for field in fields if isinstance(fields, list) else ():
+                if (
+                    isinstance(field, dict)
+                    and str(field.get("slug") or "").lower() in ("s", "subid")
+                    and isinstance(field.get("value"), str)
+                    and field["value"].strip()
+                ):
+                    subid = field["value"].strip()
+                    break
+            if subid:
+                break
+    if not subid:
         source = _first_text(payload, (
             ("sourceURL",), ("sourceUrl",), ("source_url",),
             ("contact", "sourceURL"), ("contact", "sourceUrl"),
