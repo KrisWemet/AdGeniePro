@@ -342,6 +342,20 @@ def test_a_desktop_only_page_warns():
     assert "NOT_MOBILE_READY" in codes(audit)
 
 
+@pytest.mark.parametrize("wording", [
+    "We may get paid if you buy through our links.",
+    "We get paid if you buy through this link.",
+])
+def test_a_plain_language_disclosure_counts(wording):
+    """The wording on the live Water Freedom capture page, which the check
+    missed. Plain language is what the FTC asks for."""
+    audit = audit_landing_page(
+        "https://lp.test/x",
+        fetcher=fetcher_for(serve(CLEAN_PAGE.replace("We may earn a commission", wording))),
+    )
+    assert "NO_AFFILIATE_DISCLOSURE_ON_PAGE" not in codes(audit)
+
+
 def test_a_page_with_no_disclosure_warns():
     audit = audit_landing_page(
         "https://lp.test/x",

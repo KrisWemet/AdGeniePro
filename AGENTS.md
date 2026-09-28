@@ -11,7 +11,7 @@ why; this explains what will bite you while changing it.
 
 ```bash
 pip install -r requirements.txt
-python3 -m pytest tests/          # 954 tests, ~75s, no credentials needed
+python3 -m pytest tests/          # 956 tests, ~75s, no credentials needed
 python3 -m adgenie.cli demo --days 21   # full pipeline against the simulator
 ```
 
@@ -153,7 +153,7 @@ adgenie/
   research/   Meta Ad Library
   api/        FastAPI routes
   cli.py      every capability has a command
-tests/        954 of them; start here to understand a subsystem
+tests/        956 of them; start here to understand a subsystem
 ```
 
 `README.md` has a fuller map and the reasoning behind each subsystem.
@@ -178,18 +178,23 @@ Roughly in the order they block getting real ads running:
    at every generated asset before starting one. Nothing collects a finished
    task by id either, so a timed-out or misread task has to be fetched by
    hand rather than resubmitted and paid for again.
-5. `preflight` performs read-only checks, but cannot prove write permissions,
+5. A ClickBank sale is matched to a click by `tid`, never to a lead. Behind a
+   capture page, a sale from the thank-you page or an email is credited to the
+   offer at best, so leads never show realised value and the measured value
+   per lead falls toward zero as cohorts mature, while ads are judged on it.
+   Matching the buyer's hashed email to the lead would close it.
+6. `preflight` performs read-only checks, but cannot prove write permissions,
    policy approval or successful affiliate sale attribution.
-6. Meta's asset feed (`META_DYNAMIC_CREATIVE`) is unverified against a live
+7. Meta's asset feed (`META_DYNAMIC_CREATIVE`) is unverified against a live
    account and off by default. It is also a poor fit on purpose: it lets Meta
    pick the headline, body and image and then reports delivery for the creative
    as a whole, while the optimizer scales and kills per creative. Leave the
    variant testing in AdGenie, where the winner is attributable.
-7. Nothing runs on a schedule. `sync`, `optimize`, `landing --sweep`,
+8. Nothing runs on a schedule. `sync`, `optimize`, `landing --sweep`,
    `push-conversions`, `rotate` and `portfolio` are all manual, `run_cycle`
    does not call `sync_metrics`, and two overlapping runs would both read the
    same budget headroom. Deliberate for the first trial; revisit after revenue
    reconciles.
-8. Bred variants are created paused and no optimizer rule ever proposes
+9. Bred variants are created paused and no optimizer rule ever proposes
    `RESUME`, so creative fatigue produces ads nothing starts. Compliance-blocked
    creatives reach `PENDING_REVIEW` with no list endpoint, override path or UI.

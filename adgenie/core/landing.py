@@ -301,9 +301,12 @@ _POLICY_LINK_PATTERNS = {
     "contact": r"contact|support|about",
 }
 
+# Plain wording counts: the FTC asks for disclosures people understand, and
+# "We may get paid if you buy through our links" was missed on a live page.
 _DISCLOSURE_RE = re.compile(
     r"\b(affiliate|commission|paid link|sponsored|advertorial|#ad|"
-    r"we may (earn|receive)|material connection)\b",
+    r"we may (earn|receive|get paid|be paid)|we (get|are) paid|paid if you buy|"
+    r"material connection)\b",
     re.IGNORECASE,
 )
 
