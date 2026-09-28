@@ -165,6 +165,11 @@ class KieClient(MediaProvider):
             payload["resolution"] = request.extra.get("resolution", "1K")
             payload["output_format"] = request.extra.get("output_format", "png")
         elif model == "veo-3-1":
+            # kie.ai's current Veo contract is this jobs API; the older
+            # /api/v1/veo/generate endpoint is documented as the old version.
+            # enable_fallback is deprecated there ("remove this parameter from
+            # your requests"). Translation is off by default and stays off
+            # unless asked for, as the prompts built here are in English.
             if request.reference_image_url:
                 payload["image_urls"] = [request.reference_image_url]
                 payload["generation_type"] = request.extra.get(
@@ -179,10 +184,9 @@ class KieClient(MediaProvider):
                 if request.aspect_ratio in {"16:9", "9:16"}
                 else "16:9"
             )
-            payload["enable_fallback"] = request.extra.get("enable_fallback", False)
-            payload["enable_translation"] = request.extra.get(
-                "enable_translation", True
-            )
+            for key in ("enable_translation", "resolution", "duration", "watermark"):
+                if key in request.extra:
+                    payload[key] = request.extra[key]
         elif model.startswith("elevenlabs/text-to-speech"):
             # Speech takes text, not a prompt, and a voice by name. The
             # prompt field would be rejected rather than ignored.
@@ -200,15 +204,24 @@ class KieClient(MediaProvider):
             # which rejects plain text, a missing speaker list, and any other
             # id format.
             speaker = "Speaker 1"
+            voice = {
+                "speaker_id": speaker,
+                "voice_name": request.extra.get("voice") or self.settings.kie_tts_voice,
+                # Required by the documented schema, though the live API has
+                # accepted requests without it. American, as offers target the
+                # US by default; a request can ask for another.
+                "accent": request.extra.get("accent") or "American (Gen)",
+            }
+            for key in ("style", "pace", "audio_profile"):
+                if request.extra.get(key):
+                    voice[key] = request.extra[key]
             payload = {
-                "speakers": [
-                    {
-                        "speaker_id": speaker,
-                        "voice_name": request.extra.get("voice") or self.settings.kie_tts_voice,
-                    }
-                ],
+                "speakers": [voice],
                 "dialogue_turns": [{"speaker_id": speaker, "text": request.prompt}],
             }
+            for key in ("scene", "sample_context", "temperature"):
+                if key in request.extra:
+                    payload[key] = request.extra[key]
         elif _is_lip_sync(model):
             # A lip-sync model animates a still to an existing voice track.
             # Both arrive as URLs the provider fetches, and a task submitted

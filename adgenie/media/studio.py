@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from ..config import Settings, get_settings
 from ..models import Creative, MediaAsset, MediaKind, MediaStatus, Offer, Platform
-from .base import MediaError, MediaProvider, MediaRequest
+from .base import MediaError, MediaProvider, MediaRequest, MediaResult
 from .prompts import PromptPlan, build_image_prompt, build_video_prompt
 from .sandbox import SandboxMediaProvider
 from .specs import default_placements, get_media_spec
@@ -47,6 +47,19 @@ def get_media_provider(settings: Settings | None = None) -> MediaProvider:
         "are correctly sized but are not real creative."
     )
     return SandboxMediaProvider()
+
+
+def _credits(result: MediaResult) -> float | None:
+    """What kie.ai says a task cost, when it says.
+
+    Recorded per task because the credit balance is shared by everything the
+    key generates, so it cannot say what one asset cost. Failed tasks have
+    reported zero.
+    """
+    value = (result.raw or {}).get("creditsConsumed")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value
 
 
 class MediaStudio:
@@ -237,6 +250,7 @@ class MediaStudio:
                 asset, "presenter",
                 task_id=still.task_id, url=still.remote_url,
                 asset_id=still.id, model=still.model,
+                credits=(still.extra or {}).get("credits"),
             )
             if still.status is not MediaStatus.READY or not still.remote_url:
                 return self._fail(
@@ -259,6 +273,7 @@ class MediaStudio:
             asset, "voice",
             task_id=voice.task_id, url=voice.urls[0] if voice.urls else None,
             model=voice.model or self.settings.kie_tts_model,
+            credits=_credits(voice),
         )
         if not voice.ok:
             return self._fail(asset, f"voice: {voice.error or voice.state}")
@@ -284,6 +299,7 @@ class MediaStudio:
         self._record_step(
             asset, "lip_sync",
             task_id=video.task_id, url=asset.remote_url, model=asset.model,
+            credits=_credits(video),
         )
         if not video.ok:
             return self._fail(asset, f"lip-sync: {video.error or video.state}")
@@ -323,10 +339,19 @@ class MediaStudio:
         # Reassigned rather than mutated in place: a change inside a JSON
         # column is invisible to the session and would never be written.
         extra = dict(asset.extra or {})
-        extra["steps"] = {
+        steps = {
             **(extra.get("steps") or {}),
             name: {k: v for k, v in details.items() if v is not None},
         }
+        extra["steps"] = steps
+        # The video's cost is known only while every step reported its own. A
+        # task that timed out is charged but not yet reported, and a partial
+        # sum would understate what was spent.
+        costs = [step.get("credits") for step in steps.values()]
+        if all(cost is not None for cost in costs):
+            extra["credits"] = round(sum(costs), 2)
+        else:
+            extra.pop("credits", None)
         asset.extra = extra
 
     # ------------------------------------------------------------------
@@ -388,6 +413,9 @@ class MediaStudio:
         asset.task_id = result.task_id
         asset.remote_url = result.urls[0] if result.urls else None
         asset.model = result.model or asset.model
+        credits = _credits(result)
+        if credits is not None:
+            asset.extra = {**(asset.extra or {}), "credits": credits}
 
         if not result.ok:
             asset.status = MediaStatus.FAILED

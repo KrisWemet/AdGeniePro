@@ -425,6 +425,11 @@ scripts), 2 for the voice and 112 for the lip-sync. The voice is Gemini's;
 ElevenLabs through kie.ai failed every request when tried, and is one setting
 away if it recovers.
 
+Each asset records what kie.ai charged for it as `credits` in its `extra`: per
+step for a presenter video, with the total once every step has reported. The
+account balance is shared by everything the key generates, so it cannot say
+what one video cost.
+
 ---
 
 ## Wiring up tracking
@@ -929,7 +934,7 @@ adgenie/
   static/            dashboard
   cli.py             command line
   demo.py            end-to-end simulation
-tests/               938 tests
+tests/               941 tests
 legacy/              the original prototype scripts, kept for reference
 ```
 

@@ -11,7 +11,7 @@ why; this explains what will bite you while changing it.
 
 ```bash
 pip install -r requirements.txt
-python3 -m pytest tests/          # 938 tests, ~70s, no credentials needed
+python3 -m pytest tests/          # 941 tests, ~75s, no credentials needed
 python3 -m adgenie.cli demo --days 21   # full pipeline against the simulator
 ```
 
@@ -106,9 +106,12 @@ software.
   here are not evidence.
 - **Verified live:** presenter videos through kie.ai, end to end: the
   presenter image, Gemini speech, the lip-sync, polling and downloads, which
-  produced a 14.4-second 9:16 video with sound. ElevenLabs speech through
+  produced a 14.4-second 9:16 video with sound. Gemini speech was checked
+  again with the accent kie.ai's docs require, and the credit charge each
+  task reports is read from the live task record. ElevenLabs speech through
   kie.ai is not verified: every request failed on kie's side when tried,
-  which is why Gemini is the default.
+  which is why Gemini is the default. Veo video follows kie.ai's docs but has
+  not been run live.
 
 When you fix something that first contact reveals, say so in the commit. It is
 the most valuable information in this repository.
@@ -144,7 +147,7 @@ adgenie/
   research/   Meta Ad Library
   api/        FastAPI routes
   cli.py      every capability has a command
-tests/        938 of them; start here to understand a subsystem
+tests/        941 of them; start here to understand a subsystem
 ```
 
 `README.md` has a fuller map and the reasoning behind each subsystem.

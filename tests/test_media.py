@@ -159,6 +159,8 @@ def test_submit_sends_model_and_input(kie_settings):
 
 
 def test_video_requests_use_the_current_veo_contract(kie_settings):
+    """kie.ai documents enable_fallback as deprecated and asks for it to be
+    removed from requests; translation is off unless asked for."""
     seen = {}
 
     def handler(request):
@@ -171,8 +173,26 @@ def test_video_requests_use_the_current_veo_contract(kie_settings):
     assert seen["model"] == "veo-3-1"
     assert seen["input"]["generation_type"] == "TEXT_2_VIDEO"
     assert seen["input"]["aspect_ratio"] == "16:9"
-    assert seen["input"]["enable_translation"] is True
+    assert "enable_fallback" not in seen["input"]
+    assert "enable_translation" not in seen["input"]
     assert "duration" not in seen["input"]
+
+
+def test_a_deprecated_veo_flag_is_not_sent_even_when_asked_for(kie_settings):
+    seen = {}
+
+    def handler(request):
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, json={"data": {"taskId": "t"}})
+
+    _kie(handler, kie_settings).submit(
+        MediaRequest(
+            prompt="x", kind="video",
+            extra={"enable_fallback": True, "resolution": "1080p"},
+        )
+    )
+    assert "enable_fallback" not in seen["input"]
+    assert seen["input"]["resolution"] == "1080p"
 
 
 def test_an_error_code_inside_a_200_response_is_still_an_error(kie_settings):

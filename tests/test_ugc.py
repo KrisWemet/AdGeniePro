@@ -401,14 +401,18 @@ def test_elevenlabs_speech_is_requested_as_text_and_a_voice_not_a_prompt(kie_set
 
 def test_gemini_speech_is_one_speaker_with_one_turn(kie_settings):
     """The shape the live API accepted, after rejecting plain text, a missing
-    speaker list, and speaker ids not of the form "Speaker N"."""
+    speaker list, and speaker ids not of the form "Speaker N". The accent is
+    required by the documented schema even though the live API has not yet
+    insisted on it."""
     seen: dict = {}
     _kie(_capture(seen), kie_settings).submit(
         MediaRequest(prompt="Here's what it does.", kind="audio", extra={"voice": "Puck"})
     )
     assert seen["model"] == kie_settings.kie_tts_model == "google/gemini-3-1-flash-tts"
     assert seen["input"] == {
-        "speakers": [{"speaker_id": "Speaker 1", "voice_name": "Puck"}],
+        "speakers": [
+            {"speaker_id": "Speaker 1", "voice_name": "Puck", "accent": "American (Gen)"}
+        ],
         "dialogue_turns": [{"speaker_id": "Speaker 1", "text": "Here's what it does."}],
     }
 
@@ -650,6 +654,56 @@ def test_a_timed_out_task_is_recorded_so_it_is_collected_not_resubmitted(
 
     assert asset.status is MediaStatus.FAILED
     assert asset.extra["steps"]["lip_sync"] == {"task_id": "t-slow", "state": "unfinished"}
+
+
+class _Billed(SandboxMediaProvider):
+    """Reports a charge per task, as kie.ai's task record does."""
+
+    CHARGES = {"image": 18.0, "audio": 2.01, "video": 112.0}
+
+    def generate(self, request: MediaRequest) -> MediaResult:
+        result = super().generate(request)
+        result.raw = {**result.raw, "creditsConsumed": self.CHARGES[request.kind]}
+        return result
+
+
+class _BilledUntil(_Billed, _FailsAt):
+    """Charges for each task until the named kind, which fails."""
+
+
+def test_a_presenter_video_records_what_each_step_cost_and_the_total(
+    session, settings, tmp_path, launched_creative
+):
+    """The credit balance is shared by everything the key generates, so the
+    charge on each task is the only record of what one video cost."""
+    settings.media_storage_dir = str(tmp_path / "media")
+    studio = MediaStudio(session, settings, provider=_Billed())
+    asset = studio.generate_presenter_video(
+        studio.presenter_plan_for(launched_creative), creative_id=launched_creative.id
+    )
+
+    assert asset.status is MediaStatus.READY
+    steps = asset.extra["steps"]
+    assert [steps[s]["credits"] for s in ("presenter", "voice", "lip_sync")] == [
+        18.0, 2.01, 112.0,
+    ]
+    assert asset.extra["credits"] == 132.01
+
+
+def test_no_total_is_claimed_while_a_charged_task_is_unreported(
+    session, settings, tmp_path, launched_creative
+):
+    """A timed-out task is charged but reports nothing yet. A total without it
+    would understate the spend by the most expensive step."""
+    settings.media_storage_dir = str(tmp_path / "media")
+    provider = _BilledUntil("video", payload={"task_id": "t-slow"}, code="TIMEOUT")
+    studio = MediaStudio(session, settings, provider=provider)
+    asset = studio.generate_presenter_video(
+        studio.presenter_plan_for(launched_creative), creative_id=launched_creative.id
+    )
+
+    assert asset.extra["steps"]["voice"]["credits"] == 2.01
+    assert "credits" not in asset.extra
 
 
 def test_a_failed_voice_never_reaches_the_lip_sync(session, settings, tmp_path, launched_creative):
