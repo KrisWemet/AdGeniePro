@@ -644,7 +644,7 @@ def test_a_failure_part_way_records_what_was_already_paid_for(
 def test_a_timed_out_task_is_recorded_so_it_is_collected_not_resubmitted(
     session, settings, tmp_path, launched_creative
 ):
-    """A timed-out task may still finish and is charged either way."""
+    """A timed-out task may still finish, and is charged if it does."""
     settings.media_storage_dir = str(tmp_path / "media")
     provider = _FailsAt("video", payload={"task_id": "t-slow"}, code="TIMEOUT")
     studio = MediaStudio(session, settings, provider=provider)
@@ -704,6 +704,25 @@ def test_no_total_is_claimed_while_a_charged_task_is_unreported(
 
     assert asset.extra["steps"]["voice"]["credits"] == 2.01
     assert "credits" not in asset.extra
+
+
+def test_a_step_that_failed_upstream_is_recorded_with_its_id_and_charge(
+    session, settings, tmp_path, launched_creative
+):
+    """A failed step is not left out of the record: its id is what support
+    asks for, and its zero charge keeps the total true."""
+    settings.media_storage_dir = str(tmp_path / "media")
+    provider = _BilledUntil("audio", payload={"task_id": "t-v", "creditsConsumed": 0.0})
+    studio = MediaStudio(session, settings, provider=provider)
+    asset = studio.generate_presenter_video(
+        studio.presenter_plan_for(launched_creative), creative_id=launched_creative.id
+    )
+
+    assert asset.status is MediaStatus.FAILED
+    assert asset.extra["steps"]["voice"] == {
+        "task_id": "t-v", "state": "failed", "credits": 0.0,
+    }
+    assert asset.extra["credits"] == 18.0
 
 
 def test_a_failed_voice_never_reaches_the_lip_sync(session, settings, tmp_path, launched_creative):

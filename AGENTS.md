@@ -11,7 +11,7 @@ why; this explains what will bite you while changing it.
 
 ```bash
 pip install -r requirements.txt
-python3 -m pytest tests/          # 941 tests, ~75s, no credentials needed
+python3 -m pytest tests/          # 945 tests, ~75s, no credentials needed
 python3 -m adgenie.cli demo --days 21   # full pipeline against the simulator
 ```
 
@@ -110,8 +110,12 @@ software.
   again with the accent kie.ai's docs require, and the credit charge each
   task reports is read from the live task record. ElevenLabs speech through
   kie.ai is not verified: every request failed on kie's side when tried,
-  which is why Gemini is the default. Veo video follows kie.ai's docs but has
-  not been run live.
+  which is why Gemini is the default.
+- **Verified live:** Veo video through kie.ai, end to end. kie.ai ran
+  `veo-3-1` as Veo 3.1 Fast, eight seconds at 720p, for 60 credits. The first
+  attempt failed on kie's side ("Internal Error, Please try again later") and
+  was not charged; the same request succeeded four minutes later. The file was
+  720x1280 while the asset records the placement's 1080x1920.
 
 When you fix something that first contact reveals, say so in the commit. It is
 the most valuable information in this repository.
@@ -147,7 +151,7 @@ adgenie/
   research/   Meta Ad Library
   api/        FastAPI routes
   cli.py      every capability has a command
-tests/        941 of them; start here to understand a subsystem
+tests/        945 of them; start here to understand a subsystem
 ```
 
 `README.md` has a fuller map and the reasoning behind each subsystem.
@@ -163,18 +167,24 @@ Roughly in the order they block getting real ads running:
    is why `GoogleAdsClient.upload_media` refuses rather than uploading an asset
    nothing would reference.
 3. First contact with the live Meta and Google APIs has not happened.
-4. `preflight` performs read-only checks, but cannot prove write permissions,
+4. Nothing checks what a generated image or video shows. The default kie.ai
+   models take no negative prompt, so `NEGATIVE_PROMPT` never reaches them,
+   and nothing keeps children out of a scene: the first live Veo clip, for a
+   sleep supplement, opened on a sleeping baby and showed made-up packaging
+   with garbled label text. Launches create ads paused unless told otherwise;
+   look at every generated asset before starting one.
+5. `preflight` performs read-only checks, but cannot prove write permissions,
    policy approval or successful affiliate sale attribution.
-5. Meta's asset feed (`META_DYNAMIC_CREATIVE`) is unverified against a live
+6. Meta's asset feed (`META_DYNAMIC_CREATIVE`) is unverified against a live
    account and off by default. It is also a poor fit on purpose: it lets Meta
    pick the headline, body and image and then reports delivery for the creative
    as a whole, while the optimizer scales and kills per creative. Leave the
    variant testing in AdGenie, where the winner is attributable.
-6. Nothing runs on a schedule. `sync`, `optimize`, `landing --sweep`,
+7. Nothing runs on a schedule. `sync`, `optimize`, `landing --sweep`,
    `push-conversions`, `rotate` and `portfolio` are all manual, `run_cycle`
    does not call `sync_metrics`, and two overlapping runs would both read the
    same budget headroom. Deliberate for the first trial; revisit after revenue
    reconciles.
-7. Bred variants are created paused and no optimizer rule ever proposes
+8. Bred variants are created paused and no optimizer rule ever proposes
    `RESUME`, so creative fatigue produces ads nothing starts. Compliance-blocked
    creatives reach `PENDING_REVIEW` with no list endpoint, override path or UI.

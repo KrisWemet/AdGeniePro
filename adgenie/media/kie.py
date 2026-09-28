@@ -170,6 +170,9 @@ class KieClient(MediaProvider):
             # enable_fallback is deprecated there ("remove this parameter from
             # your requests"). Translation is off by default and stays off
             # unless asked for, as the prompts built here are in English.
+            # Seen live: kie.ai runs this id as Veo 3.1 Fast, eight seconds at
+            # 720p unless told otherwise, for 60 credits. There is no negative
+            # prompt field, so request.negative_prompt does not reach Veo.
             if request.reference_image_url:
                 payload["image_urls"] = [request.reference_image_url]
                 payload["generation_type"] = request.extra.get(
@@ -337,7 +340,7 @@ class KieClient(MediaProvider):
                     raise MediaError(
                         f"kie.ai task {task_id} reported success with no output",
                         code="EMPTY_RESULT",
-                        payload=result.raw,
+                        payload={**result.raw, "task_id": task_id},
                     )
                 logger.info("kie.ai task %s produced %s asset(s)", task_id, len(result.urls))
                 return result
@@ -345,7 +348,7 @@ class KieClient(MediaProvider):
                 raise MediaError(
                     f"kie.ai task {task_id} failed: {result.error}",
                     code="GENERATION_FAILED",
-                    payload=result.raw,
+                    payload={**result.raw, "task_id": task_id},
                 )
 
         raise MediaError(

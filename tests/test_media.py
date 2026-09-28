@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from adgenie.config import Settings
-from adgenie.media.base import MediaError, MediaRequest
+from adgenie.media.base import MediaError, MediaRequest, MediaResult
 from adgenie.media.kie import KieClient, _extract_urls
 from adgenie.media.prompts import (
     NEGATIVE_PROMPT,
@@ -274,6 +274,25 @@ def test_a_failed_task_raises_with_its_reason(kie_settings):
         _kie(handler, kie_settings).generate(MediaRequest(prompt="x"))
 
 
+def test_a_failed_task_carries_its_id_and_what_it_was_charged(kie_settings):
+    """The shape a live Veo failure took. kie.ai's support asks for the task
+    id, and the charge shows the failure cost nothing."""
+    def handler(request):
+        if request.url.path.endswith("createTask"):
+            return httpx.Response(200, json={"data": {"taskId": "t-1"}})
+        return httpx.Response(200, json={"data": {
+            "taskId": "t-1", "state": "fail", "failCode": "500",
+            "failMsg": "Internal Error, Please try again later.",
+            "creditsConsumed": 0.0,
+        }})
+
+    with pytest.raises(MediaError, match="Internal Error") as failure:
+        _kie(handler, kie_settings).generate(MediaRequest(prompt="x", kind="video"))
+    assert failure.value.code == "GENERATION_FAILED"
+    assert failure.value.payload["task_id"] == "t-1"
+    assert failure.value.payload["creditsConsumed"] == 0.0
+
+
 def test_a_timeout_says_not_to_resubmit(kie_settings):
     """Resubmitting a running task is charged twice."""
     kie_settings.kie_poll_timeout_seconds = 0.2
@@ -469,6 +488,46 @@ def test_a_provider_failure_is_recorded_not_raised(
     assets = studio.generate_for_creative(launched_creative, platform=Platform.META)
     assert all(a.status is MediaStatus.FAILED for a in assets)
     assert launched_creative.media_urls == []
+
+
+class _FailsUpstream(SandboxMediaProvider):
+    def __init__(self, code: str, payload: dict):
+        super().__init__()
+        self.code, self.payload = code, payload
+
+    def generate(self, request: MediaRequest) -> MediaResult:
+        raise MediaError("kie.ai task failed", code=self.code, payload=self.payload)
+
+
+def test_a_task_that_failed_upstream_keeps_its_id_and_its_charge(
+    session, settings, launched_creative, tmp_path
+):
+    """Before this, a failed asset kept its task id only inside the error text
+    and recorded no charge, though kie.ai reported both."""
+    settings.media_storage_dir = str(tmp_path / "media")
+    provider = _FailsUpstream(
+        "GENERATION_FAILED", {"task_id": "t-f", "creditsConsumed": 0.0}
+    )
+    [asset] = MediaStudio(session, settings, provider=provider).generate_for_creative(
+        launched_creative, kind="video", placements=["meta_reel_video"]
+    )
+    assert asset.status is MediaStatus.FAILED
+    assert asset.task_id == "t-f"
+    assert asset.extra["credits"] == 0.0
+
+
+def test_a_timed_out_task_keeps_its_id_but_claims_no_charge(
+    session, settings, launched_creative, tmp_path
+):
+    """It may still finish, so its id is what collects it. What it costs is
+    not known until it does."""
+    settings.media_storage_dir = str(tmp_path / "media")
+    provider = _FailsUpstream("TIMEOUT", {"task_id": "t-slow"})
+    [asset] = MediaStudio(session, settings, provider=provider).generate_for_creative(
+        launched_creative, kind="video", placements=["meta_reel_video"]
+    )
+    assert asset.task_id == "t-slow"
+    assert "credits" not in asset.extra
 
 
 def test_video_generation_records_duration(session, settings, launched_creative, tmp_path):

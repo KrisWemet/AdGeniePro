@@ -311,6 +311,14 @@ One asset per placement, at the size the placement serves: Meta feed 4:5,
 square 1:1, story 9:16, Google Demand Gen 1.91:1, 1:1 and 4:5. Text-only
 formats generate nothing.
 
+**Look at what comes back before an ad starts.** Screening reads the prompt,
+not the result. The first live Veo clip, for a sleep supplement, opened on a
+sleeping baby and ended on made-up packaging with garbled label text; neither
+was in the prompt. Nano Banana Pro and Veo 3.1, the default models, take no
+negative prompt, so the avoid-list the planner writes does not reach them.
+Launches create ads paused unless given `--start-active`, and that pause is the
+review. A Veo clip is kie.ai's Veo 3.1 Fast: eight seconds at 720p, 60 credits.
+
 ### Getting it onto the ad
 
 Generation produces a file. An ad needs a reference the platform will still
@@ -934,7 +942,7 @@ adgenie/
   static/            dashboard
   cli.py             command line
   demo.py            end-to-end simulation
-tests/               941 tests
+tests/               945 tests
 legacy/              the original prototype scripts, kept for reference
 ```
 

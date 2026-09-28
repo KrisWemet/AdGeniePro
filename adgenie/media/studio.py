@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from ..config import Settings, get_settings
 from ..models import Creative, MediaAsset, MediaKind, MediaStatus, Offer, Platform
-from .base import MediaError, MediaProvider, MediaRequest, MediaResult
+from .base import MediaError, MediaProvider, MediaRequest
 from .prompts import PromptPlan, build_image_prompt, build_video_prompt
 from .sandbox import SandboxMediaProvider
 from .specs import default_placements, get_media_spec
@@ -49,14 +49,15 @@ def get_media_provider(settings: Settings | None = None) -> MediaProvider:
     return SandboxMediaProvider()
 
 
-def _credits(result: MediaResult) -> float | None:
-    """What kie.ai says a task cost, when it says.
+def _credits(record: dict | None) -> float | None:
+    """What kie.ai's task record says the task cost, when it says.
 
     Recorded per task because the credit balance is shared by everything the
-    key generates, so it cannot say what one asset cost. Failed tasks have
-    reported zero.
+    key generates, so it cannot say what one asset cost. A running task shows
+    its charge already; a task that failed on kie.ai's side shows zero, and
+    the balance confirms it was not charged.
     """
-    value = (result.raw or {}).get("creditsConsumed")
+    value = (record or {}).get("creditsConsumed")
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return value
@@ -273,7 +274,7 @@ class MediaStudio:
             asset, "voice",
             task_id=voice.task_id, url=voice.urls[0] if voice.urls else None,
             model=voice.model or self.settings.kie_tts_model,
-            credits=_credits(voice),
+            credits=_credits(voice.raw),
         )
         if not voice.ok:
             return self._fail(asset, f"voice: {voice.error or voice.state}")
@@ -299,7 +300,7 @@ class MediaStudio:
         self._record_step(
             asset, "lip_sync",
             task_id=video.task_id, url=asset.remote_url, model=asset.model,
-            credits=_credits(video),
+            credits=_credits(video.raw),
         )
         if not video.ok:
             return self._fail(asset, f"lip-sync: {video.error or video.state}")
@@ -324,10 +325,19 @@ class MediaStudio:
         exc: MediaError | None = None,
     ) -> MediaAsset:
         task_id = exc.payload.get("task_id") if exc is not None else None
-        if step and task_id:
-            # A task that timed out may still finish, and is charged either
-            # way. Its id is what lets it be collected rather than resubmitted.
+        if step and task_id and exc.code == "TIMEOUT":
+            # A task that timed out may still finish, and is charged if it
+            # does. Its id is what lets it be collected rather than resubmitted
+            # and paid for twice.
             self._record_step(asset, step, task_id=task_id, state="unfinished")
+        elif step and task_id:
+            # Ran and failed on the provider's side. The id is what kie.ai's
+            # support asks for; the charge it reports has been zero for every
+            # failure seen so far.
+            self._record_step(
+                asset, step,
+                task_id=task_id, state="failed", credits=_credits(exc.payload),
+            )
         asset.status = MediaStatus.FAILED
         asset.error = error
         logger.error("Presenter video %s failed: %s", asset.id, error)
@@ -406,6 +416,12 @@ class MediaStudio:
         except MediaError as exc:
             asset.status = MediaStatus.FAILED
             asset.error = str(exc)
+            # A task that ran has an id worth keeping: a timed-out one may
+            # still be collected, and a failed one is what support asks about.
+            asset.task_id = exc.payload.get("task_id") or asset.task_id
+            credits = _credits(exc.payload)
+            if credits is not None:
+                asset.extra = {**(asset.extra or {}), "credits": credits}
             logger.error("Media generation failed: %s", exc)
             self.session.flush()
             return asset
@@ -413,7 +429,7 @@ class MediaStudio:
         asset.task_id = result.task_id
         asset.remote_url = result.urls[0] if result.urls else None
         asset.model = result.model or asset.model
-        credits = _credits(result)
+        credits = _credits(result.raw)
         if credits is not None:
             asset.extra = {**(asset.extra or {}), "credits": credits}
 
