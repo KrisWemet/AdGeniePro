@@ -11,7 +11,7 @@ why; this explains what will bite you while changing it.
 
 ```bash
 pip install -r requirements.txt
-python3 -m pytest tests/          # 663 tests, ~40s, no credentials needed
+python3 -m pytest tests/          # 929 tests, ~70s, no credentials needed
 python3 -m adgenie.cli demo --days 21   # full pipeline against the simulator
 ```
 
@@ -83,6 +83,13 @@ run reaches no platform client.
 **Approval gates and the global daily cap** exist so no sequence of
 individually-reasonable decisions can run away. Do not route around them.
 
+**A synthetic presenter is not a customer.** A presenter that claims
+experience is a fake testimonial under the FTC's 2024 rule, with a penalty per
+violation. Anything that makes a person speak goes through `review_script` in
+`media/ugc.py`, and the voice is synthesised from the reviewed text. Prompting
+a video model with dialogue instead lets what was reviewed and what is said
+drift apart.
+
 ## What is verified and what is not
 
 Take this seriously — it is the difference between a passing suite and working
@@ -97,6 +104,9 @@ software.
   self-consistent, not that the platform agrees. Expect wrong field names,
   missing required params and enum mismatches on first contact. Green tests
   here are not evidence.
+- **Not verified:** the kie.ai speech and lip-sync requests behind presenter
+  videos. They follow kie.ai's published examples and have never made a live
+  call.
 
 When you fix something that first contact reveals, say so in the commit. It is
 the most valuable information in this repository.
@@ -128,11 +138,11 @@ repository.
 adgenie/
   core/       the decisions: optimizer, portfolio, rotation, metrics, stats
   platforms/  Meta, Google and the auction simulator behind one interface
-  media/      generation, local storage, upload into the ad account
+  media/      generation, presenter videos, storage, upload into the ad account
   research/   Meta Ad Library
   api/        FastAPI routes
   cli.py      every capability has a command
-tests/        663 of them; start here to understand a subsystem
+tests/        929 of them; start here to understand a subsystem
 ```
 
 `README.md` has a fuller map and the reasoning behind each subsystem.

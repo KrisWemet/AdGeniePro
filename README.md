@@ -357,6 +357,68 @@ Generation is also suppressed under `DRY_RUN`, which falls back to the sandbox.
 A mode whose purpose is to have no side effects should not have billing as its
 one exception.
 
+### Presenter videos
+
+The format UGC-ad tools sell: a vertical clip of a person talking to camera.
+It is also the format in which an affiliate account is easiest to lose, and
+the pipeline is shaped by why.
+
+```bash
+python -m adgenie.cli ugc --creative 3 --preview   # script and presenter, nothing generated
+python -m adgenie.cli ugc --creative 3 --upload    # generate, then into the ad account
+python -m adgenie.cli launch --offer 1 --platform meta --budget 45 --media-kind presenter
+```
+
+**The presenter does not exist, so it cannot be a customer.** The genre's
+default script is a testimonial — "I was sceptical, then I tried it" — and
+spoken by a synthetic person that is a review by someone who does not exist,
+about an experience nobody had. The FTC's rule on consumer reviews and
+testimonials (16 CFR Part 465, in force since October 2024) names that case
+and carries civil penalties per violation. So scripts are written in a
+presenter's voice: what the product is, how it works, what the brief can
+prove. First-person experience ("I've been taking it"), a personal life ("my
+doctor said"), borrowed credentials ("as a nurse") and claims of independence
+("not sponsored", "honest review") are blocking findings, on top of every rule
+that applies to ad text. A presenter styled as a clinician, a minor, or a
+lookalike of a real person is refused before any image is generated.
+
+**What is said is what was reviewed.** A video model given dialogue in its
+prompt usually says it, and sometimes paraphrases, adds a line, or ad-libs a
+claim. So the voice is synthesised from the approved script and a lip-sync
+model animates the presenter to that audio. The words in the finished video
+are the words the policy engine read.
+
+1. **Script** from the creative's angle, budgeted to the placement at
+   conversational pace: about 2.5 words a second, so 37 words for fifteen
+   seconds. Claude writes it when `ANTHROPIC_API_KEY` is set, through the same
+   review-and-repair loop as ad copy; otherwise the angle templates do, and
+   they never speak in the first person.
+2. **Review** the spoken words. A blocked script generates nothing.
+3. **Presenter**: a still generated from `--persona`, or
+   `--presenter-image-url` for an image you hold the rights to. A generated
+   still is kept, but not on the creative, so it is never uploaded as the ad's
+   image and can be reused for the next script.
+4. **Voice** from the script, **lip-sync** the still to it, and download the
+   result immediately, like every other asset.
+
+That is three paid tasks in a chain. Each task id is recorded as it completes,
+so a failure part way through shows what was already paid for rather than
+inviting a resubmission that is charged again. Under `DRY_RUN` the chain runs
+against the sandbox.
+
+**A presenter video reaches an ad at launch.** An ad's creative is built when
+the ad is created and nothing here replaces it afterwards, so `ugc --creative`
+on a running ad puts the video in the ad account (`--upload`) but not on the
+ad. Use `launch --media-kind presenter` to build the ads on it.
+
+The person and the voice are both AI-generated, and platforms increasingly
+require that to be declared. Declare it where the platform asks; the asset
+records `synthetic_presenter: true`.
+
+`KIE_TTS_MODEL`, `KIE_TTS_VOICE` and `KIE_AVATAR_MODEL` choose the models.
+Their request shapes follow kie.ai's published examples and have not yet been
+run against the live API.
+
 ---
 
 ## Wiring up tracking
@@ -804,6 +866,8 @@ whenever the dashboard is served from a known origin.
 | `GET /api/media/placements` | Placement sizes per platform |
 | `POST /api/media/preview-prompt` | Build and screen a prompt, generating nothing |
 | `POST /api/media/generate/{creative_id}` | Generate the imagery a creative needs |
+| `POST /api/media/presenter/{creative_id}/preview` | Write and screen a presenter script, generating nothing |
+| `POST /api/media/presenter/{creative_id}` | Generate a presenter video for a creative |
 | `POST /api/media/upload/{creative_id}` | Put its files into the live ad account |
 | `GET /api/media/assets` | Generated assets |
 | `GET /api/audit` | Every mutation ever sent to an ad account |
@@ -850,6 +914,7 @@ adgenie/
     uploader.py      into the ad account, so the reference cannot rot
     sandbox.py       real PNGs at the right size, no key needed
     studio.py        plan, screen, generate, persist
+    ugc.py           presenter videos: script, review, presenter, voice
   research/
     ad_library.py    Meta Ad Library client
     signals.py       staying power, angle inference, market brief
@@ -858,7 +923,7 @@ adgenie/
   static/            dashboard
   cli.py             command line
   demo.py            end-to-end simulation
-tests/               566 tests
+tests/               929 tests
 legacy/              the original prototype scripts, kept for reference
 ```
 

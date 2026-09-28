@@ -9,6 +9,7 @@ keeps an ad from pointing at a dead URL a day later.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
@@ -19,6 +20,7 @@ from .prompts import PromptPlan, build_image_prompt, build_video_prompt
 from .sandbox import SandboxMediaProvider
 from .specs import default_placements, get_media_spec
 from .store import MediaStore
+from .ugc import DELIVERY_PROMPT, PresenterVideoPlan, plan_presenter_video
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +127,207 @@ class MediaStudio:
         offer_id: int | None = None,
     ) -> MediaAsset:
         return self._run_plan(plan, creative_id=creative_id, offer_id=offer_id)
+
+    # ------------------------------------------------------------------
+    def presenter_plan_for(
+        self,
+        creative: Creative,
+        placement: str | None = None,
+        seconds: float | None = None,
+        persona: str = "",
+        presenter_image_url: str | None = None,
+        voice: str | None = None,
+        variant_index: int = 0,
+        script_studio=None,
+    ) -> PresenterVideoPlan:
+        """Write and review a presenter script for this creative's argument.
+
+        Costs nothing and generates nothing, which also makes it the preview.
+        """
+        return plan_presenter_video(
+            self._offer_for(creative),
+            angle_key=creative.angle,
+            platform=self._platform_for(creative),
+            placement=placement,
+            seconds=seconds,
+            persona=persona,
+            presenter_image_url=presenter_image_url,
+            voice=voice,
+            variant_index=variant_index,
+            script_studio=script_studio,
+            settings=self.settings,
+        )
+
+    def generate_presenter_video(
+        self, plan: PresenterVideoPlan, creative_id: int | None = None
+    ) -> MediaAsset:
+        """Presenter still, voice and lip-sync, for a plan that passed review.
+
+        Three paid tasks in a chain, each consuming the previous one's output
+        while the provider still hosts it. The voice is synthesised from the
+        approved script, so the words in the finished video are the words the
+        policy engine read. Each task id is recorded as it completes, so a
+        failure part way through says what was already paid for rather than
+        inviting a blind resubmission.
+        """
+        asset = MediaAsset(
+            creative_id=creative_id,
+            offer_id=plan.offer_id,
+            kind=MediaKind.VIDEO,
+            provider=self.provider.name,
+            model=self.settings.kie_avatar_model,
+            prompt=plan.script.text,
+            aspect_ratio=plan.aspect_ratio,
+            width=plan.width,
+            height=plan.height,
+            duration_seconds=plan.script.estimated_seconds,
+            compliance_report={
+                "findings": plan.findings,
+                "script": plan.script.report.as_dict() if plan.script.report else {},
+            },
+            extra={
+                "placement": plan.placement,
+                "format": "presenter",
+                # The person on camera and the voice are both generated. Kept
+                # on the asset because declaring AI-generated people and
+                # voices is increasingly a platform requirement, and the
+                # declaration is made per ad.
+                "synthetic_presenter": True,
+                "script": plan.script.as_dict(),
+                "voice": plan.voice,
+                "presenter": plan.presenter.as_dict(),
+                "steps": {},
+            },
+        )
+        self.session.add(asset)
+        self.session.flush()
+
+        # Nothing is paid for until the script and the presenter have both
+        # passed. A rejected plan costs nothing; a generated one cannot be
+        # un-generated.
+        if not plan.is_safe:
+            asset.status = MediaStatus.REJECTED
+            asset.error = "; ".join(
+                f["code"] + ": " + f["suggestion"] for f in plan.findings
+            )
+            logger.warning(
+                "Presenter video rejected before generation: %s",
+                ", ".join(f["code"] for f in plan.findings),
+            )
+            self.session.flush()
+            return asset
+
+        asset.status = MediaStatus.GENERATING
+        self.session.flush()
+
+        image_url = plan.presenter.image_url
+        if not plan.presenter.is_supplied:
+            still = self._run_plan(
+                plan.presenter.prompt_plan(plan.spec, plan.placement),
+                creative_id=None,
+                offer_id=plan.offer_id,
+            )
+            # Kept, but not on the creative. It is reusable for the next
+            # script, and attached to the creative it would be uploaded as the
+            # ad's image even when the video failed.
+            still.extra = {
+                **(still.extra or {}), "role": "presenter", "presenter_for": asset.id,
+            }
+            self._record_step(
+                asset, "presenter",
+                task_id=still.task_id, url=still.remote_url,
+                asset_id=still.id, model=still.model,
+            )
+            if still.status is not MediaStatus.READY or not still.remote_url:
+                return self._fail(
+                    asset, f"presenter image: {still.error or still.status.value}"
+                )
+            image_url = still.remote_url
+
+        try:
+            voice = self.provider.generate(
+                MediaRequest(
+                    prompt=plan.script.text,
+                    kind="audio",
+                    model=self.settings.kie_tts_model,
+                    extra={"voice": plan.voice},
+                )
+            )
+        except MediaError as exc:
+            return self._fail(asset, f"voice: {exc}", step="voice", exc=exc)
+        self._record_step(
+            asset, "voice",
+            task_id=voice.task_id, url=voice.urls[0] if voice.urls else None,
+            model=voice.model or self.settings.kie_tts_model,
+        )
+        if not voice.ok:
+            return self._fail(asset, f"voice: {voice.error or voice.state}")
+
+        request = MediaRequest(
+            prompt=DELIVERY_PROMPT,
+            kind="video",
+            model=self.settings.kie_avatar_model,
+            aspect_ratio=plan.aspect_ratio,
+            width=plan.width,
+            height=plan.height,
+            duration_seconds=plan.script.estimated_seconds,
+            reference_image_url=image_url,
+            extra={"audio_url": voice.urls[0]},
+        )
+        try:
+            video = self.provider.generate(request)
+        except MediaError as exc:
+            return self._fail(asset, f"lip-sync: {exc}", step="lip_sync", exc=exc)
+        asset.task_id = video.task_id
+        asset.remote_url = video.urls[0] if video.urls else None
+        asset.model = video.model or asset.model
+        self._record_step(
+            asset, "lip_sync",
+            task_id=video.task_id, url=asset.remote_url, model=asset.model,
+        )
+        if not video.ok:
+            return self._fail(asset, f"lip-sync: {video.error or video.state}")
+
+        try:
+            self._persist(asset, request, video.urls[0])
+        except Exception as exc:
+            # Finished and paid for. The task id stays on the asset so the
+            # result can be fetched again while the provider still hosts it.
+            return self._fail(asset, f"generated but could not be stored: {exc}")
+
+        asset.status = MediaStatus.READY
+        asset.completed_at = datetime.now(timezone.utc)
+        self.session.flush()
+        return asset
+
+    def _fail(
+        self,
+        asset: MediaAsset,
+        error: str,
+        step: str | None = None,
+        exc: MediaError | None = None,
+    ) -> MediaAsset:
+        task_id = exc.payload.get("task_id") if exc is not None else None
+        if step and task_id:
+            # A task that timed out may still finish, and is charged either
+            # way. Its id is what lets it be collected rather than resubmitted.
+            self._record_step(asset, step, task_id=task_id, state="unfinished")
+        asset.status = MediaStatus.FAILED
+        asset.error = error
+        logger.error("Presenter video %s failed: %s", asset.id, error)
+        self.session.flush()
+        return asset
+
+    @staticmethod
+    def _record_step(asset: MediaAsset, name: str, **details) -> None:
+        # Reassigned rather than mutated in place: a change inside a JSON
+        # column is invisible to the session and would never be written.
+        extra = dict(asset.extra or {})
+        extra["steps"] = {
+            **(extra.get("steps") or {}),
+            name: {k: v for k, v in details.items() if v is not None},
+        }
+        asset.extra = extra
 
     # ------------------------------------------------------------------
     def _run_plan(

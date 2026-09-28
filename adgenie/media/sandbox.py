@@ -100,7 +100,7 @@ class SandboxMediaProvider(MediaProvider):
         if task.polls <= self.polls_before_ready:
             return MediaResult(task_id=task_id, state="generating", provider=self.name)
 
-        extension = "mp4" if task.request.kind == "video" else "png"
+        extension = {"video": "mp4", "audio": "mp3"}.get(task.request.kind, "png")
         return MediaResult(
             task_id=task_id,
             state="success",

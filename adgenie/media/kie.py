@@ -1,7 +1,7 @@
 """kie.ai media generation client.
 
-kie.ai fronts several image and video models (Nano Banana, Flux, Veo, Kling,
-Seedance and others) behind one asynchronous job API:
+kie.ai fronts several image, video and speech models (Nano Banana, Flux, Veo,
+Kling, Seedance and others) behind one asynchronous job API:
 
     POST /api/v1/jobs/createTask   -> {"data": {"taskId": ...}}
     GET  /api/v1/jobs/recordInfo   -> {"data": {"state": ..., "resultJson": ...}}
@@ -141,6 +141,8 @@ class KieClient(MediaProvider):
     def _model_for(self, request: MediaRequest) -> str:
         if request.model:
             return request.model
+        if request.kind == "audio":
+            return self.settings.kie_tts_model
         return (
             self.settings.kie_video_model
             if request.kind == "video"
@@ -181,6 +183,35 @@ class KieClient(MediaProvider):
             payload["enable_translation"] = request.extra.get(
                 "enable_translation", True
             )
+        elif model.startswith("elevenlabs/text-to-speech"):
+            # Speech takes text, not a prompt, and a voice by name. The
+            # prompt field would be rejected rather than ignored.
+            payload = {
+                "text": request.prompt,
+                "voice": request.extra.get("voice") or self.settings.kie_tts_voice,
+            }
+            for key in ("stability", "similarity_boost", "style", "speed", "language_code"):
+                if key in request.extra:
+                    payload[key] = request.extra[key]
+        elif _is_lip_sync(model):
+            # A lip-sync model animates a still to an existing voice track.
+            # Both arrive as URLs the provider fetches, and a task submitted
+            # without either is paid for and then fails, so it is refused
+            # here while refusing costs nothing.
+            image_url = request.reference_image_url or ""
+            audio_url = request.extra.get("audio_url") or ""
+            if not (image_url and audio_url):
+                raise MediaError(
+                    f"{model} needs both a presenter image URL and a voice track URL",
+                    code="MISSING_INPUT",
+                )
+            payload = {
+                "image_url": image_url,
+                "audio_url": audio_url,
+                "prompt": request.prompt,
+            }
+            if model.startswith("infinitalk/"):
+                payload["resolution"] = request.extra.get("resolution", "720p")
         else:
             # Keep the generic Market-model path available for an explicitly
             # configured model. Model-specific fields can be supplied through
@@ -303,7 +334,14 @@ class KieClient(MediaProvider):
             "ok": bool(self.settings.kie_api_key),
             "image_model": self.settings.kie_image_model,
             "video_model": self.settings.kie_video_model,
+            "speech_model": self.settings.kie_tts_model,
+            "lip_sync_model": self.settings.kie_avatar_model,
         }
+
+
+def _is_lip_sync(model: str) -> bool:
+    """Models that animate a still to a supplied voice track."""
+    return model.startswith(("kling/ai-avatar", "infinitalk/"))
 
 
 def _extract_urls(data: dict) -> list[str]:

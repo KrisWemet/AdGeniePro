@@ -317,6 +317,82 @@ def generate_media(
     }
 
 
+class _PresenterOptions:
+    """Query parameters shared by the presenter preview and generation routes."""
+
+    def __init__(
+        self,
+        placement: str | None = Query(default=None, max_length=40),
+        seconds: float | None = Query(default=None, gt=0, le=120),
+        persona: str = Query(default="", max_length=300),
+        presenter_image_url: str | None = Query(default=None, max_length=2000),
+        voice: str | None = Query(default=None, max_length=80),
+        variant: int = Query(default=0, ge=0, le=50),
+    ) -> None:
+        self.placement = placement
+        self.seconds = seconds
+        self.persona = persona
+        self.presenter_image_url = presenter_image_url
+        self.voice = voice
+        self.variant = variant
+
+    def plan(self, studio: MediaStudio, creative: Creative):
+        try:
+            return studio.presenter_plan_for(
+                creative,
+                placement=self.placement,
+                seconds=self.seconds,
+                persona=self.persona,
+                presenter_image_url=self.presenter_image_url,
+                voice=self.voice,
+                variant_index=self.variant,
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc))
+
+
+@router.post("/media/presenter/{creative_id}/preview")
+def preview_presenter_video(
+    creative_id: int,
+    options: _PresenterOptions = Depends(),
+    session: Session = Depends(get_session),
+) -> dict:
+    """Write and screen a presenter script, generating nothing.
+
+    Every generation step costs money; this costs at most the copywriting
+    calls, and shows exactly what would be said and why anything is blocked.
+    """
+    creative = session.get(Creative, creative_id)
+    if creative is None:
+        raise HTTPException(404, f"creative {creative_id} not found")
+    return options.plan(MediaStudio(session, get_settings()), creative).as_dict()
+
+
+@router.post("/media/presenter/{creative_id}")
+def generate_presenter_video(
+    creative_id: int,
+    options: _PresenterOptions = Depends(),
+    session: Session = Depends(get_session),
+) -> dict:
+    """A presenter video: a synthetic person speaking a reviewed script.
+
+    Blocks until the three generation tasks finish, as image generation does.
+    A plan that fails review is recorded as rejected and costs nothing.
+    """
+    creative = session.get(Creative, creative_id)
+    if creative is None:
+        raise HTTPException(404, f"creative {creative_id} not found")
+    studio = MediaStudio(session, get_settings())
+    plan = options.plan(studio, creative)
+    asset = studio.generate_presenter_video(plan, creative_id=creative_id)
+    session.commit()
+    return {
+        "creative_id": creative_id,
+        "plan": plan.as_dict(),
+        "asset": _asset_out(asset),
+    }
+
+
 @router.post("/media/upload/{creative_id}")
 def upload_media(creative_id: int, session: Session = Depends(get_session)) -> dict:
     """Put a creative's generated files into the live ad account.
@@ -395,6 +471,7 @@ def _asset_out(asset: MediaAsset) -> dict:
         "provider": asset.provider,
         "model": asset.model,
         "placement": (asset.extra or {}).get("placement"),
+        "format": (asset.extra or {}).get("format", "standard"),
         "aspect_ratio": asset.aspect_ratio,
         "width": asset.width,
         "height": asset.height,

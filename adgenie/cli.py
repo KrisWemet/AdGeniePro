@@ -114,7 +114,9 @@ def cmd_launch(args) -> int:
                 check_landing_page=False if args.skip_landing_check else None,
                 research_market=args.research,
                 research_term=args.research_term,
-                generate_media=args.with_media,
+                # Naming a kind of media is asking for it.
+                generate_media=args.with_media or args.media_kind is not None,
+                media_kind=args.media_kind or "image",
             )
         )
     print(json.dumps(result.as_dict(), indent=2))
@@ -624,6 +626,78 @@ def cmd_media(args) -> int:
         return 0 if any(a.status.value == "ready" for a in assets) else 1
 
 
+def cmd_ugc(args) -> int:
+    """A presenter video: a synthetic person speaking a reviewed script."""
+    init_db()
+    settings = get_settings()
+    from .media.studio import MediaStudio
+    from .models import MediaStatus
+
+    with session_scope() as session:
+        creative = session.get(Creative, args.creative)
+        if creative is None:
+            print(f"creative {args.creative} not found", file=sys.stderr)
+            return 1
+        studio = MediaStudio(session, settings)
+        try:
+            plan = studio.presenter_plan_for(
+                creative,
+                placement=args.placement,
+                seconds=args.seconds,
+                persona=args.persona,
+                presenter_image_url=args.presenter_image_url,
+                voice=args.voice,
+                variant_index=args.variant,
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        _print_presenter_plan(plan)
+        if args.preview:
+            return 0 if plan.is_safe else 1
+
+        # An unsafe plan still goes through the studio, which records it as
+        # rejected without paying for anything, so the refusal is on file.
+        asset = studio.generate_presenter_video(plan, creative_id=creative.id)
+        print(f"\n  {asset.status.value:<10}{asset.local_path or asset.error or ''}")
+        if asset.status is MediaStatus.READY:
+            print(
+                "  The presenter is AI-generated, and so is the voice. Declare "
+                "that where the platform asks for it."
+            )
+            if args.upload:
+                print()
+                return _upload_media(session, settings, creative)
+            return 0
+        return 1
+
+
+def _print_presenter_plan(plan) -> None:
+    script = plan.script
+    print(
+        f"  Script   {script.generator}, {script.word_count} words, about "
+        f"{script.estimated_seconds:.0f}s of {plan.spec.max_seconds:.0f}s "
+        f"({plan.placement}, {plan.aspect_ratio})"
+    )
+    labels = ["hook"] + [""] * len(script.body) + ["close"]
+    spoken = [script.hook, *script.body, script.call_to_action]
+    for label, line in zip(labels, spoken):
+        if line:
+            print(f"    {label:<7}{line}")
+    presenter = plan.presenter
+    source = presenter.image_url if presenter.is_supplied else presenter.persona
+    print(f"  Presenter {'supplied' if presenter.is_supplied else 'generated'}: {source}")
+    print(f"  Voice    {plan.voice}")
+    warnings = script.report.warnings if script.report else []
+    for finding in warnings:
+        print(f"  warn     {finding.code}: {finding.suggestion or finding.message}")
+    if plan.findings:
+        print("\n  Blocked before anything was paid for:")
+        for finding in plan.findings:
+            quoted = f' ("{finding["matched_text"]}")' if finding.get("matched_text") else ""
+            print(f"    {finding['code']}{quoted}: {finding['suggestion']}")
+
+
 def _upload_media(session, settings, creative) -> int:
     """Push this creative's generated files into the live ad account.
 
@@ -736,6 +810,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     media.set_defaults(func=cmd_media)
 
+    ugc = sub.add_parser(
+        "ugc",
+        help="a presenter video for a creative: a synthetic person speaking a reviewed script",
+    )
+    ugc.add_argument("--creative", type=int, required=True)
+    ugc.add_argument(
+        "--preview", action="store_true",
+        help="write and screen the script and presenter; generate nothing",
+    )
+    ugc.add_argument(
+        "--seconds", type=float, default=None,
+        help="spoken length; capped by the placement",
+    )
+    ugc.add_argument("--placement", default=None, help="a video placement, e.g. meta_reel_video")
+    ugc.add_argument(
+        "--persona", default="",
+        help="who is on camera, e.g. 'a woman in her forties in a home office'",
+    )
+    ugc.add_argument(
+        "--presenter-image-url", default=None,
+        help="a public image you hold the rights to; skips generating a presenter",
+    )
+    ugc.add_argument("--voice", default=None, help="a voice name from the speech library")
+    ugc.add_argument(
+        "--variant", type=int, default=0,
+        help="which execution of the creative's angle to write",
+    )
+    ugc.add_argument(
+        "--upload", action="store_true",
+        help="also push the video into the live ad account",
+    )
+    ugc.set_defaults(func=cmd_ugc)
+
     launch = sub.add_parser("launch", help="build and launch a structured test")
     launch.add_argument("--offer", type=int, required=True)
     launch.add_argument("--platform", required=True, choices=[p.value for p in Platform])
@@ -758,6 +865,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     launch.add_argument(
         "--with-media", action="store_true", help="generate imagery for each ad"
+    )
+    launch.add_argument(
+        "--media-kind", choices=["image", "video", "presenter"], default=None,
+        help="what to generate for each ad; implies --with-media",
     )
     launch.set_defaults(func=cmd_launch)
 

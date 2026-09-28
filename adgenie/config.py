@@ -100,6 +100,13 @@ class Settings(BaseSettings):
     kie_base_url: str = "https://api.kie.ai"
     kie_image_model: str = "nano-banana-pro"
     kie_video_model: str = "veo-3-1"
+    # Presenter videos. The voice is synthesised from the reviewed script and
+    # a still is animated to it, rather than a video model being prompted with
+    # dialogue, so the words spoken are exactly the words that were reviewed.
+    kie_tts_model: str = "elevenlabs/text-to-speech-multilingual-v2"
+    # A voice name from the speech provider's library.
+    kie_tts_voice: str = "Rachel"
+    kie_avatar_model: str = "kling/ai-avatar-standard"
     kie_poll_interval_seconds: float = 5.0
     kie_poll_timeout_seconds: float = 600.0
     # Generated asset URLs expire within about a day, so they are downloaded
