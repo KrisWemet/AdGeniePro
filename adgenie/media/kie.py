@@ -155,9 +155,11 @@ class KieClient(MediaProvider):
 
         if model == "nano-banana-pro":
             # Nano Banana Pro does not accept the generic negative_prompt or
-            # num_images fields. The empty image_input array is part of its
-            # text-to-image contract; references turn the same request into an
-            # image-guided generation.
+            # num_images fields, so the negative prompt goes into the prompt.
+            # The empty image_input array is part of its text-to-image
+            # contract; references turn the same request into an image-guided
+            # generation.
+            payload["prompt"] = _with_avoid_list(request.prompt, request.negative_prompt)
             payload["image_input"] = (
                 [request.reference_image_url] if request.reference_image_url else []
             )
@@ -170,9 +172,10 @@ class KieClient(MediaProvider):
             # enable_fallback is deprecated there ("remove this parameter from
             # your requests"). Translation is off by default and stays off
             # unless asked for, as the prompts built here are in English.
-            # Seen live: kie.ai runs this id as Veo 3.1 Fast, eight seconds at
-            # 720p unless told otherwise, for 60 credits. There is no negative
-            # prompt field, so request.negative_prompt does not reach Veo.
+            # Seen live: kie.ai runs this id as Veo 3.1 Fast, eight seconds.
+            # There is no negative prompt field, so the negative prompt goes
+            # into the prompt.
+            payload["prompt"] = _with_avoid_list(request.prompt, request.negative_prompt)
             if request.reference_image_url:
                 payload["image_urls"] = [request.reference_image_url]
                 payload["generation_type"] = request.extra.get(
@@ -187,7 +190,12 @@ class KieClient(MediaProvider):
                 if request.aspect_ratio in {"16:9", "9:16"}
                 else "16:9"
             )
-            for key in ("enable_translation", "resolution", "duration", "watermark"):
+            # kie.ai's default is 720p, which turned a 1080x1920 placement into
+            # a 720x1280 file. Seen live: 1080p costs 65 credits to 720p's 60.
+            payload["resolution"] = request.extra.get("resolution") or (
+                "1080p" if min(request.width, request.height) >= 1080 else "720p"
+            )
+            for key in ("enable_translation", "duration", "watermark"):
                 if key in request.extra:
                     payload[key] = request.extra[key]
         elif model.startswith("elevenlabs/text-to-speech"):
@@ -371,6 +379,19 @@ class KieClient(MediaProvider):
         }
 
 
+def _with_avoid_list(prompt: str, negative_prompt: str) -> str:
+    """The negative prompt, as part of the prompt, for a model with no field
+    for it.
+
+    Left out instead, it never reaches the model: the first live Veo clip came
+    back with the garbled label text the list exists to prevent.
+    """
+    avoid = (negative_prompt or "").strip().rstrip(".")
+    if not avoid:
+        return prompt
+    return f"{prompt.rstrip()} Avoid: {avoid}."
+
+
 def _is_lip_sync(model: str) -> bool:
     """Models that animate a still to a supplied voice track."""
     return model.startswith(("kling/ai-avatar", "infinitalk/"))
@@ -390,10 +411,18 @@ def _extract_urls(data: dict) -> list[str]:
             result_json = json.loads(result_json)
         except json.JSONDecodeError:
             result_json = None
-    for container in (result_json, data.get("response"), data):
+    containers = [result_json]
+    if isinstance(result_json, dict) and isinstance(result_json.get("data"), dict):
+        # Seen live: Veo at 1080p wraps its result in a second envelope, with
+        # the upscaled file under result_urls and the original under
+        # origin_urls. Missed, a paid task reads as success with no output.
+        containers.append(result_json["data"])
+    for container in (*containers, data.get("response"), data):
         if not isinstance(container, dict):
             continue
-        for key in ("resultUrls", "result_urls", "fullResultUrls", "originUrls", "urls"):
+        for key in (
+            "resultUrls", "result_urls", "fullResultUrls", "originUrls", "origin_urls", "urls",
+        ):
             value = container.get(key)
             if isinstance(value, str):
                 urls.append(value)

@@ -118,6 +118,56 @@ def test_video_prompt_states_the_opening_beat():
     assert "without displaying it as text" in plan.prompt
 
 
+def test_generated_people_are_adults_and_video_people_say_nothing():
+    """The first live Veo clip, for a sleep supplement, opened on a sleeping
+    baby. Speech is only ever synthesised from a reviewed script; a line the
+    model makes up would be an unreviewed claim."""
+    video = build_video_prompt(_Offer(), angle="problem_solution").prompt
+    image = build_image_prompt(_Offer(), angle="problem_solution").prompt
+    assert "clearly an adult" in video
+    assert "clearly an adult" in image
+    assert "no speech, narration or singing" in video
+
+
+def test_a_scene_replaces_the_default_shot_and_the_product_close():
+    """With no real product image, a model asked for "the product" invents its
+    packaging; the first live clip closed on a made-up bottle."""
+    scene = "Water dripping from an air conditioner line into a glass jar."
+    video = build_video_prompt(_Offer(), angle="mechanism", scene=scene)
+    assert "Scene: Water dripping from an air conditioner line into a glass jar." in video.prompt
+    assert "shot of the product" not in video.prompt
+    assert "component shot" not in video.prompt
+    assert video.is_safe
+
+    image = build_image_prompt(_Offer(), angle="mechanism", scene=scene)
+    assert "Composition: Water dripping from an air conditioner line" in image.prompt
+    assert "component shot" not in image.prompt
+
+
+def test_a_scene_is_screened_like_any_other_prompt():
+    plan = build_video_prompt(
+        _Offer(), angle="mechanism", scene="a before and after comparison of two bodies"
+    )
+    assert not plan.is_safe
+
+
+def test_the_media_command_takes_a_scene(session, settings, launched_creative, tmp_path):
+    from adgenie.cli import build_parser
+
+    args = build_parser().parse_args(
+        ["media", "--creative", "1", "--kind", "video", "--scene", "A glass jar."]
+    )
+    assert args.scene == "A glass jar."
+
+    settings.media_storage_dir = str(tmp_path / "media")
+    [asset] = MediaStudio(
+        session, settings, provider=SandboxMediaProvider()
+    ).generate_for_creative(
+        launched_creative, kind="video", placements=["meta_reel_video"], scene=args.scene
+    )
+    assert "Scene: A glass jar." in asset.prompt
+
+
 def test_video_duration_is_capped_by_the_placement():
     plan = build_video_prompt(_Offer(), placement="meta_reel_video", seconds=600)
     assert plan.duration_seconds <= get_media_spec("meta_reel_video").max_seconds
@@ -151,11 +201,43 @@ def test_submit_sends_model_and_input(kie_settings):
     assert task_id == "t-1"
     assert seen["model"] == kie_settings.kie_image_model
     assert seen["model"] == "nano-banana-pro"
-    assert seen["input"]["prompt"] == "a photo"
+    assert seen["input"]["prompt"] == "a photo Avoid: text."
     assert seen["input"]["aspect_ratio"] == "4:5"
     assert seen["input"]["image_input"] == []
     assert seen["input"]["resolution"] == "1K"
     assert "negative_prompt" not in seen["input"]
+
+
+def test_a_model_with_no_negative_prompt_field_gets_the_list_in_the_prompt(kie_settings):
+    """Sent as a field, it is rejected; left out, it never reaches the model,
+    which is how the first live Veo clip came back with garbled label text."""
+    for kind, model in (("image", "nano-banana-pro"), ("video", "veo-3-1")):
+        seen: dict = {}
+
+        def handler(request):
+            seen.update(json.loads(request.content))
+            return httpx.Response(200, json={"data": {"taskId": "t"}})
+
+        _kie(handler, kie_settings).submit(
+            MediaRequest(prompt="A kitchen.", kind=kind, negative_prompt="garbled text, logos")
+        )
+        assert seen["model"] == model
+        assert seen["input"]["prompt"] == "A kitchen. Avoid: garbled text, logos."
+        assert "negative_prompt" not in seen["input"]
+
+
+def test_a_model_with_the_field_keeps_the_negative_prompt_separate(kie_settings):
+    seen: dict = {}
+
+    def handler(request):
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, json={"data": {"taskId": "t"}})
+
+    _kie(handler, kie_settings).submit(
+        MediaRequest(prompt="A kitchen.", model="some/other-model", negative_prompt="logos")
+    )
+    assert seen["input"]["prompt"] == "A kitchen."
+    assert seen["input"]["negative_prompt"] == "logos"
 
 
 def test_video_requests_use_the_current_veo_contract(kie_settings):
@@ -176,6 +258,24 @@ def test_video_requests_use_the_current_veo_contract(kie_settings):
     assert "enable_fallback" not in seen["input"]
     assert "enable_translation" not in seen["input"]
     assert "duration" not in seen["input"]
+
+
+def test_veo_is_asked_for_the_resolution_the_placement_needs(kie_settings):
+    """kie.ai's default is 720p. Left to it, a 1080x1920 Reel placement came
+    back 720x1280 while the asset recorded 1080x1920."""
+    def resolution(**fields) -> str:
+        seen: dict = {}
+
+        def handler(request):
+            seen.update(json.loads(request.content))
+            return httpx.Response(200, json={"data": {"taskId": "t"}})
+
+        _kie(handler, kie_settings).submit(MediaRequest(prompt="x", kind="video", **fields))
+        return seen["input"]["resolution"]
+
+    assert resolution(aspect_ratio="9:16", width=1080, height=1920) == "1080p"
+    assert resolution(aspect_ratio="9:16", width=720, height=1280) == "720p"
+    assert resolution(width=1080, height=1920, extra={"resolution": "4k"}) == "4k"
 
 
 def test_a_deprecated_veo_flag_is_not_sent_even_when_asked_for(kie_settings):
@@ -304,6 +404,24 @@ def test_a_timeout_says_not_to_resubmit(kie_settings):
 
     with pytest.raises(MediaError, match="charged again"):
         _kie(handler, kie_settings).generate(MediaRequest(prompt="x"))
+
+
+def test_a_1080p_veo_result_is_read_from_its_nested_envelope(kie_settings):
+    """The shape a live 1080p Veo task returned, trimmed. Read as success with
+    no output, it cost 65 credits and produced nothing on disk."""
+    payload = {"code": 200, "data": {
+        "taskId": "t-hd", "state": "success", "creditsConsumed": 65.0,
+        "resultJson": json.dumps({"code": 200, "data": {
+            "origin_urls": ["https://tempfile.test/v/original.mp4"],
+            "result_urls": ["https://tempfile.test/v/upscaled.mp4"],
+            "image_urls": ["https://tempfile.test/v/thumbnail.jpg"],
+            "high_resolution_pending": False,
+        }}),
+    }}
+    result = _kie(lambda r: httpx.Response(200, json=payload), kie_settings).poll("t-hd")
+    assert result.ok
+    assert result.urls[0] == "https://tempfile.test/v/upscaled.mp4"
+    assert "https://tempfile.test/v/thumbnail.jpg" not in result.urls
 
 
 def test_url_extraction_handles_every_shape():

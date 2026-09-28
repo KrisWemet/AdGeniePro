@@ -612,7 +612,8 @@ def cmd_media(args) -> int:
             print(f"creative {args.creative} not found", file=sys.stderr)
             return 1
         assets = MediaStudio(session, settings).generate_for_creative(
-            creative, placements=args.placement or None, kind=args.kind
+            creative, placements=args.placement or None, kind=args.kind,
+            scene=args.scene or "",
         )
         for asset in assets:
             location = asset.local_path or asset.error or ""
@@ -804,6 +805,11 @@ def build_parser() -> argparse.ArgumentParser:
     media.add_argument("--creative", type=int, required=True)
     media.add_argument("--kind", default="image", choices=["image", "video"])
     media.add_argument("--placement", action="append", help="repeatable")
+    media.add_argument(
+        "--scene",
+        help="what the image or video shows, in place of the angle's default "
+        "shot and the closing product shot",
+    )
     media.add_argument(
         "--upload", action="store_true",
         help="also push the files into the live ad account and print the handles",

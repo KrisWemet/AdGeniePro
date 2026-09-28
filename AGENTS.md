@@ -11,7 +11,7 @@ why; this explains what will bite you while changing it.
 
 ```bash
 pip install -r requirements.txt
-python3 -m pytest tests/          # 945 tests, ~75s, no credentials needed
+python3 -m pytest tests/          # 953 tests, ~75s, no credentials needed
 python3 -m adgenie.cli demo --days 21   # full pipeline against the simulator
 ```
 
@@ -111,11 +111,13 @@ software.
   task reports is read from the live task record. ElevenLabs speech through
   kie.ai is not verified: every request failed on kie's side when tried,
   which is why Gemini is the default.
-- **Verified live:** Veo video through kie.ai, end to end. kie.ai ran
-  `veo-3-1` as Veo 3.1 Fast, eight seconds at 720p, for 60 credits. The first
-  attempt failed on kie's side ("Internal Error, Please try again later") and
-  was not charged; the same request succeeded four minutes later. The file was
-  720x1280 while the asset records the placement's 1080x1920.
+- **Verified live:** Veo video through kie.ai, end to end. kie.ai runs
+  `veo-3-1` as Veo 3.1 Fast, eight seconds: 60 credits at 720p, 65 at 1080p,
+  which is now requested for a 1080x1920 placement and came back 1080x1920.
+  At 1080p the result is nested one envelope deeper, which first read as
+  "success with no output" on a task that was charged. Three of the first
+  five tasks failed on kie's side ("Internal Error, Please try again later");
+  those were not charged, and resubmitting minutes later worked.
 
 When you fix something that first contact reveals, say so in the commit. It is
 the most valuable information in this repository.
@@ -151,7 +153,7 @@ adgenie/
   research/   Meta Ad Library
   api/        FastAPI routes
   cli.py      every capability has a command
-tests/        945 of them; start here to understand a subsystem
+tests/        953 of them; start here to understand a subsystem
 ```
 
 `README.md` has a fuller map and the reasoning behind each subsystem.
@@ -167,12 +169,15 @@ Roughly in the order they block getting real ads running:
    is why `GoogleAdsClient.upload_media` refuses rather than uploading an asset
    nothing would reference.
 3. First contact with the live Meta and Google APIs has not happened.
-4. Nothing checks what a generated image or video shows. The default kie.ai
-   models take no negative prompt, so `NEGATIVE_PROMPT` never reaches them,
-   and nothing keeps children out of a scene: the first live Veo clip, for a
-   sleep supplement, opened on a sleeping baby and showed made-up packaging
-   with garbled label text. Launches create ads paused unless told otherwise;
-   look at every generated asset before starting one.
+4. Nothing checks what a generated image or video shows. The first live Veo
+   clip, for a sleep supplement, opened on a sleeping baby and showed made-up
+   packaging with garbled label text. Prompts now carry the avoid-list, an
+   adults-only line and, for video, no speech, and `--scene` keeps a product
+   off camera, but the next clip still turned a drip into a stream that
+   overstates output. Launches create ads paused unless told otherwise; look
+   at every generated asset before starting one. Nothing collects a finished
+   task by id either, so a timed-out or misread task has to be fetched by
+   hand rather than resubmitted and paid for again.
 5. `preflight` performs read-only checks, but cannot prove write permissions,
    policy approval or successful affiliate sale attribution.
 6. Meta's asset feed (`META_DYNAMIC_CREATIVE`) is unverified against a live

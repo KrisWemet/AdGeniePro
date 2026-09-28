@@ -84,8 +84,13 @@ class MediaStudio:
         kind: str = "image",
         platform: Platform | None = None,
         ad_format: str | None = None,
+        scene: str = "",
     ) -> list[MediaAsset]:
-        """Produce the assets one creative needs, one per placement."""
+        """Produce the assets one creative needs, one per placement.
+
+        `scene` is what the asset shows, in place of the angle's default shot:
+        an ad's own visual direction, screened like the rest of the prompt.
+        """
         offer = self._offer_for(creative)
         platform = platform or self._platform_for(creative)
         placements = placements or default_placements(platform, kind, ad_format)
@@ -102,9 +107,11 @@ class MediaStudio:
         assets: list[MediaAsset] = []
         for placement in placements:
             plan = (
-                build_image_prompt(offer, creative.angle, placement)
+                build_image_prompt(offer, creative.angle, placement, scene=scene)
                 if kind == "image"
-                else build_video_prompt(offer, creative.angle, placement, hook_line=hook)
+                else build_video_prompt(
+                    offer, creative.angle, placement, hook_line=hook, scene=scene
+                )
             )
             assets.append(
                 self._run_plan(plan, creative_id=creative.id, offer_id=offer.id)

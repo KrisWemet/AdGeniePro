@@ -267,6 +267,7 @@ def preview_prompt(
     angle: str = Query(default="mechanism"),
     placement: str = Query(default="meta_feed"),
     extra_direction: str = Query(default=""),
+    scene: str = Query(default="", max_length=600),
     session: Session = Depends(get_session),
 ) -> dict:
     """Build and screen a media prompt without generating anything.
@@ -282,9 +283,13 @@ def preview_prompt(
         raise HTTPException(422, f"unknown placement '{placement}'")
 
     plan = (
-        build_video_prompt(offer, angle, placement, extra_direction=extra_direction)
+        build_video_prompt(
+            offer, angle, placement, extra_direction=extra_direction, scene=scene
+        )
         if spec.kind == "video"
-        else build_image_prompt(offer, angle, placement, extra_direction=extra_direction)
+        else build_image_prompt(
+            offer, angle, placement, extra_direction=extra_direction, scene=scene
+        )
     )
     return {**plan.as_dict(), "would_generate": plan.is_safe}
 
@@ -294,6 +299,7 @@ def generate_media(
     creative_id: int,
     kind: str = Query(default="image", pattern="^(image|video)$"),
     placements: str | None = Query(default=None),
+    scene: str = Query(default="", max_length=600),
     session: Session = Depends(get_session),
 ) -> dict:
     """Generate the imagery a creative needs."""
@@ -305,7 +311,7 @@ def generate_media(
         [p.strip() for p in placements.split(",") if p.strip()] if placements else None
     )
     assets = MediaStudio(session, get_settings()).generate_for_creative(
-        creative, placements=wanted, kind=kind
+        creative, placements=wanted, kind=kind, scene=scene
     )
     session.commit()
     return {

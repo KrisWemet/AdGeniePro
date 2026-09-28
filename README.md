@@ -314,10 +314,27 @@ formats generate nothing.
 **Look at what comes back before an ad starts.** Screening reads the prompt,
 not the result. The first live Veo clip, for a sleep supplement, opened on a
 sleeping baby and ended on made-up packaging with garbled label text; neither
-was in the prompt. Nano Banana Pro and Veo 3.1, the default models, take no
-negative prompt, so the avoid-list the planner writes does not reach them.
-Launches create ads paused unless given `--start-active`, and that pause is the
-review. A Veo clip is kie.ai's Veo 3.1 Fast: eight seconds at 720p, 60 credits.
+was in the prompt. Prompts now say that anyone shown is an adult and that a
+video's sound has no speech, and the avoid-list goes into the prompt text,
+since Nano Banana Pro and Veo 3.1 have no negative-prompt field. None of that
+is a guarantee: the next clip asked for an air conditioner's drip and showed a
+steady stream filling a jar, which overstates the output, on a jar with garbled
+embossed lettering. Launches create ads paused unless given `--start-active`,
+and that pause is the review.
+
+Asked for "the product" with no real image of it, a model invents the
+packaging, and a digital product has none to show. `--scene` replaces the
+angle's default shot and the product close with the ad's own visual:
+
+```bash
+python -m adgenie.cli media --creative 2 --kind video --placement meta_reel_video \
+  --scene "Water dripping from an air conditioner's condensate line into a glass jar. No people"
+```
+
+A Veo clip is kie.ai's Veo 3.1 Fast, eight seconds, at 1080p for a placement
+that size: 65 credits, or 60 at 720p. Three of the first five Veo tasks failed
+on kie.ai's side with "Internal Error, Please try again later"; failures are
+not charged, and resubmitting a few minutes later worked.
 
 ### Getting it onto the ad
 
@@ -942,7 +959,7 @@ adgenie/
   static/            dashboard
   cli.py             command line
   demo.py            end-to-end simulation
-tests/               945 tests
+tests/               953 tests
 legacy/              the original prototype scripts, kept for reference
 ```
 
