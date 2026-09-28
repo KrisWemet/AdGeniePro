@@ -1,0 +1,94 @@
+{
+  "meta_feed": [
+    {
+      "angle": "problem_solution",
+      "primary_texts": [
+        "Richard Wilson is a third-generation farmer in California's Imperial Valley. When drought dried up his well, he stopped waiting for rain and started looking at the air.\n\nHis free video walks through what he and a friend who works on air conditioners came up with: pulling drinkable water out of humid air with the same condensation principle your AC uses.\n\nWatch it and judge for yourself. #ad"
+      ],
+      "headlines": ["When the well ran dry", "Water from air, explained", "Watch his free video"],
+      "descriptions": ["How condensation turns air into water", "A backup water plan for dry summers"],
+      "call_to_action": "WATCH_MORE",
+      "image_prompt": "Sunburned farmer in his 40s standing beside a dry, cracked irrigation ditch at golden hour, looking at a small homemade metal unit in an open garage, documentary photo style, no text"
+    },
+    {
+      "angle": "mechanism",
+      "primary_texts": [
+        "Ever noticed the water dripping from your air conditioner? That's moisture pulled out of the air. On a humid day a single unit can drip gallons of it.\n\nOne drought-hit farmer asked a simple question: what if you built a machine to do that on purpose, and cleaned the water up well enough to drink?\n\nHis video shows how he went about it. #ad"
+      ],
+      "headlines": ["Your AC already makes water", "The drip that started it", "See how he built it"],
+      "descriptions": ["Free video from a California farmer", "Condensation, put to work"],
+      "call_to_action": "WATCH_MORE",
+      "image_prompt": "Close-up of water droplets dripping from an outdoor air conditioner condensate line into a clear glass jar, macro photo, warm light, no text"
+    },
+    {
+      "angle": "cost_of_inaction",
+      "primary_texts": [
+        "Lake Mead has hit record lows in recent years. Wells across the Southwest are being drilled deeper. Towns have faced boil-water notices after storms.\n\nQuick question: how many days of water does your home have stored right now?\n\nThis free video shows one backup some families are looking at: a DIY unit that makes drinking water from humid air. #ad"
+      ],
+      "headlines": ["If your tap stopped?", "Days of water stored?", "A backup worth knowing"],
+      "descriptions": ["Free video: a DIY water backup idea", "Plan before the next dry spell"],
+      "call_to_action": "LEARN_MORE",
+      "image_prompt": "Kitchen faucet turned on with no water coming out, a few empty plastic jugs on the counter, soft natural light, realistic photo, no text"
+    },
+    {
+      "angle": "identity",
+      "primary_texts": [
+        "Homesteaders and preppers: food storage is only half a plan. Stored water runs out, and wells run dry.\n\nA farmer who lived through exactly that shares the DIY approach he built with a friend who repairs air conditioners: producing drinking water from the moisture in the air.\n\nFree video for anyone serious about self-reliance. #ad"
+      ],
+      "headlines": ["Stored water runs out", "Water comes first", "A farmer's DIY water setup"],
+      "descriptions": ["Free video for homesteaders", "Built by a farmer and an HVAC tech"],
+      "call_to_action": "WATCH_MORE",
+      "image_prompt": "Rural homestead garage workbench with copper coils, a small fan and a water jug, afternoon light through the door, rustic documentary photo, no text"
+    },
+    {
+      "angle": "objection",
+      "primary_texts": [
+        "\"Water from thin air\" sounds like a gimmick. The principle isn't. It's condensation, the same thing that beads on a glass of iced tea and drips from your AC.\n\nThe honest catch: it works best in humid air and it runs on electricity.\n\nThe video explains how one farmer set up his own unit. Worth a look if you have ever worried about your water supply. #ad"
+      ],
+      "headlines": ["Skeptical? Good.", "It's just condensation", "The science is simple"],
+      "descriptions": ["Free video, no signup to watch", "See how one farmer set it up"],
+      "call_to_action": "WATCH_MORE",
+      "image_prompt": "Glass of iced tea covered in condensation beads on a porch rail, blurred dry farmland behind it, summer light, no text"
+    },
+    {
+      "angle": "how_to",
+      "primary_texts": [
+        "After hurricanes and floods, tap water can be unsafe for days, and store shelves empty fast.\n\nA home unit that makes drinking water from humid air is one way people are planning for that, paired with a generator or solar for outages.\n\nSee how a drought-hit farmer built his own in this free video. #ad"
+      ],
+      "headlines": ["Water for the next storm", "When the shelves go empty", "Watch the free video"],
+      "descriptions": ["A DIY backup for storms and outages", "Built from a farmer's hard lesson"],
+      "call_to_action": "WATCH_MORE",
+      "image_prompt": "Empty bottled-water shelf in a grocery store before a storm, slightly motion-blurred shoppers, realistic photo, no text"
+    }
+  ],
+  "google_rsa": {
+    "keywords": [
+      "atmospheric water generator",
+      "water from air",
+      "diy water from air",
+      "make water from air",
+      "emergency water supply for home",
+      "off grid water system"
+    ],
+    "headlines": [
+      "Make Water From Humid Air",
+      "DIY Air-to-Water Guide",
+      "Free Video: Water From Air",
+      "A Farmer's Drought Solution",
+      "How Condensation Makes Water",
+      "Backup Water for Your Home",
+      "Built by a Farmer & HVAC Tech",
+      "Plan for Dry Summers",
+      "An Emergency Water Backup",
+      "Watch the Free Presentation",
+      "Same Principle as Your AC",
+      "Off-Grid Water Ideas"
+    ],
+    "descriptions": [
+      "A drought-hit farmer shows how he pulls drinking water from humid air. Watch free.",
+      "Uses condensation, like an air conditioner. Works best where the air is humid.",
+      "A DIY backup water source for droughts, storms and outages. Affiliate link.",
+      "See the setup he built with a friend who fixes ACs, then decide for yourself."
+    ]
+  }
+}

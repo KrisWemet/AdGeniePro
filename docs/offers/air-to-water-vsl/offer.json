@@ -1,0 +1,44 @@
+{
+  "name": "Air-to-Water DIY Guide (Richard Wilson VSL)",
+  "destination_url": "https://example.com/REPLACE-WITH-YOUR-HOPLINK",
+  "network": "clickbank",
+  "vertical": "preparedness",
+  "product_description": "A DIY guide and video presentation from a California farmer, Richard Wilson, on building a small home unit that condenses moisture from humid air into drinking water. The VSL tells his drought story and explains the condensation principle.",
+  "target_audience": "US homeowners 40+ in drought-prone or storm-prone regions (Southwest, California, Texas, Gulf Coast); preppers, homesteaders and off-grid DIYers; people who follow water-shortage news.",
+  "key_benefits": [
+    "A backup source of drinking water for droughts, storms and outages",
+    "Uses the same condensation principle as an air conditioner",
+    "A DIY project rather than an expensive commercial unit",
+    "Less reliance on stored or bottled water in an emergency"
+  ],
+  "proof_points": [
+    "Atmospheric water generation is an established technology",
+    "Air conditioners visibly produce condensate water on humid days",
+    "Lake Mead reached record lows in 2022"
+  ],
+  "landing_page_copy": "Free video presentation. A drought-hit farmer shows how he and an HVAC-tech friend built a unit that turns humid air into drinking water.",
+  "geo_targets": ["US"],
+  "banned_claims": [
+    "unlimited",
+    "endless supply",
+    "for pennies",
+    "pennies on the dollar",
+    "water bill",
+    "60 gallons",
+    "57,347",
+    "cleaner than",
+    "they don't want",
+    "suppressed",
+    "cease and desist",
+    "NASA",
+    "military",
+    "FEMA",
+    "government",
+    "water corporations",
+    "free water",
+    "any hardware store",
+    "even in the desert"
+  ],
+  "required_disclosures": [],
+  "is_regulated": false
+}
