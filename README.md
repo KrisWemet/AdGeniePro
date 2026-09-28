@@ -397,7 +397,10 @@ are the words the policy engine read.
 3. **Presenter**: a still generated from `--persona`, or
    `--presenter-image-url` for an image you hold the rights to. A generated
    still is kept, but not on the creative, so it is never uploaded as the ad's
-   image and can be reused for the next script.
+   image and can be reused for the next script. It is drawn to match
+   `--voice`: a persona that names no gender takes the voice's, and one that
+   names the other gender is refused before anything is generated. A supplied
+   image is not checked, so pick a voice that suits it.
 4. **Voice** from the script, **lip-sync** the still to it, and download the
    result immediately, like every other asset.
 
@@ -923,7 +926,7 @@ adgenie/
   static/            dashboard
   cli.py             command line
   demo.py            end-to-end simulation
-tests/               929 tests
+tests/               936 tests
 legacy/              the original prototype scripts, kept for reference
 ```
 

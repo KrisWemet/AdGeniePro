@@ -11,7 +11,7 @@ why; this explains what will bite you while changing it.
 
 ```bash
 pip install -r requirements.txt
-python3 -m pytest tests/          # 929 tests, ~70s, no credentials needed
+python3 -m pytest tests/          # 936 tests, ~70s, no credentials needed
 python3 -m adgenie.cli demo --days 21   # full pipeline against the simulator
 ```
 
@@ -104,9 +104,11 @@ software.
   self-consistent, not that the platform agrees. Expect wrong field names,
   missing required params and enum mismatches on first contact. Green tests
   here are not evidence.
-- **Not verified:** the kie.ai speech and lip-sync requests behind presenter
-  videos. They follow kie.ai's published examples and have never made a live
-  call.
+- **Partly verified:** presenter videos on kie.ai. The image request, polling
+  and download have run live. The speech request is accepted (kie.ai's task
+  record echoes the fields as sent) but has so far only failed there, with a
+  provider-side error, so its result handling is unproven. The lip-sync
+  request has never been sent.
 
 When you fix something that first contact reveals, say so in the commit. It is
 the most valuable information in this repository.
@@ -142,7 +144,7 @@ adgenie/
   research/   Meta Ad Library
   api/        FastAPI routes
   cli.py      every capability has a command
-tests/        929 of them; start here to understand a subsystem
+tests/        936 of them; start here to understand a subsystem
 ```
 
 `README.md` has a fuller map and the reasoning behind each subsystem.

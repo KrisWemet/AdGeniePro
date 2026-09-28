@@ -18,6 +18,36 @@ from adgenie.money import usd_to_micros
 from adgenie.platforms.sandbox import SandboxPlatform
 
 
+# Tests must never reach a real provider. Every Settings() reads the process
+# environment and .env, so a credential there flows into the tests and turns a
+# test run into paid API calls. That happened once: a kie.ai key was added to
+# a developer environment and an API test submitted a real generation.
+_CREDENTIAL_VARS = (
+    "ANTHROPIC_API_KEY",
+    "KIE_API_KEY",
+    "META_ACCESS_TOKEN",
+    "META_AD_ACCOUNT_ID",
+    "META_PAGE_ID",
+    "META_PIXEL_ID",
+    "GOOGLE_DEVELOPER_TOKEN",
+    "GOOGLE_CLIENT_ID",
+    "GOOGLE_CLIENT_SECRET",
+    "GOOGLE_REFRESH_TOKEN",
+    "GOOGLE_CUSTOMER_ID",
+    "GOOGLE_LOGIN_CUSTOMER_ID",
+    "CLICKBANK_API_KEY",
+    "CLICKBANK_NICKNAME",
+    "CLICKBANK_INS_SECRET",
+)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_credentials(monkeypatch):
+    for name in _CREDENTIAL_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setitem(Settings.model_config, "env_file", None)
+
+
 @pytest.fixture
 def settings() -> Settings:
     return Settings(

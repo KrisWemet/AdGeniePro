@@ -748,6 +748,35 @@ _COMPILED_PERSONA_RULES = tuple(
     (re.compile(p, re.IGNORECASE), code, fix) for p, code, fix in _PERSONA_RULES
 )
 
+# Who each stock voice in the speech library sounds like. The first live run
+# drew a man for a gender-neutral persona and gave him a woman's voice: the
+# image model and the voice are chosen separately, and nothing tied them
+# together. A presenter who sounds like someone else is the first thing a
+# viewer notices, and the lip-sync is charged either way.
+VOICE_GENDERS: dict[str, str] = {
+    **dict.fromkeys(
+        ("rachel", "aria", "sarah", "laura", "charlotte", "alice", "matilda",
+         "jessica", "lily"),
+        "woman",
+    ),
+    **dict.fromkeys(
+        ("roger", "charlie", "george", "callum", "liam", "will", "eric", "chris",
+         "brian", "daniel", "bill"),
+        "man",
+    ),
+}
+
+_PERSONA_GENDER = {
+    "woman": re.compile(r"\b(woman|women|female|lady|girl|she|her)\b", re.IGNORECASE),
+    "man": re.compile(r"\b(man|men|male|guy|gentleman|boy|he|his|him)\b", re.IGNORECASE),
+}
+
+
+def _persona_gender(persona: str) -> str | None:
+    """The gender a persona names, if it names exactly one."""
+    named = [g for g, pattern in _PERSONA_GENDER.items() if pattern.search(persona)]
+    return named[0] if len(named) == 1 else None
+
 
 def _persona_findings(persona: str) -> list[dict]:
     findings: list[dict] = []
@@ -809,12 +838,17 @@ def build_presenter_plan(
     spec: MediaSpec,
     persona: str = "",
     image_url: str | None = None,
+    voice: str | None = None,
 ) -> PresenterPlan:
     """Plan the still the lip-sync model animates, screened before it costs money.
 
     A supplied image skips generation and prompt screening, since there is no
-    prompt; the operator is vouching for their rights to it and its content.
-    It must be a URL, because the provider fetches it.
+    prompt; the operator is vouching for their rights to it, its content, and
+    that it suits the voice. It must be a URL, because the provider fetches it.
+
+    A generated presenter is matched to the voice when the voice is a known
+    one: a persona that names no gender gets the voice's, and one that names
+    the other gender is refused rather than drawn.
     """
     persona = (persona or DEFAULT_PERSONA).strip()
     if image_url:
@@ -833,9 +867,32 @@ def build_presenter_plan(
             )
         return PresenterPlan(persona=persona, image_url=image_url.strip(), findings=findings)
 
+    voice_gender = VOICE_GENDERS.get((voice or "").strip().lower())
+    persona_gender = _persona_gender(persona)
+    matching: list[dict] = []
+    if voice_gender and persona_gender and voice_gender != persona_gender:
+        example = next(name for name, g in VOICE_GENDERS.items() if g == persona_gender)
+        matching.append(
+            {
+                "code": "VOICE_MISMATCH",
+                "matched_text": voice or "",
+                "suggestion": (
+                    f"The voice '{voice}' is a {voice_gender}'s and the presenter "
+                    f"is a {persona_gender}. Choose a {persona_gender}'s voice, such "
+                    f"as '{example.title()}', or describe a {voice_gender}."
+                ),
+                "policy_ref": "Presenter video format",
+            }
+        )
+
     parts = [
         f"Vertical phone-camera frame of {persona}, looking straight into the lens "
         "as if mid-sentence.",
+        *(
+            [f"The presenter is a {voice_gender}."]
+            if voice_gender and not persona_gender
+            else []
+        ),
         "Head and shoulders, face fully visible and evenly lit, mouth relaxed, so "
         "the face can be animated to speech.",
         "Setting: a real, lived-in home with natural window light and ordinary "
@@ -848,7 +905,7 @@ def build_presenter_plan(
         "Contain no text, captions, logos or watermarks of any kind.",
     ]
     prompt = " ".join(parts)
-    findings = _persona_findings(persona) + review_media_prompt(persona)
+    findings = _persona_findings(persona) + review_media_prompt(persona) + matching
     return PresenterPlan(persona=persona, prompt=prompt, findings=findings)
 
 
@@ -946,15 +1003,16 @@ def plan_presenter_video(
     brief.variant_index = variant_index
     studio = script_studio or ScriptStudio(settings=settings)
     script = studio.write(brief, offer=offer, seconds=seconds)
+    voice = (voice or settings.kie_tts_voice).strip()
 
     return PresenterVideoPlan(
         script=script,
-        presenter=build_presenter_plan(spec, persona, presenter_image_url),
+        presenter=build_presenter_plan(spec, persona, presenter_image_url, voice=voice),
         placement=placement,
         aspect_ratio=spec.aspect_ratio,
         width=spec.width,
         height=spec.height,
-        voice=(voice or settings.kie_tts_voice).strip(),
+        voice=voice,
         platform=platform,
         offer_id=getattr(offer, "id", None),
     )

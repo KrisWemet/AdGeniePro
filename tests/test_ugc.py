@@ -305,6 +305,40 @@ def test_presenters_that_imply_an_endorsement_are_refused(persona, code):
     assert code in {f["code"] for f in plan.findings}
 
 
+@pytest.mark.parametrize("voice,gender", [("Rachel", "woman"), ("Chris", "man")])
+def test_a_presenter_is_drawn_to_match_the_voice(voice, gender):
+    """Found on the first live run: a gender-neutral persona was drawn as a
+    man and given a woman's voice, because nothing tied the two together."""
+    plan = build_presenter_plan(REEL, voice=voice)
+    assert plan.is_safe
+    assert f"The presenter is a {gender}." in plan.prompt
+
+
+def test_a_persona_that_contradicts_the_voice_is_refused_before_it_is_drawn():
+    plan = build_presenter_plan(REEL, "a man in his forties in a kitchen", voice="Rachel")
+    assert not plan.is_safe
+    finding = next(f for f in plan.findings if f["code"] == "VOICE_MISMATCH")
+    assert "man's voice" in finding["suggestion"]
+
+
+def test_a_persona_that_agrees_with_the_voice_is_not_second_guessed():
+    plan = build_presenter_plan(REEL, "a woman in her forties in a kitchen", voice="Rachel")
+    assert plan.is_safe
+    assert "The presenter is a" not in plan.prompt
+
+
+def test_an_unknown_voice_leaves_the_presenter_to_the_persona():
+    plan = build_presenter_plan(REEL, "a man in his forties", voice="MyClonedVoice")
+    assert plan.is_safe
+    assert "The presenter is a" not in plan.prompt
+
+
+def test_the_voice_chosen_for_a_plan_reaches_the_presenter(offer, settings):
+    plan = plan_presenter_video(offer, persona="a woman at her desk", voice="Chris", settings=settings)
+    assert "VOICE_MISMATCH" in {f["code"] for f in plan.findings}
+    assert not plan.is_safe
+
+
 def test_the_default_presenter_is_safe_text_free_and_vertical():
     plan = build_presenter_plan(REEL)
     assert plan.is_safe

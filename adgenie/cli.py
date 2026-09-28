@@ -832,7 +832,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--presenter-image-url", default=None,
         help="a public image you hold the rights to; skips generating a presenter",
     )
-    ugc.add_argument("--voice", default=None, help="a voice name from the speech library")
+    ugc.add_argument(
+        "--voice", default=None,
+        help="a voice name from the speech library; a generated presenter is drawn to match it",
+    )
     ugc.add_argument(
         "--variant", type=int, default=0,
         help="which execution of the creative's angle to write",
