@@ -753,7 +753,11 @@ _COMPILED_PERSONA_RULES = tuple(
 # image model and the voice are chosen separately, and nothing tied them
 # together. A presenter who sounds like someone else is the first thing a
 # viewer notices, and the lip-sync is charged either way.
+#
+# Only voices whose sound is certain are listed: an unlisted voice skips the
+# check, which is safer than a wrong entry drawing the wrong presenter.
 VOICE_GENDERS: dict[str, str] = {
+    # ElevenLabs
     **dict.fromkeys(
         ("rachel", "aria", "sarah", "laura", "charlotte", "alice", "matilda",
          "jessica", "lily"),
@@ -764,6 +768,9 @@ VOICE_GENDERS: dict[str, str] = {
          "brian", "daniel", "bill"),
         "man",
     ),
+    # Gemini
+    **dict.fromkeys(("zephyr", "kore", "leda", "aoede"), "woman"),
+    **dict.fromkeys(("puck", "charon", "fenrir", "orus"), "man"),
 }
 
 _PERSONA_GENDER = {

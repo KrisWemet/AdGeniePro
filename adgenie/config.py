@@ -103,9 +103,14 @@ class Settings(BaseSettings):
     # Presenter videos. The voice is synthesised from the reviewed script and
     # a still is animated to it, rather than a video model being prompted with
     # dialogue, so the words spoken are exactly the words that were reviewed.
-    kie_tts_model: str = "elevenlabs/text-to-speech-multilingual-v2"
-    # A voice name from the speech provider's library.
-    kie_tts_voice: str = "Rachel"
+    #
+    # Gemini rather than ElevenLabs: through kie.ai, every ElevenLabs request
+    # failed with a provider-side error from at least 2026-09-23, including
+    # the docs' own example. An elevenlabs/ model id switches back, with an
+    # ElevenLabs voice name such as "Rachel".
+    kie_tts_model: str = "google/gemini-3-1-flash-tts"
+    # A voice name from the speech model's library.
+    kie_tts_voice: str = "Zephyr"
     kie_avatar_model: str = "kling/ai-avatar-standard"
     kie_poll_interval_seconds: float = 5.0
     kie_poll_timeout_seconds: float = 600.0

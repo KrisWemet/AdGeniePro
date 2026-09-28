@@ -193,6 +193,22 @@ class KieClient(MediaProvider):
             for key in ("stability", "similarity_boost", "style", "speed", "language_code"):
                 if key in request.extra:
                     payload[key] = request.extra[key]
+        elif _is_gemini_speech(model):
+            # Gemini's speech model is built for dialogue: every line belongs
+            # to a speaker, and speaker ids must read "Speaker N". A presenter
+            # is one speaker with one turn. Verified against the live API,
+            # which rejects plain text, a missing speaker list, and any other
+            # id format.
+            speaker = "Speaker 1"
+            payload = {
+                "speakers": [
+                    {
+                        "speaker_id": speaker,
+                        "voice_name": request.extra.get("voice") or self.settings.kie_tts_voice,
+                    }
+                ],
+                "dialogue_turns": [{"speaker_id": speaker, "text": request.prompt}],
+            }
         elif _is_lip_sync(model):
             # A lip-sync model animates a still to an existing voice track.
             # Both arrive as URLs the provider fetches, and a task submitted
@@ -342,6 +358,10 @@ class KieClient(MediaProvider):
 def _is_lip_sync(model: str) -> bool:
     """Models that animate a still to a supplied voice track."""
     return model.startswith(("kling/ai-avatar", "infinitalk/"))
+
+
+def _is_gemini_speech(model: str) -> bool:
+    return model.startswith("google/gemini") and model.endswith("-tts")
 
 
 def _extract_urls(data: dict) -> list[str]:

@@ -388,19 +388,43 @@ def _capture(seen: dict):
     return handler
 
 
-def test_speech_is_requested_as_text_and_a_voice_not_a_prompt(kie_settings):
+def test_elevenlabs_speech_is_requested_as_text_and_a_voice_not_a_prompt(kie_settings):
     seen: dict = {}
     _kie(_capture(seen), kie_settings).submit(
-        MediaRequest(prompt="Here's what it does.", kind="audio", extra={"voice": "Aria"})
+        MediaRequest(
+            prompt="Here's what it does.", kind="audio",
+            model="elevenlabs/text-to-speech-multilingual-v2", extra={"voice": "Aria"},
+        )
     )
-    assert seen["model"] == kie_settings.kie_tts_model
     assert seen["input"] == {"text": "Here's what it does.", "voice": "Aria"}
+
+
+def test_gemini_speech_is_one_speaker_with_one_turn(kie_settings):
+    """The shape the live API accepted, after rejecting plain text, a missing
+    speaker list, and speaker ids not of the form "Speaker N"."""
+    seen: dict = {}
+    _kie(_capture(seen), kie_settings).submit(
+        MediaRequest(prompt="Here's what it does.", kind="audio", extra={"voice": "Puck"})
+    )
+    assert seen["model"] == kie_settings.kie_tts_model == "google/gemini-3-1-flash-tts"
+    assert seen["input"] == {
+        "speakers": [{"speaker_id": "Speaker 1", "voice_name": "Puck"}],
+        "dialogue_turns": [{"speaker_id": "Speaker 1", "text": "Here's what it does."}],
+    }
 
 
 def test_speech_falls_back_to_the_configured_voice(kie_settings):
     seen: dict = {}
     _kie(_capture(seen), kie_settings).submit(MediaRequest(prompt="Hi.", kind="audio"))
-    assert seen["input"]["voice"] == kie_settings.kie_tts_voice
+    assert seen["input"]["speakers"][0]["voice_name"] == kie_settings.kie_tts_voice
+
+
+def test_the_default_voice_draws_a_matching_default_presenter(settings):
+    """The defaults have to agree with each other, or every default run pays
+    for a presenter who does not match the voice."""
+    plan = build_presenter_plan(REEL, voice=settings.kie_tts_voice)
+    assert plan.is_safe
+    assert "The presenter is a" in plan.prompt
 
 
 def test_lip_sync_sends_the_still_and_the_voice_and_nothing_generic(kie_settings):
