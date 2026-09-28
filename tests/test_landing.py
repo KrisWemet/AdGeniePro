@@ -291,6 +291,22 @@ def test_sending_the_reviewer_somewhere_else_blocks():
     assert "CRAWLER_REDIRECTED_ELSEWHERE" in codes(audit)
 
 
+def test_a_fresh_visit_id_on_the_same_page_is_not_a_redirect_elsewhere():
+    """Seen live: a ClickBank HopLink lands every visit on the same page with
+    its own hopId, and whole-URL comparison called that cloaking."""
+    visits = iter(range(100))
+
+    def handler(request):
+        if request.url.path == "/hop":
+            return httpx.Response(
+                302, headers={"location": f"https://lp.test/vsl?hopId={next(visits)}"}
+            )
+        return httpx.Response(200, html=CLEAN_PAGE)
+
+    audit = audit_landing_page("https://lp.test/hop", fetcher=fetcher_for(handler))
+    assert "CRAWLER_REDIRECTED_ELSEWHERE" not in codes(audit)
+
+
 def test_cloaking_checks_can_be_skipped():
     other = CLEAN_PAGE.replace(BODY, "Different words entirely " * 30)
     audit = audit_landing_page(

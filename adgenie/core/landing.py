@@ -24,7 +24,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import httpx
 
@@ -558,6 +558,17 @@ def _availability_findings(snapshot: PageSnapshot) -> list[Finding]:
     return []
 
 
+def _page_of(url: str) -> str:
+    """The page a URL names, without its query or fragment.
+
+    Networks stamp each visit with its own id. Seen live: every ClickBank hop
+    lands with a fresh hopId, so whole URLs never matched and a crawler that
+    reached the same page read as redirected elsewhere. Different content on
+    the same page is still caught by the content comparison.
+    """
+    return urlunparse(urlparse(url)._replace(query="", fragment=""))
+
+
 def _cloaking_findings(
     browser: PageSnapshot, crawlers: dict[str, PageSnapshot]
 ) -> list[Finding]:
@@ -610,7 +621,7 @@ def _cloaking_findings(
                     ),
                 )
             )
-        if crawler.final_url != browser.final_url:
+        if _page_of(crawler.final_url) != _page_of(browser.final_url):
             out.append(
                 Finding(
                     code="CRAWLER_REDIRECTED_ELSEWHERE",

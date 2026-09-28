@@ -11,7 +11,7 @@ why; this explains what will bite you while changing it.
 
 ```bash
 pip install -r requirements.txt
-python3 -m pytest tests/          # 953 tests, ~75s, no credentials needed
+python3 -m pytest tests/          # 954 tests, ~75s, no credentials needed
 python3 -m adgenie.cli demo --days 21   # full pipeline against the simulator
 ```
 
@@ -153,7 +153,7 @@ adgenie/
   research/   Meta Ad Library
   api/        FastAPI routes
   cli.py      every capability has a command
-tests/        953 of them; start here to understand a subsystem
+tests/        954 of them; start here to understand a subsystem
 ```
 
 `README.md` has a fuller map and the reasoning behind each subsystem.
