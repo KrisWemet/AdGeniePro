@@ -419,8 +419,11 @@ require that to be declared. Declare it where the platform asks; the asset
 records `synthetic_presenter: true`.
 
 `KIE_TTS_MODEL`, `KIE_TTS_VOICE` and `KIE_AVATAR_MODEL` choose the models.
-Their request shapes follow kie.ai's published examples and have not yet been
-run against the live API.
+The defaults have made a real video end to end: a 14-second presenter video
+cost 132 kie.ai credits, 18 for the presenter image (reusable for later
+scripts), 2 for the voice and 112 for the lip-sync. The voice is Gemini's;
+ElevenLabs through kie.ai failed every request when tried, and is one setting
+away if it recovers.
 
 ---
 

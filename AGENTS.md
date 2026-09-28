@@ -104,11 +104,11 @@ software.
   self-consistent, not that the platform agrees. Expect wrong field names,
   missing required params and enum mismatches on first contact. Green tests
   here are not evidence.
-- **Partly verified:** presenter videos on kie.ai. The image request, polling
-  and download have run live. The speech request is accepted (kie.ai's task
-  record echoes the fields as sent) but has so far only failed there, with a
-  provider-side error, so its result handling is unproven. The lip-sync
-  request has never been sent.
+- **Verified live:** presenter videos through kie.ai, end to end: the
+  presenter image, Gemini speech, the lip-sync, polling and downloads, which
+  produced a 14.4-second 9:16 video with sound. ElevenLabs speech through
+  kie.ai is not verified: every request failed on kie's side when tried,
+  which is why Gemini is the default.
 
 When you fix something that first contact reveals, say so in the commit. It is
 the most valuable information in this repository.
