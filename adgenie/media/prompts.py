@@ -182,14 +182,21 @@ def review_media_prompt(prompt: str) -> list[dict]:
     return findings
 
 
+# Nothing else keeps children out of a generated scene, and the first live Veo
+# clip, for a sleep supplement, opened on a sleeping baby. A child in an ad for
+# an adult product reads as a use nobody claimed.
+_ADULTS_ONLY = "Anyone shown is clearly an adult."
+
+
 def _compose(
     subject: str,
     angle: str,
     spec: MediaSpec,
     extra_direction: str = "",
     text_free: bool = True,
+    scene: str = "",
 ) -> str:
-    direction = _ANGLE_DIRECTION.get(angle, _DEFAULT_DIRECTION)
+    direction = scene.strip().rstrip(".") or _ANGLE_DIRECTION.get(angle, _DEFAULT_DIRECTION)
     parts = [
         f"Advertising photograph of {subject}.",
         f"Composition: {direction}.",
@@ -197,6 +204,7 @@ def _compose(
         "The image must earn a pause without fear, fake proof or a false result.",
         "Style: candid phone-camera realism in a real place, natural light, slight "
         "tilt, imperfect framing, ordinary background detail, no staged studio look.",
+        _ADULTS_ONLY,
         f"Framing: {spec.aspect_ratio} aspect ratio, subject centred with "
         "generous margins so no placement crop loses it.",
     ]
@@ -230,13 +238,18 @@ def build_image_prompt(
     angle: str = "",
     placement: str = "meta_feed",
     extra_direction: str = "",
+    scene: str = "",
 ) -> PromptPlan:
-    """Plan one image, pre-screened against the imagery rules."""
+    """Plan one image, pre-screened against the imagery rules.
+
+    A scene, when given, is what the image shows in place of the angle's
+    default composition.
+    """
     spec = get_media_spec(placement)
     if spec.kind != "image":
         raise ValueError(f"placement '{placement}' is a video placement")
 
-    prompt = _compose(_subject_from(offer), angle, spec, extra_direction)
+    prompt = _compose(_subject_from(offer), angle, spec, extra_direction, scene=scene)
     findings = review_media_prompt(prompt + " " + extra_direction)
     return PromptPlan(
         prompt=prompt,
@@ -257,11 +270,14 @@ def build_video_prompt(
     hook_line: str = "",
     seconds: float = 8.0,
     extra_direction: str = "",
+    scene: str = "",
 ) -> PromptPlan:
     """Plan a short video.
 
     The first second decides whether it is watched at all, so the opening beat
-    is stated explicitly rather than left to the model.
+    is stated explicitly rather than left to the model. A scene, when given, is
+    the shot list, in place of the angle's default and the closing product
+    shot.
     """
     spec = get_media_spec(placement)
     if spec.kind != "video":
@@ -272,10 +288,25 @@ def build_video_prompt(
         f"Advertising video of {_subject_from(offer)}.",
         "Open on a clear visual puzzle or payoff already happening; the first "
         "second must make the viewer wonder what caused it.",
-        f"Then: {_ANGLE_DIRECTION.get(angle, _DEFAULT_DIRECTION)}.",
-        "Close on a clean, steady shot of the product.",
+    ]
+    if scene.strip():
+        # Replaces the product close too. With no real product image to work
+        # from, a model asked for "the product" invents its packaging, and a
+        # digital product has none to show.
+        beats.append(f"Scene: {scene.strip().rstrip('.')}.")
+    else:
+        beats += [
+            f"Then: {_ANGLE_DIRECTION.get(angle, _DEFAULT_DIRECTION)}.",
+            "Close on a clean, steady shot of the product.",
+        ]
+    beats += [
         f"Style: handheld documentary realism, natural light, {seconds:.0f} "
         f"seconds, {spec.aspect_ratio} vertical framing.",
+        _ADULTS_ONLY,
+        # Speech is only ever synthesised from a reviewed script. A line the
+        # model makes up has not been reviewed, and in a person's mouth it can
+        # be a fake testimonial.
+        "Sound: natural ambient sound only, with no speech, narration or singing.",
         "No on-screen text, captions, logos or watermarks.",
     ]
     if hook_line:

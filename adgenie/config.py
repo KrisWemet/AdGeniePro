@@ -100,6 +100,18 @@ class Settings(BaseSettings):
     kie_base_url: str = "https://api.kie.ai"
     kie_image_model: str = "nano-banana-pro"
     kie_video_model: str = "veo-3-1"
+    # Presenter videos. The voice is synthesised from the reviewed script and
+    # a still is animated to it, rather than a video model being prompted with
+    # dialogue, so the words spoken are exactly the words that were reviewed.
+    #
+    # Gemini rather than ElevenLabs: through kie.ai, every ElevenLabs request
+    # failed with a provider-side error from at least 2026-09-23, including
+    # the docs' own example. An elevenlabs/ model id switches back, with an
+    # ElevenLabs voice name such as "Rachel".
+    kie_tts_model: str = "google/gemini-3-1-flash-tts"
+    # A voice name from the speech model's library.
+    kie_tts_voice: str = "Zephyr"
+    kie_avatar_model: str = "kling/ai-avatar-standard"
     kie_poll_interval_seconds: float = 5.0
     kie_poll_timeout_seconds: float = 600.0
     # Generated asset URLs expire within about a day, so they are downloaded

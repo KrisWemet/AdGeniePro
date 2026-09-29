@@ -81,6 +81,8 @@ class LaunchPlan:
     # Generate imagery for each creative. A Meta ad without an image is not an
     # ad; Google search ads carry no imagery and skip this.
     generate_media: bool = False
+    # "image", "video", or "presenter": a synthetic presenter speaking a
+    # reviewed script (see media/ugc.py).
     media_kind: str = "image"
     media_placements: list[str] = field(default_factory=list)
 
@@ -611,13 +613,16 @@ class CampaignLauncher:
         ad_format: str,
     ) -> list[int]:
         try:
-            assets = self._media().generate_for_creative(
-                creative,
-                placements=plan.media_placements or None,
-                kind=plan.media_kind,
-                platform=platform,
-                ad_format=ad_format,
-            )
+            if plan.media_kind == "presenter":
+                assets = self._presenter_video(creative, plan, platform, ad_format)
+            else:
+                assets = self._media().generate_for_creative(
+                    creative,
+                    placements=plan.media_placements or None,
+                    kind=plan.media_kind,
+                    platform=platform,
+                    ad_format=ad_format,
+                )
         except Exception as exc:
             logger.error("Media generation failed for %s: %s", creative.name, exc)
             creative.generator_meta = {
@@ -628,6 +633,24 @@ class CampaignLauncher:
         ids = [a.id for a in assets]
         creative.generator_meta = {**creative.generator_meta, "media_asset_ids": ids}
         return ids
+
+    def _presenter_video(
+        self, creative: Creative, plan: LaunchPlan, platform: Platform, ad_format: str
+    ) -> list:
+        """A presenter video made before the ad exists, so the ad is built on it.
+
+        Generated after launch instead, it would reach the ad account but not
+        the ad: nothing here swaps the creative of an ad already created.
+        """
+        from ..media.specs import default_placements
+
+        if not default_placements(platform, "video", ad_format):
+            return []
+        studio = self._media()
+        presenter = studio.presenter_plan_for(
+            creative, placement=(plan.media_placements or [None])[0]
+        )
+        return [studio.generate_presenter_video(presenter, creative_id=creative.id)]
 
     def _upload_media(self, creative: Creative, client) -> list:
         """Put this creative's generated files into the ad account.
