@@ -3019,3 +3019,20 @@ def test_group_budget_changes_honor_the_parent_campaign_maximum(session, setting
     assert client.mock_calls == []
     assert groups[0].daily_budget_micros == usd_to_micros(100)
 
+
+
+def test_no_provider_credential_in_the_environment_reaches_a_test():
+    """A kie.ai key added to a developer environment flowed into every
+    Settings() a test built, and an API test submitted a real, billed
+    generation. Every provider credential is stripped for every test, and a
+    new credential setting fails here until it is added to the list."""
+    from tests.conftest import _CREDENTIAL_VARS
+
+    credentials = {
+        name
+        for name in Settings.model_fields
+        if name.endswith(("_api_key", "_token", "_secret")) and name != "postback_secret"
+    }
+    assert {name.upper() for name in credentials} <= set(_CREDENTIAL_VARS)
+    built = Settings()
+    assert all(getattr(built, name) is None for name in credentials)

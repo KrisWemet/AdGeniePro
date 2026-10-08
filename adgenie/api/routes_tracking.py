@@ -15,8 +15,10 @@ from sqlalchemy.orm import Session
 
 from ..config import get_settings
 from ..core.tracking import (
+    AD_COOKIE,
     PLATFORM_CLICK_PARAM,
     build_final_url,
+    choose_subid,
     client_ip,
     record_click,
     record_conversion,
@@ -64,6 +66,9 @@ def redirect_click(
     a 302. Anything heavier belongs in a background job.
     """
     params = dict(request.query_params)
+    # A thank-you page or an email carries only the offer's token; the ad the
+    # visitor came from may be waiting in their cookie.
+    s = choose_subid(s, request.cookies.get(AD_COOKIE))
     click, offer = record_click(
         session,
         s,

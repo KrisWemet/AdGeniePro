@@ -12,6 +12,7 @@ from adgenie.core.tracking import (
     build_final_url,
     build_prelanding_url,
     build_tracking_url,
+    choose_subid,
     decode_subid,
     encode_subid,
     hash_ip,
@@ -65,6 +66,22 @@ def test_subid_stays_short_enough_for_clickbank(value):
 @pytest.mark.parametrize("junk", ["", "!!!", "garbage", "o", "pm", "---", "o-"])
 def test_malformed_subid_degrades_instead_of_raising(junk):
     assert decode_subid(junk).offer_id == 0
+
+
+def test_a_remembered_ad_fills_in_only_a_link_that_names_just_the_offer():
+    """The cookie may credit a thank-you or email click to the ad the visitor
+    came from. It must never move a click between offers, and never override
+    a link that names its own ad."""
+    ad = encode_subid(TrackingContext(offer_id=2, creative_id=7))
+    offer_only = encode_subid(TrackingContext(offer_id=2))
+    assert choose_subid(offer_only, ad) == ad
+    other_ad = encode_subid(TrackingContext(offer_id=2, creative_id=8))
+    assert choose_subid(other_ad, ad) == other_ad
+    other_offer = encode_subid(TrackingContext(offer_id=3, creative_id=9))
+    assert choose_subid(offer_only, other_offer) == offer_only
+    assert choose_subid(offer_only, None) == offer_only
+    assert choose_subid(offer_only, "not-a-token") == offer_only
+    assert choose_subid(offer_only, offer_only) == offer_only
 
 
 def test_click_ids_are_unique_and_url_safe():

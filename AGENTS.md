@@ -11,7 +11,7 @@ why; this explains what will bite you while changing it.
 
 ```bash
 pip install -r requirements.txt
-python3 -m pytest tests/          # 663 tests, ~40s, no credentials needed
+python3 -m pytest tests/          # 961 tests, ~75s, no credentials needed
 python3 -m adgenie.cli demo --days 21   # full pipeline against the simulator
 ```
 
@@ -83,6 +83,13 @@ run reaches no platform client.
 **Approval gates and the global daily cap** exist so no sequence of
 individually-reasonable decisions can run away. Do not route around them.
 
+**A synthetic presenter is not a customer.** A presenter that claims
+experience is a fake testimonial under the FTC's 2024 rule, with a penalty per
+violation. Anything that makes a person speak goes through `review_script` in
+`media/ugc.py`, and the voice is synthesised from the reviewed text. Prompting
+a video model with dialogue instead lets what was reviewed and what is said
+drift apart.
+
 ## What is verified and what is not
 
 Take this seriously — it is the difference between a passing suite and working
@@ -97,6 +104,20 @@ software.
   self-consistent, not that the platform agrees. Expect wrong field names,
   missing required params and enum mismatches on first contact. Green tests
   here are not evidence.
+- **Verified live:** presenter videos through kie.ai, end to end: the
+  presenter image, Gemini speech, the lip-sync, polling and downloads, which
+  produced a 14.4-second 9:16 video with sound. Gemini speech was checked
+  again with the accent kie.ai's docs require, and the credit charge each
+  task reports is read from the live task record. ElevenLabs speech through
+  kie.ai is not verified: every request failed on kie's side when tried,
+  which is why Gemini is the default.
+- **Verified live:** Veo video through kie.ai, end to end. kie.ai runs
+  `veo-3-1` as Veo 3.1 Fast, eight seconds: 60 credits at 720p, 65 at 1080p,
+  which is now requested for a 1080x1920 placement and came back 1080x1920.
+  At 1080p the result is nested one envelope deeper, which first read as
+  "success with no output" on a task that was charged. Three of the first
+  five tasks failed on kie's side ("Internal Error, Please try again later");
+  those were not charged, and resubmitting minutes later worked.
 
 When you fix something that first contact reveals, say so in the commit. It is
 the most valuable information in this repository.
@@ -128,11 +149,11 @@ repository.
 adgenie/
   core/       the decisions: optimizer, portfolio, rotation, metrics, stats
   platforms/  Meta, Google and the auction simulator behind one interface
-  media/      generation, local storage, upload into the ad account
+  media/      generation, presenter videos, storage, upload into the ad account
   research/   Meta Ad Library
   api/        FastAPI routes
   cli.py      every capability has a command
-tests/        663 of them; start here to understand a subsystem
+tests/        961 of them; start here to understand a subsystem
 ```
 
 `README.md` has a fuller map and the reasoning behind each subsystem.
@@ -148,18 +169,34 @@ Roughly in the order they block getting real ads running:
    is why `GoogleAdsClient.upload_media` refuses rather than uploading an asset
    nothing would reference.
 3. First contact with the live Meta and Google APIs has not happened.
-4. `preflight` performs read-only checks, but cannot prove write permissions,
+4. Nothing checks what a generated image or video shows. The first live Veo
+   clip, for a sleep supplement, opened on a sleeping baby and showed made-up
+   packaging with garbled label text. Prompts now carry the avoid-list, an
+   adults-only line and, for video, no speech, and `--scene` keeps a product
+   off camera, but the next clip still turned a drip into a stream that
+   overstates output. Launches create ads paused unless told otherwise; look
+   at every generated asset before starting one. Nothing collects a finished
+   task by id either, so a timed-out or misread task has to be fetched by
+   hand rather than resubmitted and paid for again.
+5. A ClickBank sale is matched to a click by `tid`, never to a lead:
+   ClickBank sends affiliates no buyer email. Behind a capture page, the
+   `ag_s` cookie credits a thank-you or email click made in the same browser
+   to the ad the visitor came from; one made elsewhere is credited to the
+   offer alone. Because no sale links to a lead, the measured value per lead
+   falls toward zero as cohorts mature, and a funnel campaign ends up judged
+   on the sales credited to its ads rather than on its leads.
+6. `preflight` performs read-only checks, but cannot prove write permissions,
    policy approval or successful affiliate sale attribution.
-5. Meta's asset feed (`META_DYNAMIC_CREATIVE`) is unverified against a live
+7. Meta's asset feed (`META_DYNAMIC_CREATIVE`) is unverified against a live
    account and off by default. It is also a poor fit on purpose: it lets Meta
    pick the headline, body and image and then reports delivery for the creative
    as a whole, while the optimizer scales and kills per creative. Leave the
    variant testing in AdGenie, where the winner is attributable.
-6. Nothing runs on a schedule. `sync`, `optimize`, `landing --sweep`,
+8. Nothing runs on a schedule. `sync`, `optimize`, `landing --sweep`,
    `push-conversions`, `rotate` and `portfolio` are all manual, `run_cycle`
    does not call `sync_metrics`, and two overlapping runs would both read the
    same budget headroom. Deliberate for the first trial; revisit after revenue
    reconciles.
-7. Bred variants are created paused and no optimizer rule ever proposes
+9. Bred variants are created paused and no optimizer rule ever proposes
    `RESUME`, so creative fatigue produces ads nothing starts. Compliance-blocked
    creatives reach `PENDING_REVIEW` with no list endpoint, override path or UI.

@@ -123,6 +123,106 @@ def test_systeme_optin_webhook_rejects_a_body_without_email(
     assert response.json()["detail"] == "Systeme opt-in payload has no contact email"
 
 
+def _launched_creative_id(api_client, offer_id: int) -> int:
+    launch = api_client.post("/api/campaigns/launch", json={
+        "offer_id": offer_id, "platform": "meta", "daily_budget_usd": 10, "angle_count": 1,
+    }).json()
+    return launch["creative_ids"][0]
+
+
+def _ad_token(offer_id: int, creative_id: int | None = None) -> str:
+    from adgenie.core.tracking import TrackingContext, encode_subid
+
+    return encode_subid(TrackingContext(offer_id=offer_id, creative_id=creative_id))
+
+
+def test_systemes_documented_opt_in_event_credits_the_lead_to_the_ad(
+    api_client, created_offer, settings
+):
+    """The CONTACT_OPT_IN payload Systeme documents. The ad's token arrives
+    inside the capture page's sourceURL, and Systeme signs rather than sending
+    a custom header, so the secret travels in the webhook URL."""
+    offer_id = created_offer["id"]
+    creative_id = _launched_creative_id(api_client, offer_id)
+    token = _ad_token(offer_id, creative_id)
+    payload = {"contact": {
+        "id": 12345, "email": "lead@example.test",
+        "registeredAt": "2026-09-28T00:00:00+00:00", "locale": "en",
+        "sourceURL": f"https://ouimettest.systeme.io/20b1992c?s={token}&fbclid=IwAR9",
+        "unsubscribed": False, "bounced": False, "needsConfirmation": False,
+        "fields": [{"fieldName": "first_name", "slug": "first_name", "value": "John"}],
+        "tags": [{"id": 1, "name": "water-freedom"}],
+    }}
+    body = api_client.post(
+        f"/api/systeme/optin?offer_id={offer_id}&secret={settings.postback_secret}",
+        json=payload,
+    ).json()
+    assert body["attribution"] == "subid"
+    assert body["creative_id"] == creative_id
+
+
+def test_a_webhook_without_a_source_url_can_carry_the_ad_in_a_hidden_field(
+    api_client, created_offer, settings
+):
+    """Systeme's automation-rule webhook sends no sourceURL, only the
+    contact's fields."""
+    offer_id = created_offer["id"]
+    creative_id = _launched_creative_id(api_client, offer_id)
+    payload = {"type": "contact.optin.completed", "data": {"contact": {
+        "id": 29142804, "email": "hidden@example.test",
+        "fields": [{"fieldName": "s", "slug": "s", "value": _ad_token(offer_id, creative_id)}],
+    }}}
+    body = api_client.post(
+        f"/api/systeme/optin?offer_id={offer_id}",
+        json=payload, headers={"X-Webhook-Secret": settings.postback_secret},
+    ).json()
+    assert body["creative_id"] == creative_id
+
+
+def test_the_capture_redirect_remembers_the_ad_for_the_thank_you_click(
+    api_client, created_offer, settings
+):
+    """The capture and thank-you pages belong to the funnel builder, so the
+    ad's token cannot pass through them. The cookie carries it back to /r,
+    and is sent nowhere else and for no longer than a click is credited."""
+    settings.systeme_capture_url = "https://pages.test/water"
+    token = f"o{created_offer['id']}-a9-pm"
+    response = api_client.get(
+        f"/offer/{created_offer['id']}?s={token}", follow_redirects=False
+    )
+    cookie = response.headers["set-cookie"]
+    assert cookie.startswith(f"ag_s={token};")
+    for attribute in ("Path=/r", "HttpOnly", "SameSite=lax", "Secure", "Max-Age=2592000"):
+        assert attribute in cookie
+
+    # A later visit naming only the offer must not erase the ad.
+    again = api_client.get(
+        f"/offer/{created_offer['id']}?s=o{created_offer['id']}", follow_redirects=False
+    )
+    assert "set-cookie" not in again.headers
+
+
+def test_a_thank_you_click_is_credited_to_the_ad_the_visitor_came_from(
+    api_client, created_offer, session
+):
+    """ClickBank does not give affiliates the buyer's email. Without this, a
+    sale through the thank-you button carries a tid credited to no ad."""
+    from adgenie.models import Click
+
+    offer_id = created_offer["id"]
+    creative_id = _launched_creative_id(api_client, offer_id)
+    response = api_client.get(
+        f"/r?s={_ad_token(offer_id)}",
+        headers={"Cookie": f"ag_s={_ad_token(offer_id, creative_id)}"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 302
+    session.expire_all()
+    click = session.query(Click).order_by(Click.id.desc()).first()
+    assert click.creative_id == creative_id
+    assert f"tid={click.click_id}" in response.headers["location"]
+
+
 def test_prelanding_support_pages_are_reachable(api_client):
     for path in ("/privacy", "/terms", "/contact"):
         response = api_client.get(path)
